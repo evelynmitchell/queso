@@ -296,12 +296,374 @@ both produced counterexample traces, as desired):
   with one shared `B` cannot reach such states), so Agreement is checked on
   non-trivially divergent executions.
 
-## Phase 2 (future work)
+## Phase 2
 
 This model covers only the *abstract* core (Algorithm 1) atop idealized
 tcast. The *concrete* QuePaxa protocol — Algorithm 4 with interval summary
-registers (ISRs, Algorithm 2), asynchrony, and the proposer/recorder split
-— simulates the abstract core and is planned as a separate Phase-2 model
-(refinement mapping from Algorithm 4's four phases to the three tcast
-invocations, per Figure 5 of the paper). It is intentionally **not**
-modeled here.
+registers (ISRs, Algorithm 3), asynchrony, and the proposer/recorder split
+— simulates the abstract core and is modeled separately in
+`QuePaxaConcrete.tla` / `QuePaxaConcrete.cfg`, documented in the next
+(top-level) section of this file. It is intentionally **not** modeled here.
+
+---
+
+# TLA+ model of the concrete QuePaxa protocol (Algorithm 4 + integer ISR)
+
+`QuePaxaConcrete.tla` is a TLA+ model of the **concrete, leaderless**
+QuePaxa consensus protocol — Section 4.2 of the paper: the proposer
+protocol of **Algorithm 4** (threshold logical clock `s = 4·round + phase`,
+four phases per round, majority quorums of recorder replies, proposer
+catch-up, the phase-2 decision rule) driving passive recorders that each
+hold the **specialized constant-space integer ISR of Algorithm 3** (`S`,
+`F_c`, `A_c`, `A_p`; stale-step discard, `+1` carry, skip→nil) — for a
+single SMR slot, under **genuine asynchrony** (recorders sit at different
+steps; requests and replies are delayed, reordered, dropped and retried;
+proposers fall behind and catch up).
+
+`QuePaxaConcrete.cfg` checks it **exhaustively** at the paper's own
+Appendix D baseline — 2 proposers, 3 recorders, two full rounds (steps
+4–11), 1-bit random priorities, 2 values — and the check **terminates**
+(completed TLC output pasted at the bottom of this section) with all
+safety properties holding:
+
+- **Agreement** — no two proposers decide different values;
+- **Validity** — a decided value was some proposer's original input
+  (plus `ValuesFromInputs`, the engine behind it: no value is ever
+  fabricated anywhere in the system);
+- **Integrity / DecideOnce** — a decision, once made, is never changed
+  (checked as an action property over the transition relation; the model
+  also latches `pDecStep` and halts decided proposers, mirroring
+  Algorithm 4's `return`);
+- **DecisionAtPhase2** — decisions occur only on the asynchronous path,
+  at steps `s ≡ 2 (mod 4)`;
+- **DecisionDominance** — the concrete analogue of the abstract model's
+  `DecisionUnanimity` glue: the moment any proposer has decided `v`,
+  every proposer whose logical clock has entered any **later round**
+  carries a working proposal with value `v`;
+- **Monotone** — proposer steps and recorder ISR steps never decrease
+  (the premise of Lemma C.2's proof), as an action property;
+- **RepliesAhead**, **IsrConsistent**, **TypeOK** — structural sanity
+  (Lemma C.2 as a state invariant; the ISR shape of Algorithm 3);
+- TLC's **deadlock check is left on** and passes — the concrete analogue
+  of the paper's own SPIN property that the models "never deadlock or get
+  stuck".
+
+## What is modeled, and how it mirrors Appendix C
+
+The paper proves concrete QuePaxa correct by showing it *simulates*
+abstract QuePaxa (Appendix C, Lemmas C.2–C.11). The model is built so
+that each ingredient of that simulation argument is either represented
+directly or checked against every reachable state:
+
+| Appendix C | In the model |
+|---|---|
+| Def. C.1 (recorder reply `⟨s′, f′, a′, j⟩`) | the `(st, f, a)` reply records buffered in `pReplies`, keyed by recorder |
+| Lemma C.2 (a reply can never be behind the request step, because `record` first raises `S` to `s`) | `Assert(newS >= s)` inside `Rpc`, plus the `RepliesAhead` state invariant |
+| Lemma C.3 (catch-up adopts a valid `⟨s, p⟩` state) | the catch-up branch of `ProcessQuorum`: adopt `(st, f)` of a highest-step reply; `f ≠ nil` asserted |
+| Lemma C.4 (phase 0 computes `best(P)` over a majority's first values) | the `ph = 0` branch: `p ← BestOf(f′)` over an all-at-step quorum |
+| Lemma C.5 (spread/gather realizes tcast T2: a successfully spread proposal is carried into `A_p` by the `+1` transition and cannot be missed by the next step's gather, by quorum intersection) | `Assert(As ≠ {})` in the `ph = 2` and `ph = 3` branches: some gathered prior-step aggregate is always non-nil. This is exactly the consequence of C.5 that the Rust implementation's `expect` in `proposer.rs` relies on; the model would happily produce an all-nil gather if the `+1`-carry/quorum-intersection argument did not close in some interleaving, so TLC re-derives C.5 rather than assuming it |
+| Lemmas C.7/C.8 (phases 2/3 compute `best(E)` / `best(C)`) | the `ph = 2` / `ph = 3` gather computations over the replies' prior-step aggregates `a′` |
+| Lemma C.9 (asynchronous decision path ⇔ abstract `best(E) = best(U)` decision) | the `ph = 2` decision rule (`p = BestOf(a′)` over the quorum ⇒ deliver `p.value`), plus **DecisionDominance**, which checks C.9's conclusion chained with Lemma B.5: a decision forces every later round's working value |
+| Lemma C.10 (leader fast path) | **not modeled** — the model is leaderless-only, matching the implemented concrete core (`crates/consensus/src/proposer.rs`), where no drawn priority can ever equal `H` and the fast-path test is statically dead |
+| Lemma C.11 (liveness) | out of scope (probabilistic; same stance as the paper's own SPIN models, which "verify only the algorithm's safety"). The deadlock check plus the non-vacuity probes below stand in for "the model never gets stuck and decisions really happen" |
+
+State, mirroring the implementation (`crates/consensus/src/isr.rs`,
+`recorder.rs`, `proposer.rs`):
+
+- per recorder: `rS, rF, rAc, rAp` — exactly Algorithm 3's `S, F_c, A_c,
+  A_p` (`None` = nil). `record(s, p)` is transcribed literally: `s < S`
+  discard; `s = S` aggregate by max; `s > S` advance with `A_p ← A_c` iff
+  `s = S + 1` else `A_p ← nil`; reply `(S, F_c, A_p)`.
+- per proposer: `pStep` (the threshold logical clock, starting at 4 =
+  round 1 phase 0), `pProp` (the working proposal), `pDec`/`pDecStep`
+  (decide-once latch + decision step), `pReplies` (replies buffered for
+  the current step, always fewer than a quorum — see C2 below).
+- a proposal is `[pri, org, val]`, compared lexicographically on
+  `(pri, org)` — the record form of the paper's packed
+  `⟨priority, proposer, value⟩` integer. The value needs no role in the
+  order: within any step a proposer sends a single value, and every
+  comparison the protocol performs is among same-step proposals, so
+  `(pri, org)` already determines the proposal (this also makes `BestOf`'s
+  maximum unique and `CHOOSE` deterministic). Priority ties across
+  proposers are broken by proposer id — precisely the paper's
+  "tiebreaking" scheme (Appendix A), the one its own Promela models use,
+  and what the Rust `Proposal` `Ord` implements.
+
+### Faithfulness of the proposal order
+
+The paper's packed-integer comparison is lexicographic on
+`(priority, proposer, value)`; the model compares `(pri, org)` only. This
+is exact, not a simplification, because the `value` position can never be
+reached: a proposer's logical clock visits each step at most once
+(`Monotone`, checked), and while at a step it sends a single value (phase
+0 varies only the priority per recorder), so *within one step* a given
+`org` pairs with exactly one value. Every comparison the protocol makes —
+a recorder's `AggMax` over one step's arrivals, `BestOf` over first
+values `F[s]` of one step, `BestOf` over prior aggregates `A[s−1]` of one
+step, the phase-2 equality test — is among same-step proposals, where
+equal `(pri, org)` therefore implies equal value. This also makes the
+maximum unique, so `BestOf`'s `CHOOSE` is deterministic (and recorder-
+and value-symmetric, as Reductions C5/C6 require).
+
+## How asynchrony is modeled
+
+There is **no lock-step anywhere**: the only protocol action is
+`Rpc(i, r, pr)` — proposer `i` invokes `record` at recorder `r` for its
+current step, the recorder's ISR handles it atomically, and the reply is
+nondeterministically **delivered** into `i`'s buffer or **lost**. TLC
+explores every interleaving of these RPCs across proposers and recorders,
+so recorders sit at different steps, proposers race whole rounds ahead of
+each other, gathers observe half-written steps, and the catch-up path is
+exercised from every phase (verified non-vacuously; see the probes).
+Quorum composition is nondeterministic (whichever `Quorum` replies happen
+to be delivered first form `R`), reply loss is nondeterministic per RPC,
+and a proposer may re-contact a recorder it has no buffered reply from —
+the implementation's retry loop.
+
+## State-space reductions and why each is sound
+
+The abstract model's lesson (a 7.7M-state non-terminating first attempt)
+was applied from the start: every intermediate is reset when consumed,
+enumeration happens over deduplicated outcome spaces, and every reduction
+below is either exact (bisimulation/equivariance) or a strict
+over-approximation (may add behaviors, never removes any), hence sound
+for the safety invariants checked.
+
+**C1 — Atomic RPC; no explicit message channels.** The implementation's
+recorder handles each `record` request atomically and the reply's content
+is fixed at that instant; the model's `Rpc` performs mutation + optional
+reply delivery in one transition. Every real message-timing behavior maps
+to a schedule of these transitions:
+
+- *Delayed request* = scheduling the RPC later (the proposer, which has
+  no timeout semantics, just sits at its step; nothing else is blocked by
+  its residency, since there is no fairness constraint).
+- *Dropped request/reply + retry* = the lost branch (recorder mutated,
+  proposer learns nothing) followed by a later re-`Rpc`, whose reply
+  carries the recorder's fresh state — exactly what a real retry's reply
+  carries (the ISR is idempotent for repeated same-`(s,p)` records, so
+  the duplicate mutation is harmless, as in the implementation).
+- *Delayed reply* (content fixed at time `t1`, delivered at `t2`) —
+  between `t1` and `t2` the proposer takes no action that reads the
+  buffer (it only acts when a quorum completes), and buffering the reply
+  touches only proposer-local state, so delivering at `t1` instead is an
+  equivalent interleaving; the case where later deliveries overtake it is
+  the lost-branch-plus-re-read schedule above. (First-received wins per
+  recorder per step, as in the implementation's `or_insert`.)
+- *Stale requests from an abandoned step* (proposer `i` moved past step
+  `s`, its step-`s` request reaches a laggard recorder `r` afterwards):
+  reorderable to an in-residency lost-reply RPC. The recorder mutation
+  depends only on `(s, p, r`'s state`)`, not on `i`'s; so it suffices to
+  show the schedule prefix can be rearranged so the mutation happens
+  while `i` is still at `s`. Any event that touches `r` at a step `> s`
+  before the stale delivery makes the delivery a no-op (monotone `S`
+  discards it) — nothing to model. And any event that touches `r` at a
+  step `≤ s` is causally independent of `i`'s progress past `s`:
+  influence of `i`'s post-`s` activity propagates only through recorder
+  state at steps `> s` (a `record(u, p)` with `u > s` writes only `F[u]`,
+  `A[u]`, and `A[u−1]` *by moving* the already-final `A_c`; it fabricates
+  no content at steps `≤ s`), and any proposer that absorbs such
+  influence jumps its own clock past `s` before acting on it (catch-up),
+  after which all its requests are at steps `> s`. So all `≤ s`-step
+  events commute before `i`'s advancement, the stale mutation becomes an
+  in-residency lost-reply `Rpc(i, r)`, and the remainder of the schedule
+  replays identically.
+
+**C2 — A quorum is processed in the transition that completes it, with
+`|R| = Quorum` exactly.** This matches the implementation literally
+(`process_quorum` fires the moment `responses.len()` reaches the
+threshold, so `R` is exactly the first quorum of distinct-recorder
+replies received) and the paper's `Await R ← quorum of replies`. Which
+quorum forms, with which contents, stays fully nondeterministic through
+delivery order and loss. Deferring the processing would not add
+behaviors: it reads and writes only proposer-local state, so it commutes
+with every other component's transitions. Consequence: the reply buffer
+always holds `< Quorum` entries — for the n=3 configuration at most one —
+which is a major state-count saving, and the buffer and the completed
+quorum are reset/consumed in the same transition (no stale intermediates).
+
+**C3 — Reply-field canonicalization.** A buffered reply's fields that no
+code path can ever read from that point on are stored as `None`: `f` is
+kept only for phase-0 at-step replies (`BestOf(f′)`) and for ahead
+replies (catch-up adoption); `a` only for phase-2/3 at-step replies (the
+gathers and the decision test). Catch-up reads only the *highest-step*
+reply's `(st, f)`; the phase bodies read only what their branch uses;
+nothing else inspects the buffer. Merging states that differ only in
+unreadable fields is a bisimulation — exact, no behaviors lost.
+
+**C4 — Fresh per-recorder phase-0 priorities drawn at RPC time (a retry
+may redraw).** Algorithm 4 draws an independent random priority *per
+recorder* in phase 0; the implementation pins the drawn value in its
+`sent` map so a retry resends identical content. The model draws at each
+RPC, so a retry after a lost reply may present the same recorder a
+*different* priority for the same step. This is a strict superset of the
+implementation's behaviors (the redraw can also pick the same value), so
+any safety violation of the real system is preserved; the extra
+behaviors — a recorder aggregating two priorities from one proposer in
+one step — cannot mask violations, only (at worst) flag spurious ones,
+and none were flagged. The saving is large: no per-recorder priority
+scratchpad in the state vector (an earlier draft pinned priorities and
+multiplied the state space by up to `3^|Recorders|` per proposer; it was
+the difference between non-termination and a 38-second one-round check).
+
+**C5 — Recorder symmetry.** Recorder identities never enter proposals,
+orders, or decisions; the only id-sensitive point in the whole protocol
+is the implementation's *arbitrary* deterministic tiebreak (higher node
+id) when two replies tie for the highest step during catch-up. The model
+makes that choice nondeterministic (a superset containing the
+implementation's choice), after which the transition relation is fully
+equivariant under recorder permutation, and `Recorders` is declared a TLC
+`SYMMETRY` set (`RecSym == Permutations(Recorders)`). Exact for the
+invariants checked (all of which are themselves symmetric in recorders);
+no liveness properties are checked, so TLC's symmetry/liveness caveat
+does not apply (`DecideOnce`/`Monotone` are action invariants, checked on
+every generated transition, and are recorder-symmetric formulas).
+
+**C6 — Value-permutation canonicalization of inputs.** `Init` explores
+one input vector per orbit under bijections of `Values` (restricted-
+growth vectors: for 2 proposers and 2 values, `⟨1,1⟩` and `⟨1,2⟩`, which
+cover `⟨2,2⟩` and `⟨2,1⟩`). Exact: no operator inspects a value except
+for equality (`Better`/`BestOf` order by `(pri, org)` only; the decision
+test is record equality), so a value bijection maps behaviors to
+behaviors and symmetric invariants to themselves.
+
+**C7 — Two full rounds (`MaxStep = 11`, steps 4–11).** The paper's own
+Appendix D baseline ("executions of two full rounds (logical time steps
+4–11)"). Both decision opportunities (steps 6 and 10) and every
+cross-round hand-off are inside the bound; proposers park when the bound
+is exhausted (the `Done` stutter keeps TLC's deadlock check meaningful).
+The argument that two rounds suffice mirrors the abstract model's
+Reduction R2, with `DecisionDominance` as the machine-checked glue: a
+round's dynamics depend only on the entering value/priority state, all of
+which is exercised within rounds 1–2 (including maximally divergent
+entries via catch-up and loss), and once any proposer decides `v`,
+`DecisionDominance` (checked over the full bounded space) says every
+proposer entering any later round carries `v` — from a `v`-uniform round
+entry, every gathered/adopted proposal carries `v`, so every later
+decision is `v`. As with the paper's own SPIN verification, this is a
+finite-configuration check plus an inductive argument, not a proof for
+unbounded rounds.
+
+**C8 — No explicit crashes.** As in the abstract model's R3: a crashed
+recorder is one the schedule stops delivering RPCs to (quorums of the
+remaining majority still form; quorum arithmetic is over the fixed full
+membership, as in the implementation); a crashed proposer is one the
+schedule stops picking (no fairness assumptions anywhere). Crash
+behaviors are a strict subset of the modeled schedules.
+
+**C9 — Two active proposers, three recorders.** The paper's Appendix D
+baseline configuration. A replica whose proposer role stays idle (the
+normal case in QuePaxa, §4.2.1) is exactly a proposer the schedule never
+picks, so the 2-proposer model is the n=3 system with one idle proposer
+role; recorder-side behavior is complete. Checking more active proposers
+(or more values/priorities/rounds) is a straight config change at
+exponential cost — same stance as the paper ("any of these parameters may
+be increased in moderation").
+
+**C10 — Leaderless only.** The leader fast path (priority `H`, first
+round only) is deliberately out of scope, matching the implemented
+concrete core, where the fast-path branch is statically dead. A
+leader-based round only *adds* one more way to decide the same
+already-best proposal (Lemma C.10 reduces it to C.9); modeling it is
+future work alongside any fast-path implementation.
+
+**Not reductions (exact by construction):** decided proposers halt
+(Algorithm 4 `return`s; the implementation ignores everything after
+deciding); recorders answer every request (a recorder is purely reactive
+and cannot "refuse" — loss is modeled on the reply, and request loss is
+the schedule never firing that RPC); `pStep` starting at 4 for both
+proposers (kickoff skew is subsumed by RPC scheduling freedom, since
+nothing observes a not-yet-started proposer).
+
+## How to run TLC
+
+From the repository root (any TLA+ distribution's `tla2tools.jar`):
+
+```
+java -XX:+UseParallelGC -cp <path-to>/tla2tools.jar tlc2.TLC \
+     -workers auto -config spec/QuePaxaConcrete.cfg spec/QuePaxaConcrete.tla
+```
+
+Deadlock checking is intentionally left enabled (see above).
+
+## Completed TLC output
+
+Actual output of the command above at the Appendix D baseline
+(TLC 2.19, OpenJDK 21; the environment-specific `JAVA_TOOL_OPTIONS` echo
+and the periodic `Progress(...)` lines are trimmed; the final summary is
+verbatim):
+
+```
+TLC2 Version 2.19 of 08 August 2024 (rev: ${git.shortRevision})
+Running breadth-first search Model-Checking with fp 47 ... with 4 workers on 4 cores ...
+Parsing file .../spec/QuePaxaConcrete.tla
+Semantic processing of module QuePaxaConcrete
+Starting... (2026-07-10 19:25:47)
+Computing initial states...
+Finished computing initial states: 2 distinct states generated at 2026-07-10 19:25:48.
+...
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 1.1E-4
+  based on the actual fingerprints:  val = 2.9E-4
+165876224 states generated, 13323585 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 36.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 21 and the 95th percentile is 4).
+Finished in 12min 44s at (2026-07-10 19:38:31)
+```
+
+All eight invariants (`TypeOK`, `Agreement`, `Validity`, `RepliesAhead`,
+`DecisionAtPhase2`, `DecisionDominance`, `IsrConsistent`,
+`ValuesFromInputs`), both action properties (`DecideOnce`, `Monotone`),
+and every in-action `Assert` (the Lemma C.2 reply-step bound, the Lemma
+C.3 non-nil catch-up value, and the Lemma C.5 non-nil-gather asserts in
+phases 2 and 3) held over the exhaustive search: **165,876,224 states
+generated, 13,323,585 distinct, queue drained to 0, depth 36, ~12m44s**.
+TLC's deadlock check was enabled and passed (no reachable non-terminated
+state is stuck).
+
+**Fingerprint-collision caveat.** Because the reachable space here is
+~13.3M distinct states (vs. ~107K for the abstract model), the estimated
+probability that two distinct states shared a 64-bit fingerprint and one
+was silently skipped is `2.9E-4` (actual) — higher than the abstract
+model's `1.5E-10`, purely a function of state count, not of any modeling
+weakness. This is small but non-negligible; a confirming re-run with a
+different hash seed (`-fp 1`, optional) drives the residual chance that a
+collision hid a safety violation down multiplicatively, and is
+recommended if this model is used as a load-bearing artifact. The paper's
+own more realistic Promela model faced the same tradeoff and resorted to
+*bitstate* hashing (Appendix D.2), which is strictly weaker than the
+exhaustive full-fingerprint search used here.
+
+### Non-vacuity sanity probes
+
+To confirm the check is not vacuous, five deliberately false "probe"
+properties were checked against a scratch module that `EXTENDS
+QuePaxaConcrete` (not committed). Each produced a counterexample, as
+desired, establishing that the safety properties are exercised on real,
+non-trivial executions:
+
+- `ProbeNoDecision == ∀i : pDec[i] = None` — **violated**: decisions are
+  reachable, so Agreement / Validity / DecideOnce are exercised on actual
+  decisions (not vacuously true because no one ever decides).
+- `ProbeNoRound2Decision == ∀i : pDecStep[i] ≠ 10` — **violated**:
+  decisions at step 10 (round 2, phase 2) are reachable, so cross-round
+  agreement — a proposer deciding in a *later* round than another — is
+  genuinely exercised.
+- `ProbeNoUndecidedValueSplit` (no two undecided proposers, both already
+  in round 2, hold different working values) — **violated** by a
+  reachable state where both proposers sit at step 8, undecided, holding
+  working proposals with values `2` and `1` respectively. So Agreement is
+  checked on genuinely divergent *mid-protocol* states (a split carried
+  through a full round of spread/gather/catch-up, not merely the initial
+  input split), where a wrong decision would actually be possible.
+- `ProbeNoDivergence == ∀i,k : pStep[i] ≤ pStep[k] + 4` — **violated**:
+  proposers' logical clocks diverge by more than a full round — real
+  asynchrony, with no hidden lock-step barrier.
+- `ProbeNoCatchUpJump == □[∀i : pStep'[i] ≤ pStep[i] + 1]_vars` —
+  **violated**: the catch-up path fires with a multi-step jump (a
+  proposer adopts a much-higher recorder step in one transition). As an
+  *action* property, its violation also confirms action properties are
+  genuinely enforced under the `SYMMETRY` declaration.
+
