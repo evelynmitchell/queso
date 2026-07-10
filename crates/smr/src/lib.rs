@@ -1,12 +1,12 @@
-//! `queso-smr`: Phase 4a -- a fault-tolerant, linearizable key-value store
+//! `queso-smr`: Phase 4 -- a fault-tolerant, linearizable key-value store
 //! over a multi-slot replicated log, built directly on top of
 //! `queso-consensus`'s concrete per-slot protocol (the ISR + threshold-clock
 //! proposer/recorder pair, including the §4.2.5 leader fast path).
 //!
 //! This is Queso's headline "hello world" milestone (see
 //! `docs/00-project-outline.md`'s Phase 4 and `docs/02-properties.md`'s
-//! property model, particularly P5-P10 and P8a/A6). The two ideas this
-//! crate adds on top of single-slot consensus:
+//! property model, particularly P5-P10, P8a/A6, and P9/P12). The three ideas
+//! this crate adds on top of single-slot consensus:
 //!
 //! 1. **A log is a sequence of independently-decided slots.** Chaining
 //!    slots gives prefix consistency (P5), a total order across replicas
@@ -21,17 +21,26 @@
 //!    of running an ordinary, completely unmodified
 //!    [`queso_consensus::proposer::Proposer`] at a possibly-already-decided
 //!    slot.
+//! 3. **Crash-recovery, not just crash-stop (P9/P12).** A replica's durable
+//!    state (recorders' ISR, log frontier, applied log, `kv`) survives a
+//!    crash + restart; its volatile state does not, and a restarted replica
+//!    rejoins as a learner, catching up before it resumes participating. See
+//!    [`replica::Durable`]'s docs for the split and how it is modeled
+//!    faithfully against the harness's actual restart semantics, and
+//!    [`replica::SmrNode::on_restart`] for the recovery sequence.
 //!
-//! # Scope (Stage 4a)
+//! # Scope (Stage 4a + 4b)
 //!
-//! Single cluster, single log, **crash-stop** (matching this stage's
-//! instructions -- not `docs/02-properties.md`'s Phase-4 durability design
-//! item, P12, which this crate treats as a **Stage 4b** follow-on with an
-//! explicit seam left for it; see [`cluster`]'s module docs). No hedging
-//! tuning (Phase 5), no auto-tuning (Phase 6), no reconfiguration (Phase 8).
-//! Slots are processed with no pipelining -- a replica runs at most one
-//! `Proposer` at a time, always at its own frontier -- noted as future work
-//! in the project outline, not a correctness shortcut (log safety and
+//! Single cluster, single log. Crash-**recovery** (not merely crash-stop):
+//! a replica may crash and later restart via [`cluster::SmrCluster::restart`]
+//! without losing acknowledged writes or diverging (P9/P12) -- see
+//! [`replica::Durable`]'s docs. No hedging tuning (Phase 5), no auto-tuning
+//! (Phase 6), no reconfiguration/membership change (Phase 8), no real
+//! fsync/WAL (also Phase-8 hardening -- durability is modeled faithfully in
+//! memory against the harness's restart semantics, not backed by real
+//! disk). Slots are processed with no pipelining -- a replica runs at most
+//! one `Proposer` at a time, always at its own frontier -- noted as future
+//! work in the project outline, not a correctness shortcut (log safety and
 //! linearizability do not depend on pipelining).
 //!
 //! # Layout
@@ -45,11 +54,12 @@
 //!   sequential reference specification [`linearizability`] checks
 //!   candidate orderings against.
 //! - [`replica`] -- [`replica::SmrNode`] (the `Node` impl each replica
-//!   runs) and [`replica::ReplicaState`] (its persistent per-slot
-//!   recorders, log frontier, and pending-operation queue).
+//!   runs), [`replica::ReplicaState`] (durable + volatile halves), and
+//!   [`replica::Durable`] (exactly what survives a crash + restart, P9/P12).
 //! - [`cluster`] -- [`cluster::SmrCluster`], the external driver: builds the
-//!   replica set, accepts `submit`/`submit_put`/`submit_get`, runs the
-//!   simulation, and exposes results/state for tests to inspect.
+//!   replica set, accepts `submit`/`submit_put`/`submit_get`, injects
+//!   `crash`/`restart`, runs the simulation, and exposes results/state for
+//!   tests to inspect.
 //! - [`linearizability`] -- a dependency-light, in-tree Wing-Gong-style
 //!   linearizability checker (P8): given a history of invocation/response
 //!   logical-time intervals plus observed values, brute-force/backtracking-
