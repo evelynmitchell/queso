@@ -44,6 +44,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "queso-consensus"
+version = "0.1.0"
+dependencies = [
+ "queso-sim",
+ "rand",
+]
+
+[[package]]
 name = "queso-sim"
 version = "0.1.0"
 dependencies = [

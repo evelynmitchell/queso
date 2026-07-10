@@ -1,0 +1,16 @@
+[package]
+name = "queso-consensus"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Phase 1: abstract single-slot QuePaxa consensus (Algorithm 1) atop the queso-sim harness."
+
+[lints]
+workspace = true
+
+[dependencies]
+queso-sim = { path = "../sim" }
+rand = "0.8"
+
+[dev-dependencies]
