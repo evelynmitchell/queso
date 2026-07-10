@@ -4,9 +4,15 @@
 //! This crate is the **entire Phase 0 deliverable**: an injectable virtual
 //! clock, a single seeded PRNG, an in-memory network with a pluggable
 //! scheduler (including two adversary classes), a fault-injection API, and
-//! a trace recorder — everything `docs/03-testing-plan.md §1` calls for.
-//! There is **no consensus logic here**; nodes in the examples/tests just
-//! echo or count messages.
+//! a trace recorder, covering the deterministic-simulation core of
+//! `docs/03-testing-plan.md §1`. There is **no consensus logic here**;
+//! nodes in the examples/tests just echo or count messages.
+//!
+//! **Not yet implemented: shrinking** (minimizing a failing seed down to a
+//! smaller reproducer). This is intentionally deferred until a later phase
+//! has property/consensus tests that can actually produce failing seeds to
+//! shrink against — there is no such workflow yet, so there is nothing to
+//! shrink.
 //!
 //! # Determinism, end to end
 //!
@@ -69,4 +75,4 @@ pub mod scheduler;
 pub mod time;
 pub mod trace;
 
-pub use kernel::{Kernel, KernelCore};
+pub use kernel::Kernel;
