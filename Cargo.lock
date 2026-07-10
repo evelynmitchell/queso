@@ -59,6 +59,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "queso-smr"
+version = "0.1.0"
+dependencies = [
+ "queso-consensus",
+ "queso-sim",
+ "rand",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"

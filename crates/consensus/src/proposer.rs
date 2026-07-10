@@ -314,6 +314,12 @@ fn fast_path_value<V: Ord + Clone>(responses: &BTreeMap<NodeId, RecordResponse<V
 /// One proposer's Algorithm-4 state for one slot.
 pub struct Proposer<V> {
     self_id: NodeId,
+    /// The slot this proposer is running consensus for -- see
+    /// [`crate::rpc::RecordRequest::slot`]'s docs. Attached verbatim to
+    /// every outgoing [`RecordRequest`] and checked against every incoming
+    /// [`RecordResponse`] ([`Proposer::on_response`]); inert for any
+    /// single-slot caller (always `0`).
+    slot: u64,
     /// Total configured replica count `n` (not "currently live") -- quorum
     /// is always computed against this fixed membership, matching
     /// `crate::tcast`'s reasoning for why doing otherwise risks split-brain
@@ -357,14 +363,20 @@ impl<V: Ord + Clone> Proposer<V> {
     /// `crate::concrete::ConcreteCluster::new_with_leader`, which enforces
     /// it by passing one shared value to every `Proposer::new` call), not
     /// something this constructor can check on its own.
+    /// `slot` is attached verbatim to every outgoing `record` request and
+    /// checked on every incoming reply (see [`Proposer::slot`]'s field
+    /// docs); single-slot callers (this crate's own Phase 2/3 tests and
+    /// [`crate::concrete::ConcreteCluster`]) always pass `0`.
     pub fn new(
         self_id: NodeId,
         total_replicas: usize,
         initial_value: V,
         leader: Option<NodeId>,
+        slot: u64,
     ) -> Self {
         Self {
             self_id,
+            slot,
             total_replicas,
             leader,
             step: 0,
@@ -481,6 +493,7 @@ impl<V: Ord + Clone> Proposer<V> {
         ctx.send(
             recorder,
             ConcreteMsg::Request(RecordRequest {
+                slot: self.slot,
                 req_step: self.step,
                 proposal,
             }),
@@ -501,9 +514,12 @@ impl<V: Ord + Clone> Proposer<V> {
         if self.decided.is_some() {
             return;
         }
-        if resp.req_step != self.step {
-            // Stale (answers an earlier, already-superseded request) or
-            // otherwise irrelevant -- ignore.
+        if resp.slot != self.slot || resp.req_step != self.step {
+            // Stale (answers an earlier, already-superseded request, or --
+            // only possible when a caller multiplexes multiple slots over
+            // the same replica addresses, see `crate::rpc::RecordRequest`'s
+            // docs -- a different slot's reply entirely) or otherwise
+            // irrelevant -- ignore.
             return;
         }
         // First writer wins for a given recorder within a step: retries
