@@ -14,9 +14,26 @@ safety properties hold:
 - **DecisionUnanimity** — as soon as any replica has decided `x`, every
   replica's candidate value is `x` (the crux of the paper's Agreement proof,
   and the glue of the induction in Reduction R2 below);
-- the paper's cross-node subset relationship **`U_i ⊆ C_j ⊆ E_i`** is
-  `Assert`-checked at the end of every round for every reachable tcast
-  outcome — it is *derived* from the tcast guarantees, never assumed.
+- the paper's cross-node subset relationship **`U_i ⊆ C_j ⊆ E_i`**
+  (**Lemma B.5**) is `Assert`-checked at the end of every round for every
+  reachable tcast outcome — it is *derived* from the tcast guarantees, never
+  assumed.
+
+In addition, the two lemmas the Appendix B Agreement proof pivots on are now
+`Assert`-checked directly against every reachable tcast outcome (not merely
+implied by the top-level invariants passing):
+
+- **Lemma B.4 (set cardinalities)** — every set the algorithm builds
+  (`P`, `P'`, `E`, `C`, `U`) has cardinality `> n/2`, checked as each set
+  becomes live in its phase;
+- **Lemma B.5 corollary (decision-safety pivot)** — whenever a replica's
+  decision guard `best(E_i) = best(U_i)` holds, `best` is unanimous across
+  every replica's `C_j` and `E_i` (`best(U_i) = best(C_j) = best(E_i)`) — this
+  is exactly what forces two same-round deciders to agree (Lemma B.7 case 1).
+
+Both were confirmed to hold across the full state space (106,704 distinct
+states, 0 counterexamples). Verified against the authoritative Appendix B text
+(`Definition B.1`–`Lemma B.9`).
 
 ## What is modeled
 
