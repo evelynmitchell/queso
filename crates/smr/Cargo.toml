@@ -1,0 +1,17 @@
+[package]
+name = "queso-smr"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Phase 4a: a multi-slot replicated log (SMR) driving a linearizable in-memory KV store, atop queso-consensus's concrete per-slot protocol."
+
+[lints]
+workspace = true
+
+[dependencies]
+queso-consensus = { path = "../consensus" }
+queso-sim = { path = "../sim" }
+rand = "0.8"
+
+[dev-dependencies]
