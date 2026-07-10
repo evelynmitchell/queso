@@ -10,7 +10,7 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use queso_consensus::proposer::{MAX_RETRIES_PER_STEP, RETRY_DELAY_TICKS};
+use queso_consensus::proposer::RETRY_DELAY_TICKS;
 use queso_sim::ids::NodeId;
 use queso_sim::scheduler::{ContentObliviousAdversary, Fifo, SchedulerKind};
 use queso_sim::time::LogicalTime;
@@ -131,7 +131,7 @@ fn restart_recovers_without_divergence_and_preserves_acknowledged_writes() {
 /// Reproduces the review's exact scenario: crash the whole cluster, restart
 /// exactly one replica *alone* (so its catch-up probe can never reach a
 /// live majority), let comfortably more than the `Proposer`'s own worst-case
-/// retry-exhaustion budget (`MAX_RETRIES_PER_STEP * RETRY_DELAY_TICKS`
+/// retry-exhaustion budget (`64 * RETRY_DELAY_TICKS = 1280`
 /// ticks) pass -- long enough that, without the watchdog, its catch-up
 /// `Proposer` has certainly parked for good -- then bring the rest of the
 /// cluster back. The lone replica must still (eventually) rejoin: its
@@ -180,11 +180,11 @@ fn a_lone_restarted_replica_rejoins_instead_of_zombie_parking_forever() {
     let read = c.submit_get(lone, ClientId(2), 0, 7);
 
     // Let far more than the Proposer's own worst-case per-step retry budget
-    // elapse (comfortably past `MAX_RETRIES_PER_STEP * RETRY_DELAY_TICKS`,
+    // elapse (comfortably past `64 * RETRY_DELAY_TICKS = 1280`,
     // and past this crate's own watchdog interval too) -- long enough that
     // the lone replica's catch-up `Proposer` has certainly either parked
     // (pre-fix) or already been re-armed at least once (post-fix).
-    let stall_budget = MAX_RETRIES_PER_STEP as u64 * RETRY_DELAY_TICKS;
+    let stall_budget = 64 * RETRY_DELAY_TICKS;
     c.run_for(stall_budget * 4);
     assert_eq!(
         c.next_slot(lone),
@@ -269,7 +269,7 @@ fn a_lone_restarted_replica_rejoins_under_a_lossy_adversary_too() {
         c.restart(lone);
 
         let read = c.submit_get(lone, ClientId(2), 0, 3);
-        let stall_budget = MAX_RETRIES_PER_STEP as u64 * RETRY_DELAY_TICKS;
+        let stall_budget = 64 * RETRY_DELAY_TICKS;
         c.run_for(stall_budget * 4);
         assert!(
             !c.is_complete(read),

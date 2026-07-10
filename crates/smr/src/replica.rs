@@ -64,7 +64,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
-use queso_consensus::proposer::{Proposer, KICKOFF_TIMER, MAX_RETRIES_PER_STEP, RETRY_DELAY_TICKS};
+use queso_consensus::proposer::{Proposer, KICKOFF_TIMER, RETRY_DELAY_TICKS};
 use queso_consensus::recorder::Recorder;
 use queso_consensus::rpc::ConcreteMsg;
 use queso_sim::ids::{NodeId, TimerId};
@@ -152,27 +152,24 @@ fn catch_up_probe(slot: u64) -> Command {
 ///
 /// # The "permanent zombie" liveness bug this closes (P11/O4)
 ///
-/// A [`Proposer`]'s per-step retries are capped
-/// (`queso_consensus::proposer::MAX_RETRIES_PER_STEP` retries,
-/// [`RETRY_DELAY_TICKS`] apart -- currently `64 * 20 = 1280` ticks worst
-/// case); once that budget is exhausted for a step, the proposer stops
-/// retrying and *parks* -- nothing in `queso_consensus` ever wakes it again
-/// except a response that happens to arrive anyway (see that module's
-/// "Retries" docs). Without this watchdog, [`SmrNode::begin_next_attempt`]/
-/// [`SmrNode::begin_catch_up`] both refuse to start anything new while
-/// `current_attempt.is_some()`, so a parked catch-up attempt -- e.g. a
-/// replica restarted alone after a full-cluster crash, unable to reach a
-/// live majority -- would occupy that slot *forever*, even once a majority
-/// becomes reachable again: nothing else in this crate ever re-arms it, so
-/// the replica silently stays at whatever `next_slot` it restarted with,
-/// and a client `Get` routed to it never completes, even though
-/// `SmrCluster::live()` still reports it live.
+/// [`SmrNode::begin_next_attempt`]/[`SmrNode::begin_catch_up`] refuse to start
+/// anything new while `current_attempt.is_some()`, so a catch-up attempt that
+/// makes no progress -- e.g. a replica restarted alone after a full-cluster
+/// crash, unable to reach a live majority -- would occupy that slot until it
+/// eventually completes. Historically the underlying [`Proposer`] capped its
+/// per-step retries and then *parked* forever, so such an attempt could never
+/// recover even once a majority became reachable again. The hedging work
+/// replaced that hard cap with unbounded exponential backoff, so a
+/// lone-restarted replica now keeps retrying and does rejoin on its own. This
+/// watchdog remains as a defensive backstop: if a catch-up attempt shows no
+/// progress for a full interval it drops the stale attempt and re-issues
+/// catch-up from scratch, guarding against transient stalls and against any
+/// future regression to a bounded-retry proposer.
 ///
-/// Deliberately set to comfortably more than double the proposer's own
-/// worst-case per-step exhaustion time, so the watchdog only ever fires
-/// once the underlying proposer has genuinely parked -- never racing (or
-/// interrupting) its own legitimate, still-in-progress retries.
-const CATCH_UP_WATCHDOG_TICKS: u64 = 2 * (MAX_RETRIES_PER_STEP as u64) * RETRY_DELAY_TICKS;
+/// Set comfortably longer than the proposer's maximum per-step retry-backoff
+/// spacing, so the watchdog only ever fires on a genuinely stalled attempt --
+/// never racing (or interrupting) still-in-progress retries.
+const CATCH_UP_WATCHDOG_TICKS: u64 = 128 * RETRY_DELAY_TICKS;
 
 /// Reserved timer id for the catch-up quiescence watchdog. Distinct from
 /// [`KICKOFF_TIMER`] (`TimerId(u64::MAX)`) and from any live [`Proposer`]'s
