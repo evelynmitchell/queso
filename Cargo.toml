@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/sim"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Queso contributors"]
+
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+disallowed_types = "deny"
