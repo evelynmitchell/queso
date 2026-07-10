@@ -221,6 +221,13 @@ impl SmrCluster {
     /// re-proposed at) proceeds purely through `Node` callbacks, exactly
     /// like `queso_consensus::concrete::ConcreteCluster::run_slot`.
     pub fn submit(&mut self, replica: NodeId, command: Command) -> OpId {
+        debug_assert_ne!(
+            command.client_seq().0,
+            crate::replica::CATCH_UP_CLIENT,
+            "ClientId(u32::MAX) is reserved for this crate's internal restart catch-up probes \
+             (see crate::replica::CATCH_UP_CLIENT's docs) -- a real client/test must never \
+             submit using it"
+        );
         let op_id = OpId(self.next_op_id);
         self.next_op_id += 1;
         let invoked_at = self.next_invoked_at();

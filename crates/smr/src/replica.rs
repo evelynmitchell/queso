@@ -43,12 +43,28 @@
 //! entry point: it clears volatile state and kicks off a learner-style
 //! catch-up (see [`SmrNode::begin_catch_up`]) before the replica resumes
 //! ordinary participation.
+//!
+//! Catch-up itself is watched by a quiescence watchdog
+//! ([`SmrNode::on_catch_up_watchdog`], armed by
+//! [`SmrNode::arm_catch_up_watchdog`]): a restarted replica that cannot yet
+//! reach a live majority (e.g. it comes back up alone after a full-cluster
+//! crash, or during a long partition) would otherwise drive its catch-up
+//! probe through a [`Proposer`] whose per-step retries are capped and, once
+//! exhausted, never self-resume -- permanently stalling that replica even
+//! after a majority becomes reachable again. The watchdog re-issues a fresh
+//! catch-up attempt at the same frontier slot whenever the current one has
+//! made no progress for a full [`CATCH_UP_WATCHDOG_TICKS`] interval, so the
+//! replica keeps retrying (never faster than that interval, so it never
+//! races a genuinely-still-progressing attempt) until it can actually make
+//! progress. See [`SmrNode::on_catch_up_watchdog`]'s docs for why re-issuing
+//! is a pure liveness action that never touches ISR/decision/quorum
+//! correctness.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
-use queso_consensus::proposer::{Proposer, KICKOFF_TIMER};
+use queso_consensus::proposer::{Proposer, KICKOFF_TIMER, MAX_RETRIES_PER_STEP, RETRY_DELAY_TICKS};
 use queso_consensus::recorder::Recorder;
 use queso_consensus::rpc::ConcreteMsg;
 use queso_sim::ids::{NodeId, TimerId};
@@ -128,6 +144,42 @@ fn catch_up_probe(slot: u64) -> Command {
         key: CATCH_UP_KEY,
     }
 }
+
+/// How many logical ticks a catch-up attempt is given to make forward
+/// progress before the quiescence watchdog ([`SmrNode::on_catch_up_watchdog`])
+/// concludes its underlying [`Proposer`] has parked for good and re-issues
+/// catch-up from scratch.
+///
+/// # The "permanent zombie" liveness bug this closes (P11/O4)
+///
+/// A [`Proposer`]'s per-step retries are capped
+/// (`queso_consensus::proposer::MAX_RETRIES_PER_STEP` retries,
+/// [`RETRY_DELAY_TICKS`] apart -- currently `64 * 20 = 1280` ticks worst
+/// case); once that budget is exhausted for a step, the proposer stops
+/// retrying and *parks* -- nothing in `queso_consensus` ever wakes it again
+/// except a response that happens to arrive anyway (see that module's
+/// "Retries" docs). Without this watchdog, [`SmrNode::begin_next_attempt`]/
+/// [`SmrNode::begin_catch_up`] both refuse to start anything new while
+/// `current_attempt.is_some()`, so a parked catch-up attempt -- e.g. a
+/// replica restarted alone after a full-cluster crash, unable to reach a
+/// live majority -- would occupy that slot *forever*, even once a majority
+/// becomes reachable again: nothing else in this crate ever re-arms it, so
+/// the replica silently stays at whatever `next_slot` it restarted with,
+/// and a client `Get` routed to it never completes, even though
+/// `SmrCluster::live()` still reports it live.
+///
+/// Deliberately set to comfortably more than double the proposer's own
+/// worst-case per-step exhaustion time, so the watchdog only ever fires
+/// once the underlying proposer has genuinely parked -- never racing (or
+/// interrupting) its own legitimate, still-in-progress retries.
+const CATCH_UP_WATCHDOG_TICKS: u64 = 2 * (MAX_RETRIES_PER_STEP as u64) * RETRY_DELAY_TICKS;
+
+/// Reserved timer id for the catch-up quiescence watchdog. Distinct from
+/// [`KICKOFF_TIMER`] (`TimerId(u64::MAX)`) and from any live [`Proposer`]'s
+/// own per-step retry timer (`TimerId(step)`, always far smaller in any run
+/// this crate's tests exercise -- A7, step counts are practically bounded),
+/// so the three timer namespaces a replica uses never collide.
+const CATCH_UP_WATCHDOG_TIMER: TimerId = TimerId(u64::MAX - 1);
 
 /// Which of two things a [`CurrentAttempt`] is standing in for: a real
 /// client-visible operation, or this replica's own internal restart
@@ -251,6 +303,22 @@ pub struct ReplicaState {
     /// `queue`: a real crash loses a proposer's not-yet-quorate
     /// conversation with recorders.
     current_attempt: Option<CurrentAttempt>,
+    /// The `(slot, generation)` the most recently armed catch-up quiescence
+    /// watchdog timer ([`CATCH_UP_WATCHDOG_TIMER`]) was armed for, if any --
+    /// `generation` is `watchdog_generation`'s value at arm time. The
+    /// kernel has no facility to cancel an already-scheduled timer (see
+    /// `queso_sim::node::NodeCtx::schedule_timer`'s docs), so every firing
+    /// must re-check both fields against current state before acting --
+    /// exactly the same "recognize and ignore a stale timer" discipline
+    /// [`Proposer`]'s own retry timer already uses (`req_step`/`step`). See
+    /// [`SmrNode::on_catch_up_watchdog`]. Volatile: purely a liveness
+    /// bookkeeping aid, not part of what a restart needs to recover.
+    watchdog_armed_for: Option<(u64, u64)>,
+    /// Monotonically increasing generation counter, bumped every time a
+    /// catch-up attempt is (re)armed -- including by the watchdog re-issuing
+    /// catch-up itself -- so a watchdog firing can recognize whether it is
+    /// still watching the attempt it was armed for. See `watchdog_armed_for`.
+    watchdog_generation: u64,
 }
 
 /// The [`queso_sim::node::Node`] implementation each replica runs. Thin
@@ -330,6 +398,106 @@ impl SmrNode {
             slot,
             proposer,
         });
+        self.arm_catch_up_watchdog(st, ctx, slot);
+    }
+
+    /// (Re-)arm the catch-up quiescence watchdog for the catch-up attempt
+    /// just started at `slot`: bump the generation counter, record which
+    /// `(slot, generation)` this arm is watching, and schedule
+    /// [`CATCH_UP_WATCHDOG_TIMER`] to fire [`CATCH_UP_WATCHDOG_TICKS`] ticks
+    /// from now. Called only from [`Self::begin_catch_up`], so every catch-up
+    /// attempt -- whether started fresh, resumed after learning of another
+    /// slot, or reissued by the watchdog itself -- is always watched by
+    /// exactly one live arm.
+    fn arm_catch_up_watchdog(
+        &self,
+        st: &mut ReplicaState,
+        ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>,
+        slot: u64,
+    ) {
+        st.watchdog_generation += 1;
+        st.watchdog_armed_for = Some((slot, st.watchdog_generation));
+        ctx.schedule_timer(CATCH_UP_WATCHDOG_TICKS, CATCH_UP_WATCHDOG_TIMER);
+    }
+
+    /// [`CATCH_UP_WATCHDOG_TIMER`] fired. Re-issues catch-up iff this firing
+    /// is still watching a *live, unprogressed* catch-up attempt:
+    ///
+    /// 1. `watchdog_armed_for`'s `(slot, generation)` must still match
+    ///    `watchdog_generation` exactly -- otherwise a fresher arm has
+    ///    already superseded this one (catch-up advanced to a new slot, or
+    ///    the watchdog itself already re-armed once), so this firing is
+    ///    stale.
+    /// 2. The replica's *current* attempt must still be a catch-up attempt
+    ///    targeting that exact slot -- otherwise the frontier genuinely
+    ///    advanced (catch-up finished and ordinary work resumed, or another
+    ///    restart happened) since this timer was armed.
+    ///
+    /// Both together are the same "recognize and ignore a stale timer"
+    /// discipline [`Proposer`]'s own retry timer already relies on
+    /// (`req_step`/`step`) -- see the module docs.
+    ///
+    /// # Why re-issuing (drop + fresh [`Proposer`]) is safe, not just live
+    ///
+    /// This only ever changes *when* a catch-up probe is (re)proposed, never
+    /// what gets decided or how: [`catch_up_probe`] is a pure function of
+    /// `slot`, so the dropped attempt's `command` and the fresh attempt's
+    /// `command` are *identical* -- `finish_attempt`'s `decided ==
+    /// attempt.command` check (the one that recognizes "this replica's own
+    /// probe is what won the slot") is content-based, not tied to which
+    /// `Proposer` *instance* sent it. Any response the abandoned `Proposer`
+    /// is still owed (its outstanding retries were never cancelled -- the
+    /// kernel has no such facility, see `watchdog_armed_for`'s docs) that
+    /// arrives late is simply folded into the fresh `Proposer`'s own
+    /// `responses` for the same `(slot, step)` if it is still waiting on
+    /// that exact step (`Proposer::on_response`'s `slot`/`req_step` check is
+    /// the only gate `SmrNode::on_message` applies before forwarding) --
+    /// exactly the same "any number of `record` calls, from any number of
+    /// proposers, converge safely on one recorder's shared per-step ISR
+    /// state" tolerance this module's own docs already describe for
+    /// concurrent proposers racing the same slot from *different* replicas.
+    /// Nothing here is a new safety argument, only one more source (this
+    /// replica's own superseded local proposer) of the same kind of
+    /// harmless, provenance-agnostic extra evidence the algorithm already
+    /// tolerates by design. This never touches ISR/decision/quorum logic
+    /// itself -- `Recorder`/`Proposer` are used completely unmodified.
+    fn on_catch_up_watchdog(
+        &self,
+        st: &mut ReplicaState,
+        ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>,
+    ) {
+        let Some((watched_slot, watched_generation)) = st.watchdog_armed_for else {
+            return;
+        };
+        if watched_generation != st.watchdog_generation {
+            return; // Superseded by a fresher arm -- stale, ignore.
+        }
+        let is_stalled_catch_up = matches!(
+            st.current_attempt.as_ref(),
+            Some(attempt)
+                if attempt.slot == watched_slot
+                    && matches!(attempt.origin, AttemptOrigin::CatchUp)
+        );
+        if !is_stalled_catch_up {
+            // Either idle, running an ordinary op, or already catching up on
+            // a later slot -- catch-up made progress (or finished) since
+            // this watchdog was armed. Nothing to re-arm.
+            return;
+        }
+        // The catch-up attempt for `watched_slot` has made no progress in a
+        // full watchdog interval -- comfortably longer than the underlying
+        // `Proposer`'s own worst-case retry budget (see
+        // `CATCH_UP_WATCHDOG_TICKS`), so it has almost certainly exhausted
+        // its retries and parked forever: exactly the liveness bug this
+        // watchdog exists to close. Drop the stale attempt and start a
+        // brand-new catch-up `Proposer` at the same frontier slot -- fresh
+        // retry budget, fresh watchdog arm -- so the replica keeps trying
+        // instead of zombie-parking. `begin_catch_up` re-arms the watchdog
+        // itself, so this replica keeps retrying, once per interval,
+        // indefinitely, until a majority becomes reachable and catch-up can
+        // actually make progress.
+        st.current_attempt = None;
+        self.begin_catch_up(st, ctx);
     }
 
     /// The current attempt's slot has decided (on *some* value -- not
@@ -474,6 +642,12 @@ impl Node<ConcreteMsg<Command>> for SmrNode {
             // rather than a direct call: `submit` runs outside any `Node`
             // callback, so it has no `NodeCtx` to drive a `Proposer` with).
             self.begin_next_attempt(&mut st, ctx);
+            return;
+        }
+        if timer_id == CATCH_UP_WATCHDOG_TIMER {
+            // See `Self::on_catch_up_watchdog` for the re-arm/re-issue
+            // logic and why it never risks safety, only liveness.
+            self.on_catch_up_watchdog(&mut st, ctx);
             return;
         }
         if let Some(attempt) = st.current_attempt.as_mut() {
