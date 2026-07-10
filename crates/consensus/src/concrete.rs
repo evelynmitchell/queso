@@ -19,9 +19,17 @@
 //! the correctness-baseline fallback); [`ConcreteCluster::new_with_leader`]
 //! (Phase 3, §4.2.5) additionally designates one replica as the round-1
 //! fast-path leader -- see `crate::proposer`'s module docs for the safety
-//! argument tying the two together.
+//! argument tying the two together. [`ConcreteCluster::new_with_schedule`]
+//! and [`ConcreteCluster::new_with_delays`] (Phase 5, §5.1-5.2) additionally
+//! stagger *when* each replica's proposer activates -- see `crate::proposer`'s
+//! module docs' "Hedging" section for the mechanism; this module's only job
+//! is schedule *construction* (turning a leader + base delay δ, or an
+//! explicit per-replica map, into the `activation_delay` each
+//! [`crate::proposer::Proposer`] is built with) and wiring each replica's
+//! recorder up to feed its own colocated proposer's evidence-of-progress
+//! signal (`ReplicaNode`'s `local_step` field, below).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::rc::Rc;
@@ -30,7 +38,7 @@ use queso_sim::fault::FaultCommand;
 use queso_sim::ids::{NodeId, TimerId};
 use queso_sim::node::{Node, NodeCtx};
 use queso_sim::scheduler::SchedulerKind;
-use queso_sim::trace::Trace;
+use queso_sim::trace::{Trace, TraceEvent};
 use queso_sim::Kernel;
 
 use crate::proposer::{Proposer, KICKOFF_TIMER};
@@ -47,11 +55,26 @@ use crate::rpc::ConcreteMsg;
 struct ReplicaNode<V> {
     proposer: Rc<RefCell<Proposer<V>>>,
     recorder: Rc<RefCell<Recorder<V>>>,
+    /// This replica's own colocated recorder's most-recently-observed ISR
+    /// step, updated below every time `recorder` answers *any* proposer's
+    /// `record` request (local or remote) -- the evidence-of-progress
+    /// signal `proposer` consults when hedged (`Proposer::with_hedging`;
+    /// see that module's "Hedging" docs). Shared (not owned) because
+    /// `Proposer` itself needs read access to the same cell.
+    local_step: Rc<Cell<u64>>,
 }
 
 impl<V> ReplicaNode<V> {
-    fn new(proposer: Rc<RefCell<Proposer<V>>>, recorder: Rc<RefCell<Recorder<V>>>) -> Self {
-        Self { proposer, recorder }
+    fn new(
+        proposer: Rc<RefCell<Proposer<V>>>,
+        recorder: Rc<RefCell<Recorder<V>>>,
+        local_step: Rc<Cell<u64>>,
+    ) -> Self {
+        Self {
+            proposer,
+            recorder,
+            local_step,
+        }
     }
 }
 
@@ -64,8 +87,12 @@ impl<V: Ord + Clone> Node<ConcreteMsg<V>> for ReplicaNode<V> {
     ) {
         match payload {
             ConcreteMsg::Request(req) => {
-                // Passive recorder role: answer the RPC, nothing else.
+                // Passive recorder role: answer the RPC, then publish the
+                // resulting step for this replica's own (possibly hedged)
+                // proposer to observe -- see `local_step`'s docs. This is
+                // pure bookkeeping: the recorder's own answer is unchanged.
                 let resp = self.recorder.borrow_mut().handle(req);
+                self.local_step.set(resp.step);
                 ctx.send(from, ConcreteMsg::Response(resp));
             }
             ConcreteMsg::Response(resp) => {
@@ -107,6 +134,11 @@ pub struct ConcreteCluster<V> {
     /// against the *full* replica count (see `crate::proposer`'s module
     /// docs on why).
     live: BTreeSet<NodeId>,
+    /// Each replica's configured hedging activation delay (Phase 5,
+    /// §5.1-5.2) -- the same value each was built with via
+    /// `Proposer::with_hedging`. All zero for clusters built via `new`/
+    /// `new_with_leader` (unconditional δ=0 activation, unchanged).
+    activation_delays: BTreeMap<NodeId, u64>,
 }
 
 impl<V: Ord + Clone + Debug + 'static> ConcreteCluster<V> {
@@ -125,33 +157,99 @@ impl<V: Ord + Clone + Debug + 'static> ConcreteCluster<V> {
     /// Build a cluster with one replica per `(NodeId, initial value)` pair,
     /// all initially live, and `leader` designated as the slot's fast-path
     /// leader (§4.2.5, D1) for round 1 -- or `None` for the purely
-    /// leaderless Phase-2 behavior. `leader` is passed to *every*
-    /// [`Proposer`] built here (the invariant `Proposer::new` documents)
-    /// and to the kernel via `Kernel::set_leader`, so adversary schedulers
-    /// that key off "the current leader" (e.g.
-    /// `queso_sim::scheduler::ContentObliviousAdversary::with_leader_dos`)
-    /// target the same replica.
+    /// leaderless Phase-2 behavior. Equivalent to
+    /// `Self::new_with_schedule(seed, scheduler, initial_values, leader, 0)`
+    /// -- base delay δ=0, so every proposer activates unconditionally the
+    /// instant it starts (Phase 3 behavior, unchanged; see
+    /// `crate::proposer`'s module docs' "Hedging" section for why δ=0
+    /// collapses exactly to this).
     pub fn new_with_leader(
         seed: u64,
         scheduler: SchedulerKind<ConcreteMsg<V>>,
         initial_values: BTreeMap<NodeId, V>,
         leader: Option<NodeId>,
     ) -> Self {
+        Self::new_with_schedule(seed, scheduler, initial_values, leader, 0)
+    }
+
+    /// Build a cluster whose proposers follow a **hedging schedule**
+    /// (Phase 5, §5.1-5.2): `leader` (if any) is always first, at delay 0;
+    /// every other replica is ranked in ascending `NodeId` order and
+    /// assigned delay `rank * base_delay` (the paper's single base delay
+    /// δ). A leaderless cluster (`leader: None`) still gets a schedule --
+    /// the lowest-`NodeId` replica is rank 0 -- since §5.2's construction
+    /// only special-cases *whether* there's a leader to put first, not
+    /// whether hedging itself applies.
+    ///
+    /// `base_delay = 0` reproduces `new_with_leader`'s unconditional
+    /// activation exactly (every rank's delay collapses to `0`).
+    pub fn new_with_schedule(
+        seed: u64,
+        scheduler: SchedulerKind<ConcreteMsg<V>>,
+        initial_values: BTreeMap<NodeId, V>,
+        leader: Option<NodeId>,
+        base_delay: u64,
+    ) -> Self {
+        let mut order: Vec<NodeId> = initial_values.keys().copied().collect();
+        order.sort();
+        if let Some(l) = leader {
+            order.retain(|&id| id != l);
+            order.insert(0, l);
+        }
+        let delays: BTreeMap<NodeId, u64> = order
+            .into_iter()
+            .enumerate()
+            .map(|(rank, id)| (id, rank as u64 * base_delay))
+            .collect();
+        Self::new_with_delays(seed, scheduler, initial_values, leader, delays)
+    }
+
+    /// Build a cluster with an **explicit, arbitrary per-replica**
+    /// activation delay map (Phase 5, §5.1-5.2) -- the fully general form
+    /// underlying [`Self::new_with_schedule`], useful for exercising
+    /// deliberately non-monotonic or per-proposer-misconfigured schedules
+    /// (P15: liveness must hold for *any* δ, including badly misconfigured
+    /// ones) that a single base-delay-and-rank formula cannot express. A
+    /// replica missing from `activation_delays` gets delay `0` (activates
+    /// unconditionally, same as an unhedged proposer).
+    ///
+    /// `leader` is passed to *every* [`Proposer`] built here (the
+    /// invariant `Proposer::new` documents) and to the kernel via
+    /// `Kernel::set_leader`, so adversary schedulers that key off "the
+    /// current leader" (e.g.
+    /// `queso_sim::scheduler::ContentObliviousAdversary::with_leader_dos`)
+    /// target the same replica.
+    pub fn new_with_delays(
+        seed: u64,
+        scheduler: SchedulerKind<ConcreteMsg<V>>,
+        initial_values: BTreeMap<NodeId, V>,
+        leader: Option<NodeId>,
+        activation_delays: BTreeMap<NodeId, u64>,
+    ) -> Self {
         let n = initial_values.len();
         let mut kernel = Kernel::new(seed, scheduler);
         kernel.set_leader(leader);
         let mut proposers = BTreeMap::new();
         let mut replicas = Vec::new();
+        let mut resolved_delays = BTreeMap::new();
 
         for (id, v) in initial_values {
+            let delay = activation_delays.get(&id).copied().unwrap_or(0);
+            let local_step = Rc::new(Cell::new(0));
             // Slot 0: `ConcreteCluster` is single-slot (see `crate::rpc`'s
             // `RecordRequest::slot` docs for what this tag is for and why
             // it is inert here).
-            let proposer = Rc::new(RefCell::new(Proposer::new(id, n, v, leader, 0)));
+            let proposer = Rc::new(RefCell::new(
+                Proposer::new(id, n, v, leader, 0).with_hedging(delay, local_step.clone()),
+            ));
             let recorder = Rc::new(RefCell::new(Recorder::new()));
-            kernel.add_node(id, Box::new(ReplicaNode::new(proposer.clone(), recorder)));
+            kernel.add_node(
+                id,
+                Box::new(ReplicaNode::new(proposer.clone(), recorder, local_step)),
+            );
             proposers.insert(id, proposer);
             replicas.push(id);
+            resolved_delays.insert(id, delay);
         }
         replicas.sort();
         let live = replicas.iter().copied().collect();
@@ -162,6 +260,7 @@ impl<V: Ord + Clone + Debug + 'static> ConcreteCluster<V> {
             proposers,
             leader,
             live,
+            activation_delays: resolved_delays,
         }
     }
 
@@ -173,6 +272,36 @@ impl<V: Ord + Clone + Debug + 'static> ConcreteCluster<V> {
     /// The slot's designated fast-path leader, if any.
     pub fn leader(&self) -> Option<NodeId> {
         self.leader
+    }
+
+    /// This replica's configured hedging activation delay (`0` for
+    /// clusters built via `new`/`new_with_leader`).
+    pub fn activation_delay(&self, id: NodeId) -> u64 {
+        self.activation_delays.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Whether this replica's proposer has ever sent a `record` request --
+    /// `false` the whole time a hedged, currently-passive proposer is
+    /// waiting out its delay or deferring to observed progress elsewhere
+    /// (see `crate::proposer::Proposer::activated`'s docs).
+    pub fn activated(&self, id: NodeId) -> bool {
+        self.proposers
+            .get(&id)
+            .is_some_and(|p| p.borrow().activated())
+    }
+
+    /// Total number of messages sent so far in this run (both `record`
+    /// requests and their responses) -- a direct proxy for D2's `O(n)`
+    /// (leader-only, under synchrony) vs. `O(n^2)` (all-proposers-active)
+    /// messaging-cost distinction, read straight off the trace so it
+    /// requires no separate bookkeeping.
+    pub fn message_count(&self) -> usize {
+        self.kernel
+            .trace()
+            .events()
+            .iter()
+            .filter(|e| matches!(e, TraceEvent::Send { .. }))
+            .count()
     }
 
     /// Replicas the driver currently considers live (not crashed).
@@ -286,6 +415,24 @@ impl<V: Ord + Clone + Debug + 'static> ConcreteCluster<V> {
     /// checks).
     pub fn trace(&self) -> &Trace {
         self.kernel.trace()
+    }
+
+    /// The kernel's current logical time.
+    pub fn now(&self) -> queso_sim::time::LogicalTime {
+        self.kernel.now()
+    }
+
+    /// Advance the kernel by `more_ticks` from wherever it currently is,
+    /// running whatever events (retries, hedge rechecks, in-flight
+    /// messages) are already scheduled -- unlike [`Self::run_slot`], this
+    /// does **not** re-inject any replica's `KICKOFF_TIMER`, so it is safe
+    /// to call more than once on the same cluster (e.g. to observe a
+    /// hedging schedule's intermediate state before enough ticks have
+    /// passed for a later-ranked proposer to activate, then let it play
+    /// out further).
+    pub fn advance(&mut self, more_ticks: u64) {
+        let until = self.kernel.now().advance(more_ticks);
+        self.kernel.run_until(until);
     }
 }
 

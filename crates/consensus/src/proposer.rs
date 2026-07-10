@@ -180,17 +180,126 @@
 //! already-superseded step is trivially recognized and ignored (`s.0 !=
 //! self.step`) rather than needing a separate generation counter.
 //!
-//! Retries are capped per step ([`MAX_RETRIES_PER_STEP`]); exceeding the
-//! cap does not panic (unlike `crate::tcast`'s hard "you promised a live
-//! majority" precondition) because a proposer legitimately *cannot* make
-//! progress when fewer than a majority of recorders are reachable at all
-//! (P11/O4: safety holds, liveness may simply stall) -- it just stops
-//! retrying and leaves the proposer parked at its current step.
+//! Retries are **unbounded**, with exponential backoff ([`retry_backoff_delay`])
+//! capped at a maximum spacing (issue #13: the previous design, a hard
+//! `MAX_RETRIES_PER_STEP` cap after which a proposer permanently "parked"
+//! itself, could leave a slot stalled forever even after the network
+//! healed or a majority became reachable again -- a genuine liveness bug,
+//! since nothing would ever wake the parked proposer back up). A proposer
+//! legitimately cannot make progress when fewer than a majority of
+//! recorders are reachable at all (P11/O4: safety holds, liveness may
+//! simply stall for as long as that holds) -- but the fix is to keep
+//! retrying, cheaply, forever, not to give up. Backoff bounds the *rate*
+//! of retries (so a permanently-unreachable majority does not spin the
+//! kernel), while never bounding their *count* (so a network that heals
+//! at tick 10,000,000 still resumes the slot).
+//!
+//! # Hedging (§5.1-5.2, P15/P16, D2)
+//!
+//! By default (`Proposer::new`, no [`Proposer::with_hedging`] call) a
+//! proposer activates -- sends its first `record` requests -- the instant
+//! [`Proposer::start`] runs, exactly reproducing Phase 3's unconditional
+//! δ=0 "every proposer active from round 1" behavior. [`Proposer::with_hedging`]
+//! opts a proposer into the paper's staggered *delayed-activation schedule*
+//! instead: the caller assigns each replica a position in the schedule (the
+//! designated leader, if any, always first with delay 0; §5.2) and an
+//! `activation_delay` derived from it (`(rank) * δ` for a single configured
+//! base delay δ -- see `crate::concrete::ConcreteCluster::new_with_schedule`
+//! for where that arithmetic lives; this module only ever sees the final
+//! per-replica delay, not the schedule-construction policy).
+//!
+//! `start` on a hedged proposer does not call [`begin_step`] immediately;
+//! it arms a one-shot [`HEDGE_TIMER`] for `activation_delay` ticks out.
+//! When that timer fires ([`Proposer::maybe_activate_after_hedge`]), the
+//! proposer checks `local_recorder_step` -- a handle to *this replica's own,
+//! co-located* recorder's most-recently-observed ISR step for this slot,
+//! updated by the driver (`crate::concrete::ReplicaNode::on_message`) every
+//! time that recorder answers *any* proposer's `record` request, local or
+//! remote. This is a genuinely free (no extra messages) signal: it is
+//! in-process state this replica already has for an unrelated reason
+//! (being a passive recorder), simply read instead of ignored, which is
+//! exactly what makes the "leader-only, no wasted proposals" `O(n)`
+//! synchrony case (D2) possible -- a suppressed backup's proposer sends
+//! *zero* bytes.
+//!
+//! - If `local_recorder_step` shows *fresh* evidence that the relevant step
+//!   has already been driven past round 1's first step *since the last time
+//!   this proposer checked* (§5.2: "has not by then seen evidence that some
+//!   other proposer ... has already driven the relevant step to
+//!   completion"), the proposer stays passive and rearms the hedge timer
+//!   for another [`HEDGE_RECHECK_TICKS`] to check again later.
+//! - Otherwise -- no progress was ever observed, *or* the last-observed
+//!   progress has since stalled (the recorder step did not move further
+//!   between two consecutive checks) -- the proposer activates via
+//!   [`begin_step`], exactly as an unhedged proposer would.
+//!
+//! # Why no δ (P15) can cause a permanent stall
+//!
+//! The crux is that "stay passive" is re-earned at every recheck, not
+//! granted once: a hedged proposer only *keeps* deferring while it keeps
+//! observing *new* forward motion on `local_recorder_step`. A healthy,
+//! progressing leader keeps producing that new motion (a live proposer
+//! completing steps keeps advancing the recorder's `S`), so backups
+//! correctly stay out of its way -- but the moment that motion stops (the
+//! leader crashed, was DoS'd, or was partitioned away from this replica),
+//! the *very next* recheck sees no advance since the previous one and
+//! activates unconditionally. Since step numbers are bounded in practice
+//! (A7), the number of "genuinely still progressing" rechecks before either
+//! a decision or a stall is itself bounded, so total suppression time is
+//! always finite regardless of δ: `activation_delay + k * HEDGE_RECHECK_TICKS`
+//! for some bounded `k`. This holds even for δ=0 (no hedge timer is ever
+//! armed at all -- see `start`), absurdly large δ (the very first recheck
+//! after that long a wait either finds a decided/progressing slot, in which
+//! case great, no wasted work was needed, or a stalled one, in which case it
+//! activates immediately), and per-replica-misconfigured schedules (every
+//! replica's suppression is independently re-earned, so no replica can be
+//! held passive by another replica's misconfiguration -- only by *itself*
+//! observing genuine, ongoing progress). A replica with no
+//! `local_recorder_step` wired up at all (hedged with a bare delay and no
+//! progress oracle) simply activates unconditionally once its one delay
+//! elapses -- also bounded, trivially.
+//!
+//! One deliberate, safety-motivated limitation worth calling out: a
+//! recorder's step never advances past round 1's first step ([`FIRST_ROUND_STEP`])
+//! from fast-path activity alone ([`fast_path_value`] lets a proposer decide
+//! *without* the recorder-visible step ever moving beyond it), so a hedged
+//! backup cannot distinguish "the leader's fast-path proposal reached this
+//! recorder's `F[4]` but never reached a majority" from "it reached a
+//! majority and the slot is already decided" using `local_recorder_step`
+//! alone -- and it would be *unsafe* to treat merely seeing `F[4]` locally
+//! as proof of the latter (a content-aware adversary could deliver the
+//! leader's proposal to a minority of recorders while still defeating the
+//! fast path everywhere, exactly as in `crate::proposer`'s fast-path safety
+//! argument above; a backup that wrongly stood down in that case, and every
+//! other backup reasoning the same way from its own recorder, could
+//! livelock -- N6). So a hedged backup errs on the side of eventually
+//! joining in once its own schedule slot comes up, even after a
+//! successful leader fast-path decision elsewhere: hedging's message
+//! savings in that case are a *bounded head start* (no wasted work happens
+//! before a backup's delay elapses), not a permanent guarantee that
+//! later-scheduled replicas never do any work for an already-decided slot.
+//! A caller that wants every replica to avoid ever redundantly deciding a
+//! slot it has no independent need to confirm (e.g. because it can instead
+//! learn the outcome from a replicated log) should simply not start a
+//! proposer for that replica at all -- an orthogonal, driver-level policy
+//! decision outside this module's scope.
+//!
+//! This is deliberately **not** a safety mechanism: it only ever changes
+//! *when* [`begin_step`] first runs for a given proposer, never anything
+//! about what a step, a quorum, a decision, or catch-up mean once activated
+//! -- all of that is the same, unmodified machinery documented above. A
+//! hedged proposer that activates "late" (having deferred, or having waited
+//! out a long δ) simply runs Algorithm 4 from round 1, phase 0, same as
+//! ever; the majority-intersection argument for Agreement never mentions
+//! *when* any proposer started, only what genuine quorums it forms once it
+//! does.
 
 use queso_sim::ids::{NodeId, TimerId};
 use queso_sim::node::NodeCtx;
 use rand::Rng;
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use crate::proposal::Proposal;
 use crate::rpc::{ConcreteMsg, RecordRequest, RecordResponse};
@@ -219,20 +328,40 @@ pub const H: u64 = u64::MAX;
 /// the only step at which the phase-0 fast path can fire.
 const FIRST_ROUND_STEP: u64 = 4;
 
-/// Retry budget per step before a proposer gives up retrying (but stays
-/// parked, ready to resume if fresh network activity reaches it) -- see the
-/// module docs' "Retries" section for why this does not panic.
-pub const MAX_RETRIES_PER_STEP: u32 = 64;
-
-/// How many logical ticks a proposer waits after sending (or resending) a
-/// step's requests before checking whether it needs to retry.
+/// How many logical ticks a proposer waits, at minimum, after sending (or
+/// resending) a step's requests before checking whether it needs to retry.
+/// The *actual* spacing grows with [`retry_backoff_delay`]; this is the
+/// base (first-retry) value.
 pub const RETRY_DELAY_TICKS: u64 = 20;
+
+/// Retries never stop (issue #13 -- see the module docs' "Retries"
+/// section), but their spacing backs off exponentially up to this many
+/// doublings of [`RETRY_DELAY_TICKS`], so a permanently-unreachable
+/// majority costs bounded retry *rate*, not unbounded retry *count*.
+const RETRY_BACKOFF_MAX_SHIFT: u32 = 6;
+
+/// The spacing before the `retries`-th retry (0-indexed): `RETRY_DELAY_TICKS`
+/// doubled up to [`RETRY_BACKOFF_MAX_SHIFT`] times, then held constant.
+fn retry_backoff_delay(retries: u32) -> u64 {
+    let shift = retries.min(RETRY_BACKOFF_MAX_SHIFT);
+    RETRY_DELAY_TICKS.saturating_mul(1u64 << shift)
+}
 
 /// The timer id used to kick off a proposer's very first step. Distinct
 /// from any real retry timer id (`TimerId(step)`) because step numbers stay
 /// far below `u64::MAX` in any run this crate's tests exercise (A7: step
 /// counts are practically bounded).
 pub const KICKOFF_TIMER: TimerId = TimerId(u64::MAX);
+
+/// The timer id used for a hedged proposer's delayed-activation checks (see
+/// the module docs' "Hedging" section). Distinct from `KICKOFF_TIMER` and
+/// from any real retry timer id (`TimerId(step)`) for the same A7-bounded
+/// reason.
+pub const HEDGE_TIMER: TimerId = TimerId(u64::MAX - 1);
+
+/// How many logical ticks a hedged, currently-passive proposer waits before
+/// rechecking whether it should activate (see [`Proposer::with_hedging`]).
+pub const HEDGE_RECHECK_TICKS: u64 = RETRY_DELAY_TICKS;
 
 /// The retry-timer id for a given step: reusing the step number itself as
 /// the timer id, so a stale timer is recognizable without extra state (see
@@ -349,7 +478,31 @@ pub struct Proposer<V> {
     /// referring to the same request).
     sent: BTreeMap<NodeId, Proposal<V>>,
     /// Retries used so far for the current step; reset every `begin_step`.
+    /// Also feeds [`retry_backoff_delay`].
     retries_this_step: u32,
+    /// Ticks to wait, after `start`, before this proposer's first
+    /// activation attempt (see [`Proposer::with_hedging`]). `0` (the
+    /// default from `Proposer::new`) reproduces unconditional δ=0
+    /// activation exactly: `start` skips the hedge timer entirely.
+    activation_delay: u64,
+    /// A handle to this replica's own co-located recorder's
+    /// most-recently-observed ISR step for this slot (see the module docs'
+    /// "Hedging" section for why this, and not a network probe, is the
+    /// evidence-of-progress signal). `None` if this proposer was never
+    /// wired up with one -- a hedged-by-delay-only proposer with no
+    /// progress oracle, which just activates once its delay elapses.
+    local_recorder_step: Option<Rc<Cell<u64>>>,
+    /// The `local_recorder_step` value as of the *previous* hedge recheck
+    /// (or `None` before the first one), used to tell *fresh* progress
+    /// (worth deferring for) from stale/stalled progress (not worth
+    /// deferring for -- see the module docs' "why no δ can stall" section).
+    last_seen_progress: Option<u64>,
+    /// Whether `begin_step` has ever run for this proposer -- i.e. whether
+    /// it has sent so much as one `record` request yet. `false` the entire
+    /// time a hedged proposer is waiting out its delay or deferring.
+    /// Exposed via [`Proposer::activated`] for tests asserting D2's
+    /// "backups stay passive" behavior.
+    activated: bool,
 }
 
 impl<V: Ord + Clone> Proposer<V> {
@@ -395,12 +548,58 @@ impl<V: Ord + Clone> Proposer<V> {
             responses: BTreeMap::new(),
             sent: BTreeMap::new(),
             retries_this_step: 0,
+            activation_delay: 0,
+            local_recorder_step: None,
+            last_seen_progress: None,
+            activated: false,
         }
+    }
+
+    /// Opt this proposer into the hedging schedule (§5.2; see the module
+    /// docs' "Hedging" section for the full design). Without this call
+    /// (the default), a proposer activates the instant `start` runs --
+    /// Phase 3's unconditional δ=0 behavior, unchanged.
+    ///
+    /// `activation_delay` is this proposer's position in the schedule,
+    /// already resolved to a tick count by the caller (e.g. `rank * δ` --
+    /// see `crate::concrete::ConcreteCluster::new_with_schedule`); this
+    /// type has no opinion on schedule-construction policy, only on what
+    /// to do with the final per-replica delay.
+    ///
+    /// `local_recorder_step` is a handle to this replica's own co-located
+    /// recorder's most-recently-observed step for this slot, kept fresh by
+    /// the driver every time that recorder answers *any* `record` request
+    /// (see `crate::concrete::ReplicaNode`) -- the free, zero-extra-message
+    /// evidence-of-progress signal a hedged proposer consults before
+    /// activating.
+    pub fn with_hedging(
+        mut self,
+        activation_delay: u64,
+        local_recorder_step: Rc<Cell<u64>>,
+    ) -> Self {
+        self.activation_delay = activation_delay;
+        self.local_recorder_step = Some(local_recorder_step);
+        self
     }
 
     /// This replica's decision, if any.
     pub fn decided(&self) -> Option<&V> {
         self.decided.as_ref()
+    }
+
+    /// This proposer's configured hedging delay (ticks after `start` before
+    /// its first activation attempt); `0` if [`Proposer::with_hedging`] was
+    /// never called.
+    pub fn activation_delay(&self) -> u64 {
+        self.activation_delay
+    }
+
+    /// Whether this proposer has ever sent a `record` request -- `false`
+    /// the whole time a hedged, currently-passive proposer is waiting out
+    /// its delay or deferring to observed progress elsewhere. See the
+    /// module docs' "Hedging" section.
+    pub fn activated(&self) -> bool {
+        self.activated
     }
 
     /// The current step (for tests/introspection).
@@ -432,15 +631,57 @@ impl<V: Ord + Clone> Proposer<V> {
 
     /// Kick off round 1, phase 0 (`s <- 4*1 + 0`). Called once, from the
     /// driver injecting a `KICKOFF_TIMER`.
+    ///
+    /// If this proposer was configured with [`Proposer::with_hedging`] and
+    /// has a nonzero `activation_delay`, this does *not* activate
+    /// immediately: it arms [`HEDGE_TIMER`] and defers the actual first
+    /// `begin_step` to [`Proposer::maybe_activate_after_hedge`]. With no
+    /// hedging configured (`activation_delay == 0`, the default), this is
+    /// exactly Phase 3's unconditional behavior: activate right now.
     pub fn start(&mut self, ctx: &mut NodeCtx<'_, ConcreteMsg<V>>) {
         self.step = FIRST_ROUND_STEP;
-        self.begin_step(ctx);
+        if self.activation_delay == 0 {
+            self.begin_step(ctx);
+        } else {
+            ctx.schedule_timer(self.activation_delay, HEDGE_TIMER);
+        }
+    }
+
+    /// A hedge timer has fired: either this proposer's initial
+    /// `activation_delay` has elapsed, or a prior recheck's
+    /// [`HEDGE_RECHECK_TICKS`] has. Decide whether to stay passive (defer
+    /// again) or activate -- see the module docs' "Hedging" and "Why no δ
+    /// can cause a permanent stall" sections for the full reasoning.
+    fn maybe_activate_after_hedge(&mut self, ctx: &mut NodeCtx<'_, ConcreteMsg<V>>) {
+        if self.decided.is_some() {
+            // Nothing to activate for -- already done (only reachable if a
+            // caller somehow drove this proposer to a decision through some
+            // other path before its hedge timer fired; defensive, not
+            // expected in the current single-slot/SMR drivers).
+            return;
+        }
+        let current = self.local_recorder_step.as_ref().map(|cell| cell.get());
+        let saw_fresh_progress = matches!(
+            current,
+            Some(step) if step > self.step && Some(step) != self.last_seen_progress
+        );
+        if saw_fresh_progress {
+            self.last_seen_progress = current;
+            ctx.schedule_timer(HEDGE_RECHECK_TICKS, HEDGE_TIMER);
+        } else {
+            // Either no progress was ever observed, or the last-observed
+            // progress has stalled since the previous recheck (no further
+            // advance) -- safe, and necessary for liveness (P15/P16), to
+            // activate now.
+            self.begin_step(ctx);
+        }
     }
 
     /// Prepare and send this step's `record` requests to every recorder,
     /// then arm the retry timer. Used both for the very first step (via
-    /// `start`) and every subsequent step/catch-up.
+    /// `start`, possibly hedged) and every subsequent step/catch-up.
     fn begin_step(&mut self, ctx: &mut NodeCtx<'_, ConcreteMsg<V>>) {
+        self.activated = true;
         self.responses.clear();
         self.sent.clear();
         self.retries_this_step = 0;
@@ -533,10 +774,14 @@ impl<V: Ord + Clone> Proposer<V> {
         }
     }
 
-    /// A retry (or kickoff) timer has fired.
+    /// A retry, hedge, or kickoff timer has fired.
     pub fn on_timer(&mut self, timer_id: TimerId, ctx: &mut NodeCtx<'_, ConcreteMsg<V>>) {
         if timer_id == KICKOFF_TIMER {
             self.start(ctx);
+            return;
+        }
+        if timer_id == HEDGE_TIMER {
+            self.maybe_activate_after_hedge(ctx);
             return;
         }
         if self.decided.is_some() || timer_id.0 != self.step {
@@ -549,21 +794,17 @@ impl<V: Ord + Clone> Proposer<V> {
             // retry.
             return;
         }
-        if self.retries_this_step >= MAX_RETRIES_PER_STEP {
-            // Give up retrying this step -- see the module docs' "Retries"
-            // section: this is the expected shape of a stall when fewer
-            // than a majority of recorders are reachable, not a bug to
-            // panic about.
-            return;
-        }
-        self.retries_this_step += 1;
+        // Unbounded retry with exponential backoff (issue #13) -- see the
+        // module docs' "Retries" section for why this never gives up.
+        let delay = retry_backoff_delay(self.retries_this_step);
+        self.retries_this_step = self.retries_this_step.saturating_add(1);
         for recorder in self.all_recorders() {
             if !self.responses.contains_key(&recorder) {
                 let proposal = self.sent[&recorder].clone();
                 self.send_request(recorder, proposal, ctx);
             }
         }
-        ctx.schedule_timer(RETRY_DELAY_TICKS, retry_timer_id(self.step));
+        ctx.schedule_timer(delay, retry_timer_id(self.step));
     }
 
     /// A quorum of replies for the current step has been gathered; branch
