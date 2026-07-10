@@ -1,0 +1,17 @@
+# Phase-0 determinism gate: forbid the classic sources of nondeterminism from
+# ever creeping into the simulation kernel. See docs/03-testing-plan.md §1 and
+# docs/02-properties.md D9. Enforced as `deny` via `[workspace.lints.clippy]`
+# in the root Cargo.toml, so `cargo clippy -- -D warnings` fails the build if
+# any of these are used anywhere in the workspace.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "wall-clock time breaks determinism; use the kernel's LogicalTime" },
+    { path = "std::time::SystemTime::now", reason = "wall-clock time breaks determinism; use the kernel's LogicalTime" },
+    { path = "std::thread::spawn", reason = "the sim kernel is single-threaded by design; no thread interleaving nondeterminism allowed" },
+    { path = "rand::thread_rng", reason = "all randomness must come from the kernel's single seeded PRNG" },
+    { path = "rand::random", reason = "all randomness must come from the kernel's single seeded PRNG" },
+]
+
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is nondeterministic across runs/platforms; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order is nondeterministic across runs/platforms; use BTreeSet" },
+]
