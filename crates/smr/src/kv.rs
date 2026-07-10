@@ -71,6 +71,20 @@ impl Kv {
                 key,
                 value,
             } => {
+                // SOUNDNESS PRECONDITION (A6): this dedup test -- "drop any
+                // `seq` that is not strictly greater than the highest `seq`
+                // this client has ever had applied" -- is only correct
+                // under the single-in-flight-per-client contract: a client
+                // issues `seq`s in strictly increasing order and never has
+                // more than one operation in flight at a time (see
+                // `crate::command::ClientSession`'s docs). If a client ever
+                // violated that (e.g. pipelined two writes and the higher
+                // `seq` happened to apply first), this check would silently
+                // and permanently drop the lower-`seq` write as a spurious
+                // "duplicate" even though it was a distinct, never-applied
+                // command -- a real write lost, not idempotency. Stage 4a's
+                // client model guarantees the precondition holds; nothing
+                // here re-checks it at runtime.
                 let is_duplicate = self.last_seq.get(client).is_some_and(|&s| s >= *seq);
                 if is_duplicate {
                     Applied::PutDuplicate

@@ -30,6 +30,30 @@ pub struct ClientId(pub u32);
 /// must reuse the seq the first attempt used (that reuse, not a fresh
 /// `next_seq` call, is what makes a retry deduplicate via P8a; see
 /// `crate::kv::Kv::apply`).
+///
+/// # Precondition this dedup relies on (A6)
+///
+/// [`crate::kv::Kv::apply`]'s dedup logic -- drop any `Put` whose `seq` is
+/// not strictly greater than the highest `seq` already applied for that
+/// client -- is sound **only** if every real client honors both halves of
+/// this contract:
+///
+/// 1. `seq`s are issued in strictly increasing order (never reused except
+///    for an exact retry of the same logical operation, and never skipped
+///    backwards), and
+/// 2. the client has **at most one** operation in flight at a time (it
+///    waits for a response -- or gives up -- before issuing the next
+///    `seq`).
+///
+/// Violate either one -- e.g. a client that pipelines two writes and the
+/// higher `seq` happens to get applied first -- and the dedup check cannot
+/// tell "a stale retry of an old operation" apart from "a distinct write
+/// that just hasn't been applied yet": it will silently and permanently
+/// drop the lower-`seq` write as a false duplicate, losing a real write
+/// rather than merely papering over a harmless resend. `ClientSession` is
+/// the smallest thing that can honor (1); Stage 4a has no concurrent/
+/// multi-session client, so (2) is left to callers to uphold by
+/// construction (see the crate docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientSession {
     id: ClientId,

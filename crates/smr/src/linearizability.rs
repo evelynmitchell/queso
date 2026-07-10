@@ -83,13 +83,17 @@ pub fn history_from_records(records: &BTreeMap<OpId, OpRecord>) -> Vec<HistoryOp
 ///
 /// # Panics
 ///
-/// Debug-asserts `history.len() <= 63` (the search's memo uses a `u64`
-/// bitmask of "which operations have been placed so far"); this checker is
+/// Asserts `history.len() <= 63` (the search's memo uses a `u64` bitmask of
+/// "which operations have been placed so far"; 64+ operations would
+/// silently shift-overflow that mask rather than error). This is a real
+/// `assert!`, not a `debug_assert!`, so a release build fails loudly
+/// instead of returning a wrong (and unsound) answer -- this checker is
 /// documented, deliberately, as a small-history brute-force tool, not a
-/// scalable one.
+/// scalable one, and the check is cheap enough that release builds don't
+/// need to skip it.
 pub fn is_linearizable(history: &[HistoryOp]) -> bool {
     let n = history.len();
-    debug_assert!(
+    assert!(
         n <= 63,
         "is_linearizable is a brute-force checker for small histories only"
     );

@@ -155,6 +155,43 @@ impl SmrCluster {
         self.live.remove(&id);
     }
 
+    /// A faithful invocation timestamp for a *new* submission: at least
+    /// [`Kernel::now`], but strictly after every operation that has already
+    /// completed by this point in the driver's program order.
+    ///
+    /// This exists to close a real soundness hole in
+    /// [`crate::linearizability`]: `Kernel::now()` does not advance just
+    /// because `submit` is called outside of any dispatched event, so a
+    /// driver sequence like `submit(a); run_for(n); submit(b)` -- where `b`
+    /// is only submitted *after* `a` has been observed to complete -- can
+    /// otherwise produce `b.invoked_at == a.completed_at`. The checker's
+    /// real-time precedence relation is a strict `<`, so that tie would
+    /// wrongly let it treat `a` and `b` as concurrent, potentially
+    /// *accepting* a history it should reject (e.g. `b` observing a value
+    /// from before `a`'s write, even though `a` had already completed when
+    /// `b` was invoked).
+    ///
+    /// The fix is deliberately in the driver, not the checker or the
+    /// kernel's clock: every op still submitted *before* any completion
+    /// (genuinely concurrent submissions) gets `invoked_at == kernel.now()`
+    /// exactly as before, so overlapping intervals -- and the checker's
+    /// freedom to order them either way -- are unaffected. Only a
+    /// submission that the driver issues *after* some completion is pushed
+    /// strictly past that completion's timestamp.
+    fn next_invoked_at(&self) -> LogicalTime {
+        let now = self.kernel.now();
+        let max_completed = self
+            .results
+            .borrow()
+            .values()
+            .filter_map(|r| r.completed_at)
+            .max();
+        match max_completed {
+            Some(t) => std::cmp::max(now, t.advance(1)),
+            None => now,
+        }
+    }
+
     /// Submit `command` to `replica`: enqueue it, and -- if the replica was
     /// idle -- kick off its first attempt. Returns an [`OpId`] the caller
     /// uses to poll [`SmrCluster::result`] after running the simulation.
@@ -170,7 +207,7 @@ impl SmrCluster {
     pub fn submit(&mut self, replica: NodeId, command: Command) -> OpId {
         let op_id = OpId(self.next_op_id);
         self.next_op_id += 1;
-        let invoked_at = self.kernel.now();
+        let invoked_at = self.next_invoked_at();
         self.results.borrow_mut().insert(
             op_id,
             OpRecord {
