@@ -405,8 +405,11 @@ impl<V: Ord + Clone> Proposer<V> {
             3 => {
                 // Phase 3: gather C.
                 let best_c = best_of(self.responses.values().map(|r| r.prior_agg.clone())).expect(
-                    "phase 3 gathers a'_j from a quorum that just spread p in phase 2; \
-                     at least one reply must reflect it",
+                    "step s+1 traffic implies some proposer completed step s with an \
+                     all-at-s quorum Q_s; Q_s intersects this phase-3 quorum in a recorder \
+                     whose s->s+1 transition carried a non-nil A_c into A_p (Lemma C.5), so \
+                     at least one prior_agg is Some -- holds even when this proposer caught \
+                     up directly into phase 3 without spreading in phase 2",
                 );
                 self.proposal = best_c;
             }

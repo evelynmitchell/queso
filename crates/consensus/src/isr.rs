@@ -14,8 +14,8 @@
 //! actually packing bits, this ISR stores `Option<Proposal<V>>` directly:
 //! `None` is Algorithm 3's `nil`/zero (nothing is smaller than the "absence
 //! of a proposal" -- `Option`'s derived `Ord` already places `None` below
-//! every `Some`, matching "zero is smaller than every real proposal" as
-//! long as priorities are `>= 1`, see [`crate::proposer`]'s priority range),
+//! every `Some`, matching "zero is smaller than every real proposal"
+//! unconditionally, regardless of the priority range),
 //! and `aggregate` is `Ord::max` over that `Option<Proposal<V>>`.
 //!
 //! # Why this is constant space
