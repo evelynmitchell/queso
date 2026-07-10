@@ -18,6 +18,15 @@ Please read the documents, write up a white paper backgrounder describing this a
 
 Ask any questions you may have.
 
+# Project documents
+
+An initial project outline based on the README and the two PDFs lives in [`docs/`](docs/):
+
+- [`docs/00-project-outline.md`](docs/00-project-outline.md) — master outline: goals, guiding principles, phased roadmap, milestones, and open questions.
+- [`docs/01-backgrounder.md`](docs/01-backgrounder.md) — white-paper backgrounder on the consensus problem space, QuePaxa, and Meerkat, with references.
+- [`docs/02-properties.md`](docs/02-properties.md) — the property model: invariants that must hold, desirable properties, and non-desired / out-of-scope behaviors.
+- [`docs/03-testing-plan.md`](docs/03-testing-plan.md) — the testing plan: harness, property tests, deterministic simulation, formal verification, and benchmarks.
+
 # References
 
 https://blog.cloudflare.com/meerkat-introduction/
