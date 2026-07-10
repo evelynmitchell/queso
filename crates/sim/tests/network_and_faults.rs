@@ -198,6 +198,81 @@ fn partition_blocks_cross_group_traffic_and_heal_restores_it() {
 }
 
 #[test]
+fn partition_installed_after_send_still_drops_the_in_flight_message() {
+    // The message goes out before any partition exists (so it passes the
+    // send-time fault check and is queued for arrival), then a partition is
+    // installed between src and dst *before* the message's arrival tick.
+    // Delivery must still be cut off -- "partition = network cut" has to
+    // hold for messages already in flight, not just future sends.
+    let mut kernel = fifo_kernel(5);
+    let log = Rc::new(RefCell::new(Vec::new()));
+    kernel.add_node(
+        NodeId(1),
+        Box::new(Sink {
+            log: log.clone(),
+            restarts: Rc::new(RefCell::new(0)),
+        }),
+    );
+
+    kernel.inject_message(NodeId(0), NodeId(1), 7); // arrives at t=5
+    kernel.partition(BTreeSet::from([NodeId(0)]), BTreeSet::from([NodeId(1)])); // installed at t=0, before arrival
+    kernel.run();
+
+    assert!(
+        log.borrow().is_empty(),
+        "message already in flight when the partition was installed must not be delivered"
+    );
+    let arrival_drop = kernel.trace().events().iter().any(|e| {
+        matches!(
+            e,
+            TraceEvent::Drop {
+                reason: DropReason::PartitionedAtArrival,
+                ..
+            }
+        )
+    });
+    assert!(
+        arrival_drop,
+        "expected a Drop{{reason: PartitionedAtArrival}} trace event"
+    );
+    // And there is no Deliver event at all for this message.
+    assert!(
+        !kernel
+            .trace()
+            .events()
+            .iter()
+            .any(|e| matches!(e, TraceEvent::Deliver { .. })),
+        "no Deliver event should have been recorded"
+    );
+}
+
+#[test]
+fn sender_crash_after_send_does_not_prevent_delivery() {
+    // Deliberate asymmetry: unlike a partition, a sender crashing after the
+    // message was already sent does NOT retract the in-flight message in
+    // this crash-stop model.
+    let mut kernel = fifo_kernel(5);
+    let log = Rc::new(RefCell::new(Vec::new()));
+    kernel.add_node(
+        NodeId(1),
+        Box::new(Sink {
+            log: log.clone(),
+            restarts: Rc::new(RefCell::new(0)),
+        }),
+    );
+
+    kernel.inject_message(NodeId(0), NodeId(1), 11); // arrives at t=5
+    kernel.crash(NodeId(0)); // src crashes after the message is already in flight
+    kernel.run();
+
+    assert_eq!(
+        *log.borrow(),
+        vec![11],
+        "an in-flight message must survive its sender crashing afterwards"
+    );
+}
+
+#[test]
 fn slow_node_multiplies_delivery_delay() {
     let mut fast = fifo_kernel(2);
     fast.add_node(

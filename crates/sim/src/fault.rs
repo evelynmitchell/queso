@@ -21,10 +21,16 @@ pub enum DropReason {
     /// Source or destination node was crashed at send or arrival time.
     Crashed,
     /// Source and destination were on opposite sides of a manually
-    /// injected [`FaultState`] partition.
+    /// injected [`FaultState`] partition at send time.
     Partitioned,
     /// The scheduler (adversary or otherwise) chose to drop the message.
     Scheduler,
+    /// The message was already in flight when a manually injected
+    /// [`FaultState`] partition was installed between its source and
+    /// destination, so it was dropped at arrival time instead of being
+    /// delivered. Distinct from [`DropReason::Partitioned`] (which is a
+    /// send-time drop) so traces can tell the two situations apart.
+    PartitionedAtArrival,
 }
 
 /// Deterministic, explicitly-injected fault state. Mutated only through
