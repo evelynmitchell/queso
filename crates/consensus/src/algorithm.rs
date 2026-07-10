@@ -229,6 +229,27 @@ impl<V: Ord + Clone + std::fmt::Debug + 'static> Cluster<V> {
         let c_sets = call3.r;
         let u = call3.b;
 
+        // Safety crux (paper §4.1.2): the cross-node relation U ⊆ C_j ⊆ E_i is
+        // exactly what forces Agreement. It holds by construction in this tcast
+        // realization, but assert it every round so a future refactor of the
+        // three-call composition cannot silently break it — in debug/test builds
+        // this runs across the entire property-test seed corpus.
+        #[cfg(debug_assertions)]
+        {
+            for &j in &self.live {
+                assert!(
+                    u.is_subset(&c_sets[&j]),
+                    "crux invariant violated: U ⊄ C_{j:?}"
+                );
+                for &i in &self.live {
+                    assert!(
+                        c_sets[&j].is_subset(&e_sets[&i]),
+                        "crux invariant violated: C_{j:?} ⊄ E_{i:?}"
+                    );
+                }
+            }
+        }
+
         let u_best = best(&u)
             .expect("U must be nonempty: every live replica proposes")
             .clone();
