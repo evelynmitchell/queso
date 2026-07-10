@@ -19,8 +19,19 @@
 //! the same E/C/U relationship Phase 1 assumed a synchronous `tcast` for,
 //! but reconstructed from majority-quorum ISR summaries instead (see
 //! `crate::proposer`'s module docs for the safety argument). This phase is
-//! still **leaderless** and **single-slot**: no leader fast path (Phase 3),
-//! no hedging (Phase 5), no multi-slot log or KV application (Phase 4).
+//! **leaderless** and **single-slot**: no multi-slot log or KV application
+//! (Phase 4).
+//!
+//! **Phase 3** adds the §4.2.5 leader fast path on top of Phase 2's core,
+//! unchanged: a designated leader may attach the reserved maximum priority
+//! [`proposer::H`] to its round-1 proposal, letting any proposer (not just
+//! the leader) decide after a single round-trip if a quorum of recorders
+//! all recorded it first (D1). The leaderless core remains the fallback --
+//! every round past round 1, and round 1 itself when no leader is
+//! configured or the fast path is defeated -- and the same Agreement
+//! argument covers both (`crate::proposer`'s module docs). No hedging
+//! (Phase 5): activation stays unconditional (δ=0), so backup proposers
+//! are already active in round 1, just without `H`.
 //!
 //! See `docs/00-project-outline.md` for the full roadmap and
 //! `docs/02-properties.md` for the property model this crate's tests target
@@ -52,7 +63,9 @@
 //! - [`proposer`] -- [`proposer::Proposer`], the active role driving
 //!   Algorithm 4: the four phases, quorum gathering, catch-up, and the
 //!   decision rule -- see its module docs for the majority-intersection
-//!   argument that preserves Agreement under full asynchrony.
+//!   argument that preserves Agreement under full asynchrony, and for
+//!   Phase 3's leader fast path ([`proposer::H`], `Proposer::new`'s
+//!   `leader` parameter, `Proposer::decided_via_fast_path`).
 //! - [`concrete`] -- [`concrete::ConcreteCluster`], the Phase-2 driver:
 //!   runs every replica's proposer+recorder pair on the harness for one
 //!   slot with no round barrier, purely via `Node` callbacks.
@@ -73,7 +86,7 @@ pub use concrete::ConcreteCluster;
 pub use isr::{Isr, IsrSummary};
 pub use message::TcastMsg;
 pub use proposal::{best, Proposal, ProposalSet};
-pub use proposer::Proposer;
+pub use proposer::{Proposer, H};
 pub use recorder::Recorder;
 pub use rpc::{ConcreteMsg, RecordRequest, RecordResponse};
 pub use tcast::{tcast as tcast_step, TcastResult};
