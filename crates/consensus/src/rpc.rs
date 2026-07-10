@@ -21,17 +21,37 @@ use crate::proposal::Proposal;
 /// reply to *this* request apart from a stale reply to an earlier one it has
 /// since moved past (see `crate::proposer`'s module docs on why this
 /// correlation is required for safety under reordering/duplication).
+///
+/// `slot` is an opaque routing tag, not part of Algorithm 4 itself: a single
+/// slot's consensus (everything else in this crate) has no notion of
+/// multiple slots at all. It exists so that a *multi-slot* driver (Phase 4,
+/// `queso-smr`) can run many independent instances of this same per-slot
+/// protocol over one shared node/recorder addressing space without the
+/// wire-level ambiguity that would otherwise arise: two different slots'
+/// [`crate::proposer::Proposer`]s both start their threshold clock at the
+/// same step numbers (`s = 4, 5, 6, ...`), so a recorder receiving a bare
+/// `(req_step, proposal)` pair would have no way to tell which slot's ISR it
+/// belongs to, and a proposer receiving a bare `(req_step, ...)` reply would
+/// have no way to reject a stale reply that happens to echo the same step
+/// number but actually answers a *different* slot's earlier request.
+/// Single-slot users (this crate's own Phase 2/3 tests,
+/// [`crate::concrete::ConcreteCluster`]) always use slot `0` and never
+/// inspect it -- it is inert plumbing here, load-bearing only once a caller
+/// actually multiplexes more than one slot over the same replica addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordRequest<V> {
+    pub slot: u64,
     pub req_step: u64,
     pub proposal: Proposal<V>,
 }
 
 /// The recorder's reply: the ISR's `(s', f', a')` summary (see
-/// [`crate::isr::IsrSummary`]), plus `req_step` echoed from the
+/// [`crate::isr::IsrSummary`]), plus `req_step` (and `slot`) echoed from the
 /// [`RecordRequest`] this answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordResponse<V> {
+    /// Echoed from the request -- see [`RecordRequest::slot`]'s docs.
+    pub slot: u64,
     /// Echoed from the request, for proposer-side correlation. *Not* the
     /// same thing as `step` below in general: `step` is the recorder's
     /// (possibly-further-advanced) internal `S`.

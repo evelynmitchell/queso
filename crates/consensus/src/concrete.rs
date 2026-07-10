@@ -143,7 +143,10 @@ impl<V: Ord + Clone + Debug + 'static> ConcreteCluster<V> {
         let mut replicas = Vec::new();
 
         for (id, v) in initial_values {
-            let proposer = Rc::new(RefCell::new(Proposer::new(id, n, v, leader)));
+            // Slot 0: `ConcreteCluster` is single-slot (see `crate::rpc`'s
+            // `RecordRequest::slot` docs for what this tag is for and why
+            // it is inert here).
+            let proposer = Rc::new(RefCell::new(Proposer::new(id, n, v, leader, 0)));
             let recorder = Rc::new(RefCell::new(Recorder::new()));
             kernel.add_node(id, Box::new(ReplicaNode::new(proposer.clone(), recorder)));
             proposers.insert(id, proposer);

@@ -34,6 +34,7 @@ impl<V: Ord + Clone> Recorder<V> {
     pub fn handle(&mut self, req: RecordRequest<V>) -> RecordResponse<V> {
         let summary = self.isr.record(req.req_step, req.proposal);
         RecordResponse {
+            slot: req.slot,
             req_step: req.req_step,
             step: summary.step,
             first: summary.first,
@@ -54,9 +55,13 @@ mod tests {
     use crate::proposal::Proposal;
     use queso_sim::ids::NodeId;
 
-    /// Convenience: build a request for a given step and proposal.
+    /// Convenience: build a request for a given step and proposal, always
+    /// tagged as slot 0 -- this crate's tests are single-slot throughout
+    /// (see [`RecordRequest::slot`]'s docs), and slot-routing behavior is
+    /// exercised in `queso-smr` instead.
     fn req<V>(step: u64, p: Proposal<V>) -> RecordRequest<V> {
         RecordRequest {
+            slot: 0,
             req_step: step,
             proposal: p,
         }
@@ -74,10 +79,22 @@ mod tests {
     fn handle_echoes_req_step_and_returns_isr_summary() {
         let mut r: Recorder<u64> = Recorder::new();
         let resp = r.handle(req(4, p(1, 10, 0)));
+        assert_eq!(resp.slot, 0);
         assert_eq!(resp.req_step, 4);
         assert_eq!(resp.step, 4);
         assert_eq!(resp.first, Some(p(1, 10, 0)));
         assert_eq!(resp.prior_agg, None);
+    }
+
+    #[test]
+    fn handle_echoes_the_requests_slot_tag() {
+        let mut r: Recorder<u64> = Recorder::new();
+        let resp = r.handle(RecordRequest {
+            slot: 7,
+            req_step: 4,
+            proposal: p(1, 10, 0),
+        });
+        assert_eq!(resp.slot, 7);
     }
 
     #[test]
