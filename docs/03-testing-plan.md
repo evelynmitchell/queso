@@ -10,8 +10,8 @@ The plan has five pillars, applied continuously as the implementation grows:
 2. **Property-based / model tests** — invariants hold over randomized inputs.
 3. **Deterministic simulation testing (DST)** — the whole system, under
    adversarial schedules, replayable from a seed. *(Primary correctness argument.)*
-4. **Formal verification** — model-check the core safety invariants. *(Confidence
-   supplement.)*
+4. **Formal verification** — model-check the core safety invariants. *(A
+   first-class, tracked deliverable — developed in parallel from Phase 1.)*
 5. **Performance & robustness benchmarks** — it is fast enough and stays live
    under attack.
 
@@ -136,9 +136,12 @@ soak). Every historical failing seed becomes a permanent regression test.
 
 - **Online oracle.** A linearizability monitor validates the operation history
   against the sequential KV reference model (property P8; anti-properties
-  N2/N3/N4). Use an established checker where possible:
+  N2/N3/N4). History checkers operate on recorded histories and are effectively
+  language-agnostic; options:
+  - **`stateright`** — a Rust model checker with a linearizability tester, the
+    most natural in-tree fit given the Rust implementation.
   - **Porcupine** (Go) or **Elle/Knossos** (Jepsen ecosystem, Clojure) for
-    linearizability/serializability of recorded histories.
+    checking recorded histories out-of-band as a cross-check.
 - **Jepsen-style black-box tests.** Once real TCP transport exists (Phase 7), run
   a Jepsen-style harness against a multi-process cluster with `nemesis`-style
   fault injection (partitions, clock skew, process kills) and check histories with
@@ -148,20 +151,31 @@ soak). Every historical failing seed becomes a permanent regression test.
 
 ---
 
-## 6. Formal verification (confidence supplement)
+## 6. Formal verification (first-class deliverable)
+
+Formal verification is a primary, tracked deliverable, developed in parallel with
+the implementation from Phase 1 — not a late-stage supplement.
 
 - **Safety model in TLA+ and/or Promela/SPIN.** Model the abstract QuePaxa core
   (Algorithm 1: prioritized proposals, `E`/`C`/`U`, decision rule) and
   exhaustively check the safety invariants (agreement, validity, integrity) over a
   small finite configuration (e.g., n = 3, bounded rounds/values). The paper
-  itself ships SPIN-verified Promela models — we mirror that and, if using Rust,
-  keep a path toward implementation-level verification as Meerkat is pursuing.
+  itself ships SPIN-verified Promela models — we mirror that as our starting point.
+- **Rust implementation-level checks.** Because the implementation is in Rust, we
+  additionally pursue a path toward implementation-level assurance, as Meerkat is
+  doing — e.g., `kani` (bounded model checking), `loom` (concurrency-interleaving
+  tests for the async/shared-state code), and `proptest` for property tests. These
+  bridge the gap between the abstract spec and the running code.
+- **Trace refinement.** Use the TLA+ spec as the reference the implementation is
+  trace-checked against: map recorded DST traces to spec steps and assert the
+  implementation refines the model.
 - **Scope & honesty about limits.** Model checking must constrain the state space
   (finite replicas/rounds/values) and cannot verify probabilistic liveness. It
   raises confidence in the *logic* of safety; it does not replace DST for the real
   implementation. State this limitation wherever results are reported.
-- **Optional: refinement checks.** Use the TLA+ spec as the reference the
-  implementation is trace-checked against (map real traces to spec steps).
+- **Tracking.** The formal model has its own home in the repo (e.g., `spec/`) and
+  its checks run in CI on the small configuration so the model cannot silently
+  drift from the implementation.
 
 ---
 
@@ -215,5 +229,5 @@ recorded environment, and results checked into `docs/benchmarks/` over time.
 | Property-based | P1–P4, P14, P17 |
 | DST | P1–P13, P16, N1–N5, restart P12 |
 | Linearizability/Jepsen | P8–P10, N2–N4 |
-| Formal (TLA+/SPIN) | P1–P3 (safety core) |
+| Formal (TLA+/SPIN, kani/loom) | P1–P3 (safety core), concurrency of shared state |
 | Benchmarks | D1–D4 (performance/robustness) |

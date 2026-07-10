@@ -69,8 +69,8 @@ a clear "done" bar tied to properties (see `02-properties.md`) and tests (see
 `03-testing-plan.md`).
 
 ### Phase 0 — Scaffolding & harness (the ground)
-- Pick language/toolchain (see Open Questions). Set up repo layout, CI, lint,
-  test runner.
+- **Rust** toolchain (see Decisions). Set up repo layout (Cargo workspace), CI,
+  `clippy`/`rustfmt`, and the test runner.
 - Build the **simulation kernel**: injectable clock, seeded PRNG, and an
   in-memory network with a pluggable scheduler (FIFO, random, adversarial).
 - Reproducibility contract: `(seed) → identical event trace`.
@@ -140,7 +140,8 @@ a clear "done" bar tied to properties (see `02-properties.md`) and tests (see
 - **Deliverable:** a cluster that can be reconfigured and restarted safely.
 
 ### Cross-cutting (every phase)
-- Grow the **formal model** (TLA+ and/or Promela/SPIN) alongside the code.
+- Grow the **formal model** (TLA+ and/or Promela/SPIN) alongside the code —
+  this is a **first-class deliverable**, not an afterthought (see Decisions).
 - Expand **deterministic simulation testing (DST)** seeds and adversarial
   schedules.
 - Keep the **property-check suite** green as an executable spec.
@@ -152,34 +153,42 @@ a clear "done" bar tied to properties (see `02-properties.md`) and tests (see
 | M0 Harness | 0 | Seeded, replayable N-node message sim with adversarial scheduler. |
 | M1 One value | 1–2 | Single-slot agreement under crash + async; safety checks pass. |
 | M2 Fast path | 3 | One-round-trip common-case commit with correct fallback. |
-| **M3 Hello-world KV** | 4 | Linearizable replicated KV store survives fault-injection + Jepsen-style checks. |
-| M4 No timeouts | 5 | Hedging gives fast recovery; liveness robust to any δ. |
-| M5 Self-tuning | 6 | Converges to best leader automatically. |
+| M3 Hello-world KV | 4 | Linearizable replicated KV store survives fault-injection + Jepsen-style checks. |
+| **M4 No timeouts** | 5 | Hedging gives fast recovery; liveness robust to any δ. |
+| **M5 Self-tuning** | 6 | Converges to best leader automatically. |
 | M6 Performance | 7 | Reproducible LAN/WAN throughput & latency; adversarial liveness. |
 
-## 6. Open questions (for the project owner)
+**Committed scope: through M4–M5.** M0–M3 build the fault-tolerant linearizable
+KV store; M4 (hedging / timeout-free recovery) and M5 (auto-tuning) are in scope
+and complete the QuePaxa story. M6 (performance) and Phase 8 (operability) are
+follow-on.
 
-These affect scope and effort; defaults are proposed so work can start either way.
+## 6. Decisions
 
-1. **Implementation language.** The reference prototype and Meerkat are in
-   **Rust/Go**. Rust buys us a path toward formal verification (as Meerkat is
-   doing) and strong types; Go matches the paper and is quicker to prototype.
-   *Proposed default: Rust* (best fit for "validated, verified, performant" and
-   for deterministic simulation), unless you prefer Go for closeness to the paper.
-2. **Scope of "hello world."** Is the target milestone **M3** (a linearizable KV
-   store that survives faults), or do you want to push through hedging/auto-tuning
-   (M4–M5)? *Proposed default: aim for M3 first, treat M4+ as follow-on.*
-3. **Formal methods appetite.** Do you want full **TLA+/SPIN** model checking as a
-   first-class deliverable, or is **deterministic simulation testing** (à la
-   FoundationDB / Meerkat) sufficient as the primary correctness argument?
-   *Proposed default: DST as primary, a small SPIN/TLA+ safety model as a
-   confidence supplement.*
-4. **Non-goals confirmation.** Byzantine fault tolerance, general-purpose
-   database features, side-channel resistance, and dynamic membership (until
-   Phase 8) are proposed as **out of scope**. Confirm.
-5. **Deployment target for benchmarks.** Local multi-process only, or real
-   multi-region cloud (the paper used AWS EC2 LAN + WAN)? *Proposed default:
-   local sim + local multi-process; cloud WAN optional.*
+Resolved with the project owner (2026-07-10):
+
+1. **Implementation language: Rust.** Chosen for the "validated, verified,
+   performant" goals — strong types, a clean path toward implementation-level
+   formal verification (as Meerkat is pursuing), and good fit for deterministic
+   simulation. Repo is a Cargo workspace.
+2. **Scope of "hello world": through M4–M5.** We build the fault-tolerant
+   linearizable KV store (M3) and continue through **hedging / timeout-free
+   recovery (M4)** and **auto-tuning (M5)**. M6 performance and Phase 8
+   operability are follow-on.
+3. **Formal methods: first-class deliverable.** TLA+ and/or Promela/SPIN safety
+   models are a primary, tracked deliverable alongside deterministic simulation
+   testing — not merely a confidence supplement. DST remains the workhorse for
+   the real implementation; the formal model is developed and maintained in
+   parallel from Phase 1.
+4. **Non-goals: confirmed out of scope.** Byzantine fault tolerance,
+   general-purpose database features, side-channel / traffic-analysis resistance,
+   and dynamic membership (deferred to the Phase 8 stretch) are out of scope.
+
+### Still open (non-blocking)
+
+- **Benchmark deployment target.** Local multi-process is the default; real
+  multi-region cloud (the paper used AWS EC2 LAN + WAN) is optional and can be
+  decided when Phase 7 approaches.
 
 ## 7. References
 
