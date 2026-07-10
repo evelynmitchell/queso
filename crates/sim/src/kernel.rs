@@ -276,6 +276,12 @@ impl<P: Payload> Kernel<P> {
     /// scenario (messages *and* faults) can be expressed up front as data
     /// driven by the event queue rather than by imperative interleaving
     /// with `run_until`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `at` is before the kernel's current logical time.
+    /// Scheduling a fault in the past is a hard precondition violation on
+    /// the caller's part, not a condition the kernel handles at runtime.
     pub fn schedule_fault(&mut self, at: LogicalTime, cmd: FaultCommand) {
         assert!(at >= self.core.now, "cannot schedule a fault in the past");
         let seq = self.core.bump_seq();
@@ -413,6 +419,11 @@ impl<P: Payload> Kernel<P> {
         let src = envelope.meta.src;
         let dst = envelope.meta.dst;
 
+        // Deliberately does NOT recheck `is_crashed(src)`: in this
+        // crash-stop model, a message already in flight legitimately
+        // survives its sender crashing afterwards — only the destination's
+        // liveness at arrival time (checked just above) and the network
+        // path (checked just below) can still stop delivery.
         if self.core.faults.is_crashed(dst) {
             self.core.trace.record(TraceEvent::Drop {
                 time: self.core.now,
@@ -421,6 +432,23 @@ impl<P: Payload> Kernel<P> {
                 src,
                 dst,
                 reason: DropReason::Crashed,
+            });
+            return;
+        }
+
+        // A partition installed after `send` but before arrival must still
+        // cut this message off — otherwise "partition = network cut" is
+        // leaky for anything already in flight. Reuse the same Drop/reason
+        // machinery as the send-time check, with a distinct reason so
+        // traces can tell a send-time partition drop from an in-flight one.
+        if self.core.faults.is_partitioned(src, dst) {
+            self.core.trace.record(TraceEvent::Drop {
+                time: self.core.now,
+                seq,
+                id,
+                src,
+                dst,
+                reason: DropReason::PartitionedAtArrival,
             });
             return;
         }
