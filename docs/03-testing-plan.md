@@ -27,15 +27,28 @@ it. It is a **deterministic simulation kernel**:
   timing scenarios are exact and fast.
 - **Seeded PRNG.** All randomness (proposal priorities, scheduler choices, fault
   injection) derives from one seed. Reproducibility contract:
-  **`seed → identical event trace`** (property D9).
-- **Pluggable network model** between nodes, with schedulers:
-  - *FIFO / reliable* — sanity baseline.
-  - *Random-delay / reorder* — shakes out ordering assumptions.
-  - *Adversarial* — a message scheduler that actively tries to break liveness:
-    delay the leader's messages, deliver to `E` sets but not `U` sets, partition
-    minorities, induce asymmetric connectivity, focus a "DoS" on the current
-    leader and refocus when leadership moves.
-  - *Lossy* — transient drops (with eventual delivery per A2).
+  **`seed → identical event trace`** (property D9). This requires eliminating
+  Rust's nondeterminism sources: `HashMap`/`HashSet` iteration order (use a fixed
+  seed / ordered maps), async executor scheduling, and thread interleaving. Run
+  the protocol on a **single-threaded deterministic executor** and/or a sim
+  framework such as **`madsim`/`turmoil`**. If this contract is not airtight, DST
+  is not reproducible and the entire pillar is compromised — treat it as a Phase-0
+  acceptance gate.
+- **Pluggable network model** between nodes. The scheduler comes in **two adversary
+  classes that test different guarantees** — using the wrong one produces false
+  results:
+  - **Content-oblivious** (matches assumption A3): may delay, reorder, drop
+    (with eventual delivery per A2), partition minorities, induce asymmetric
+    connectivity, and DoS whichever replica is *currently leader* (refocusing on
+    leadership change) — but chooses **without reading message contents/priorities**.
+    *This is the only class under which P14/P15/randomized-termination may be
+    asserted.*
+  - **Content-aware / strong** (beyond A3): may target specific messages, e.g.,
+    deliver a leader's proposal to all `E` sets but no `U` set. Used **only** to
+    test fast-path defeat and correct fallback — asserting *safety* and *round-1 →
+    leaderless fallback*, **not** unconditional eventual decision.
+  - Baseline schedulers *FIFO/reliable* and *random-delay/reorder* remain for
+    sanity and ordering-assumption shakeout.
 - **Fault injection API.** Crash, pause, restart (with volatile-state loss down to
   durable state), partition/heal, clock skew, slow-node.
 - **Trace recorder & checker hooks.** Every externally-visible event
@@ -117,15 +130,24 @@ Key DST scenarios (each a named, seeded suite):
   (P11, O4) — and that progress *resumes* when a majority returns.
 - **Partition / heal.** Split into minority/majority; only the majority side makes
   progress; on heal, minority catches up without divergence (P5, N1).
-- **Adversarial leader targeting.** Scheduler DoS's whichever replica is leader
-  and refocuses on leadership change; assert continued progress via leaderless
-  rounds (P16) and no safety loss.
-- **Fast-path defeat.** Scheduler delivers leader proposal to all `E` sets but no
-  `U` set; assert correct fallback to round ≥ 2 and eventual decision.
+- **Adversarial leader targeting** *(content-oblivious scheduler)*. DoS whichever
+  replica is leader, refocusing on leadership change; assert continued progress via
+  leaderless rounds (P16) and no safety loss. Because the scheduler is oblivious,
+  asserting eventual progress here is legitimate.
+- **Fast-path defeat** *(content-aware scheduler)*. Deliver the leader's proposal
+  to all `E` sets but no `U` set; assert *safety* and correct fallback to round
+  ≥ 2. Do **not** assert unconditional eventual decision here — a content-aware
+  adversary may defeat every leader-based round; that is expected behavior, not a
+  bug.
 - **Hedging misconfiguration.** δ far from network delay (both directions);
-  assert liveness (P15) and measure the redundant-effort cost.
+  assert liveness (P15) and no livelock with all proposers active (N6, P17), and
+  measure the redundant-effort cost.
 - **Restart with state loss.** Kill mid-decision, restart from durable state;
-  assert P9/P12 (no lost ack'd write, no divergence).
+  assert P9/P12 (no lost ack'd write, no divergence) — exercises the Phase-4
+  durability design directly.
+- **Client-retry / idempotency.** Duplicate and reorder client commands (same
+  `(client-id, seq)`) across replicas; assert exactly-once application (P8a) and no
+  linearizability violation (P8).
 
 Run these across a large seed corpus in CI (short budget per PR, long nightly
 soak). Every historical failing seed becomes a permanent regression test.
@@ -156,19 +178,24 @@ soak). Every historical failing seed becomes a permanent regression test.
 Formal verification is a primary, tracked deliverable, developed in parallel with
 the implementation from Phase 1 — not a late-stage supplement.
 
-- **Safety model in TLA+ and/or Promela/SPIN.** Model the abstract QuePaxa core
-  (Algorithm 1: prioritized proposals, `E`/`C`/`U`, decision rule) and
-  exhaustively check the safety invariants (agreement, validity, integrity) over a
-  small finite configuration (e.g., n = 3, bounded rounds/values). The paper
-  itself ships SPIN-verified Promela models — we mirror that as our starting point.
+- **Safety model in TLA+ and/or Promela/SPIN.** Model check the safety invariants
+  (agreement, validity, integrity) over a small finite configuration (e.g., n = 3,
+  bounded rounds/values). The paper ships SPIN-verified Promela models of the
+  **concrete** core (Algorithm 4 / ISRs); **model the concrete core as the paper
+  did** — it is what the real implementation actually runs. An abstract-protocol
+  (Algorithm 1 / tcast) model is useful pedagogically but is a different structure
+  from the running code.
 - **Rust implementation-level checks.** Because the implementation is in Rust, we
   additionally pursue a path toward implementation-level assurance, as Meerkat is
   doing — e.g., `kani` (bounded model checking), `loom` (concurrency-interleaving
   tests for the async/shared-state code), and `proptest` for property tests. These
   bridge the gap between the abstract spec and the running code.
-- **Trace refinement.** Use the TLA+ spec as the reference the implementation is
-  trace-checked against: map recorded DST traces to spec steps and assert the
-  implementation refines the model.
+- **Trace refinement (aspirational).** Mapping recorded DST traces of the real
+  async Rust implementation onto a spec and proving refinement is research-grade —
+  the abstract/concrete structural gap makes a mapping to Algorithm 1 especially
+  hard. Treat full trace refinement as a stretch; the primary, tracked safety
+  argument is model-checking the concrete core (above) plus DST on the
+  implementation.
 - **Scope & honesty about limits.** Model checking must constrain the state space
   (finite replicas/rounds/values) and cannot verify probabilistic liveness. It
   raises confidence in the *logic* of safety; it does not replace DST for the real
@@ -216,7 +243,7 @@ recorded environment, and results checked into `docs/benchmarks/` over time.
 - **On failure:** the offending seed + minimized trace is attached; a regression
   test pinning that seed is added before the fix is merged.
 - **Coverage of the property model:** a checklist ties each property (P1–P17,
-  N1–N6, D1–D11) to at least one passing test; unimplemented ones are marked
+  P8a, N1–N6, D1–D11) to at least one passing test; unimplemented ones are marked
   `pending` with the phase that will cover them.
 
 ---
@@ -226,8 +253,8 @@ recorded environment, and results checked into `docs/benchmarks/` over time.
 | Test pillar | Primary properties covered |
 |-------------|----------------------------|
 | Unit/component | ISR (D5), tcast, logical clock, fast path (D1), hedging (P15) |
-| Property-based | P1–P4, P14, P17 |
-| DST | P1–P13, P16, N1–N5, restart P12 |
-| Linearizability/Jepsen | P8–P10, N2–N4 |
+| Property-based | P1–P4, P14, P15, P17, N6 |
+| DST | P1–P13, P15–P17, N1–N6, restart P12, idempotency P8a |
+| Linearizability/Jepsen | P8, P8a, P9, P10, N2–N4 |
 | Formal (TLA+/SPIN, kani/loom) | P1–P3 (safety core), concurrency of shared state |
 | Benchmarks | D1–D4 (performance/robustness) |

@@ -49,7 +49,7 @@ writes submitted to different nodes in any order:
 Linearizability is what most control-plane services want because it lets
 programmers reason about a distributed store the way they reason about local
 memory on a single thread — no menagerie of anomalies to keep in mind. (Meerkat's
-KV store additionally offers **serializability** for multi-key transactions.)
+KV store additionally offers **serializability**, per the blog post.)
 
 ## 3. Fault tolerance, precisely
 
@@ -139,9 +139,10 @@ normal-case efficiency *without depending on timeouts for liveness*. Key ideas:
 - **Auto-tuning via multi-armed bandits.** Because leader choice and hedging
   delays affect only *performance*, not safety or liveness, QuePaxa treats them
   as a multi-armed-bandit problem: it explores (round-robin leader rotation over
-  epochs), then exploits (orders the hedging schedule by observed completion
-  times), and keeps monitoring so it can switch to a better leader **even if the
-  current one hasn't failed**.
+  epochs — over the first `2n+1` epochs each replica leads twice), then exploits
+  (orders the hedging schedule by replicas' observed average epoch completion
+  times, sorted descending per §5.3), and keeps monitoring so it can switch to a
+  better leader **even if the current one hasn't failed**.
 
 ### Structure of the protocol (how the pieces fit)
 
@@ -186,7 +187,8 @@ at global scale. Salient points for us:
   healthy replica anywhere. Proofs-of-concept ran up to **50 replicas worldwide**
   with leaders *constantly failing* and no increase in error rate.
 - **Cost:** consensus means round-trips. QuePaxa takes 1 round-trip on the leader
-  fast path, ~3 for a non-leader proposer, more under contention; decision
+  fast path (plus an extra broadcast to notify replicas of the decision), ~3 for a
+  non-leader proposer (plus the extra broadcast), more under contention; decision
   latency is fundamentally bounded by the latency to a majority of replicas.
   Mitigations: co-locate replicas, batch writes, allow stale-but-consistent local
   reads, and bundle operations (e.g., compare-and-swap / transactions). This
