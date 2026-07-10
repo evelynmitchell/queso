@@ -142,6 +142,31 @@ impl<V: Ord + Clone + std::fmt::Debug + 'static> Cluster<V> {
         self.live.insert(id);
     }
 
+    /// Install a **genuine** network partition (test-only fault-injection
+    /// escape hatch wrapping `Kernel::partition`) between two disjoint
+    /// groups of replicas -- a real network cut, not merely a scheduler-
+    /// level drop; see `queso_sim::fault`'s module docs. Deliberately does
+    /// *not* touch `self.live` the way `crash` does: a partitioned replica
+    /// is still running (unlike a crashed one), it is simply unable to
+    /// reach the other side. Because [`Self::run_round`]'s `tcast` calls are
+    /// driven off `self.live`, not off actual network reachability, a
+    /// partition that leaves fewer than a majority of `self.live` mutually
+    /// reachable will *not* trip tcast's "no live majority" precondition --
+    /// instead `tcast`'s mandatory `b_src` dissemination to the unreachable
+    /// side will retry until `crate::tcast::MAX_TCAST_RETRIES` and panic
+    /// loudly ("eventual delivery (A2) violated"). That is the documented,
+    /// intentional shape of this lock-step driver's degradation under a
+    /// genuine partition (see `crates/consensus/tests/partition.rs`) --
+    /// **not** silent divergence.
+    pub fn partition(&mut self, group_a: BTreeSet<NodeId>, group_b: BTreeSet<NodeId>) {
+        self.kernel.partition(group_a, group_b);
+    }
+
+    /// Remove any active partition installed via [`Self::partition`].
+    pub fn heal(&mut self) {
+        self.kernel.heal();
+    }
+
     /// This replica's decision, if it has delivered one yet.
     pub fn decided(&self, id: NodeId) -> Option<&V> {
         self.state.get(&id).and_then(|s| s.decided.as_ref())

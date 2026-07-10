@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::rc::Rc;
 
+use queso_sim::fault::FaultCommand;
 use queso_sim::ids::{NodeId, TimerId};
 use queso_sim::node::{Node, NodeCtx};
 use queso_sim::scheduler::SchedulerKind;
@@ -188,6 +189,50 @@ impl<V: Ord + Clone + Debug + 'static> ConcreteCluster<V> {
     pub fn crash(&mut self, id: NodeId) {
         self.kernel.crash(id);
         self.live.remove(&id);
+    }
+
+    /// Install a **genuine** network partition (test-only fault-injection
+    /// escape hatch wrapping `Kernel::partition`) between two disjoint
+    /// groups of replicas: messages between opposite sides are dropped both
+    /// at send time and, if already in flight when the partition takes
+    /// effect, at arrival too (see `queso_sim::fault`'s `DropReason::
+    /// Partitioned`/`PartitionedAtArrival`) -- a real network cut, not
+    /// merely a scheduler-level drop. Same-side traffic is unaffected.
+    /// Unlike [`Self::crash`], partitioned replicas stay in the driver's
+    /// `live` set: they are still running, just unable to reach the other
+    /// side.
+    pub fn partition(&mut self, group_a: BTreeSet<NodeId>, group_b: BTreeSet<NodeId>) {
+        self.kernel.partition(group_a, group_b);
+    }
+
+    /// Remove any active partition installed via [`Self::partition`] (or
+    /// [`Self::schedule_heal`]/[`Self::schedule_partition`]). A no-op if no
+    /// partition is active.
+    pub fn heal(&mut self) {
+        self.kernel.heal();
+    }
+
+    /// Schedule a partition to take effect `after_ticks` logical ticks from
+    /// the cluster's current time (`Kernel::schedule_fault`), so a test can
+    /// install a genuine mid-run partition deterministically -- e.g. after
+    /// replicas have already exchanged some protocol messages -- rather
+    /// than only before [`Self::run_slot`] starts.
+    pub fn schedule_partition(
+        &mut self,
+        after_ticks: u64,
+        group_a: BTreeSet<NodeId>,
+        group_b: BTreeSet<NodeId>,
+    ) {
+        let at = self.kernel.now().advance(after_ticks);
+        self.kernel
+            .schedule_fault(at, FaultCommand::Partition(group_a, group_b));
+    }
+
+    /// Schedule a heal (removal of any active partition) `after_ticks`
+    /// logical ticks from the cluster's current time.
+    pub fn schedule_heal(&mut self, after_ticks: u64) {
+        let at = self.kernel.now().advance(after_ticks);
+        self.kernel.schedule_fault(at, FaultCommand::Heal);
     }
 
     /// This replica's decision, if it has delivered one yet.
