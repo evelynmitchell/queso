@@ -192,7 +192,10 @@ Phase1 ==
     /\ round <= MaxRound
     /\ LET In1 == [i \in Replicas |-> {Prop[i]}]
        IN \E base \in [Replicas -> RVals(In1)], b \in InVals(In1) :
-              P' = [i \in Replicas |-> base[i] \cup b]
+              /\ P' = [i \in Replicas |-> base[i] \cup b]
+              \* Lemma B.4: every set the algorithm builds has cardinality > n/2.
+              /\ Assert(\A i \in Replicas : Cardinality(base[i] \cup b) > N \div 2,
+                        "Lemma B.4: |P_i| > n/2 violated")
     /\ phase' = 2
     /\ UNCHANGED <<pri, inp, v, decided, round, E, PP>>
 
@@ -210,6 +213,11 @@ Phase2 ==
            LET M == UNION { u[m] : m \in Replicas }
            IN /\ E'  = [i \in Replicas |-> base[i] \cup M]
               /\ PP' = u
+              \* Lemma B.4 for E_i (existent) and P'_i (= u[i], the B output).
+              /\ Assert(\A i \in Replicas :
+                            /\ Cardinality(base[i] \cup M) > N \div 2
+                            /\ Cardinality(u[i]) > N \div 2,
+                        "Lemma B.4: |E_i|,|P'_i| > n/2 violated")
     /\ P' = NoSets                       \* consumed; reset to avoid state blowup
     /\ phase' = 3
     /\ UNCHANGED <<pri, inp, v, decided, round>>
@@ -238,7 +246,19 @@ Phase3 ==
                U == u
            IN /\ Assert(\A i, j \in Replicas :
                             U[i] \subseteq C[j] /\ C[j] \subseteq E[i],
-                        "cross-node containment U_i <= C_j <= E_i violated")
+                        "Lemma B.5: cross-node containment U_i <= C_j <= E_i violated")
+              \* Lemma B.4 for the common (C_i) and universal (U_i) sets.
+              /\ Assert(\A i \in Replicas :
+                            Cardinality(C[i]) > N \div 2 /\ Cardinality(U[i]) > N \div 2,
+                        "Lemma B.4: |C_i|,|U_i| > n/2 violated")
+              \* Lemma B.5 corollary: the decision-safety pivot. If i's decision
+              \* guard best(E_i)=best(U_i) holds, then best is unanimous across
+              \* every replica's C_j and E_i -- this is exactly what forces two
+              \* deciders in the same round to agree (Lemma B.7 case 1).
+              /\ Assert(\A i, j \in Replicas :
+                            (Best(E[i]) = Best(U[i])) =>
+                                (Best(U[i]) = Best(C[j]) /\ Best(C[j]) = Best(E[i])),
+                        "Lemma B.5 corollary: best(E_i)=best(U_i) => best(U_i)=best(C_j)=best(E_i) violated")
               /\ v' = [i \in Replicas |-> Best(C[i]).val]
               /\ decided' = [i \in Replicas |->
                                  IF decided[i] # None
