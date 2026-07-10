@@ -1,4 +1,4 @@
-//! The Phase-2 driver: runs `N` replicas, each hosting one
+//! The Phase-2/3 driver: runs `N` replicas, each hosting one
 //! [`crate::proposer::Proposer`] (active) and one [`crate::recorder::Recorder`]
 //! (passive), on the harness for a single slot, and reports decisions.
 //!
@@ -14,6 +14,12 @@
 //! Different replicas' proposers can and do end up at different steps at
 //! the same logical time; there is no round barrier anywhere in this
 //! module.
+//!
+//! [`ConcreteCluster::new`] builds a purely leaderless slot (Phase 2, still
+//! the correctness-baseline fallback); [`ConcreteCluster::new_with_leader`]
+//! (Phase 3, §4.2.5) additionally designates one replica as the round-1
+//! fast-path leader -- see `crate::proposer`'s module docs for the safety
+//! argument tying the two together.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -85,6 +91,14 @@ pub struct ConcreteCluster<V> {
     kernel: Kernel<ConcreteMsg<V>>,
     replicas: Vec<NodeId>,
     proposers: BTreeMap<NodeId, Rc<RefCell<Proposer<V>>>>,
+    /// The slot's designated fast-path leader (§4.2.5), if any -- the same
+    /// value every [`Proposer`] in `proposers` was constructed with (see
+    /// `Proposer::new`'s "every proposer must be built with the same
+    /// `leader` value" invariant) and also handed to the kernel via
+    /// `Kernel::set_leader`, so content-oblivious adversaries' `with_leader_dos`
+    /// and friends target the same replica the protocol itself treats as
+    /// leader.
+    leader: Option<NodeId>,
     /// Driver-tracked liveness, mirroring `crate::algorithm::Cluster`'s
     /// rationale: `Kernel` doesn't expose fault state publicly, and
     /// "currently live" here is purely a bookkeeping convenience for
@@ -95,20 +109,41 @@ pub struct ConcreteCluster<V> {
 }
 
 impl<V: Ord + Clone + Debug + 'static> ConcreteCluster<V> {
-    /// Build a cluster with one replica per `(NodeId, initial value)` pair,
-    /// all initially live.
+    /// Build a purely **leaderless** cluster (Phase 2 behavior, unchanged)
+    /// with one replica per `(NodeId, initial value)` pair, all initially
+    /// live. Equivalent to `Self::new_with_leader(seed, scheduler,
+    /// initial_values, None)`.
     pub fn new(
         seed: u64,
         scheduler: SchedulerKind<ConcreteMsg<V>>,
         initial_values: BTreeMap<NodeId, V>,
     ) -> Self {
+        Self::new_with_leader(seed, scheduler, initial_values, None)
+    }
+
+    /// Build a cluster with one replica per `(NodeId, initial value)` pair,
+    /// all initially live, and `leader` designated as the slot's fast-path
+    /// leader (§4.2.5, D1) for round 1 -- or `None` for the purely
+    /// leaderless Phase-2 behavior. `leader` is passed to *every*
+    /// [`Proposer`] built here (the invariant `Proposer::new` documents)
+    /// and to the kernel via `Kernel::set_leader`, so adversary schedulers
+    /// that key off "the current leader" (e.g.
+    /// `queso_sim::scheduler::ContentObliviousAdversary::with_leader_dos`)
+    /// target the same replica.
+    pub fn new_with_leader(
+        seed: u64,
+        scheduler: SchedulerKind<ConcreteMsg<V>>,
+        initial_values: BTreeMap<NodeId, V>,
+        leader: Option<NodeId>,
+    ) -> Self {
         let n = initial_values.len();
         let mut kernel = Kernel::new(seed, scheduler);
+        kernel.set_leader(leader);
         let mut proposers = BTreeMap::new();
         let mut replicas = Vec::new();
 
         for (id, v) in initial_values {
-            let proposer = Rc::new(RefCell::new(Proposer::new(id, n, v)));
+            let proposer = Rc::new(RefCell::new(Proposer::new(id, n, v, leader)));
             let recorder = Rc::new(RefCell::new(Recorder::new()));
             kernel.add_node(id, Box::new(ReplicaNode::new(proposer.clone(), recorder)));
             proposers.insert(id, proposer);
@@ -121,6 +156,7 @@ impl<V: Ord + Clone + Debug + 'static> ConcreteCluster<V> {
             kernel,
             replicas,
             proposers,
+            leader,
             live,
         }
     }
@@ -128,6 +164,11 @@ impl<V: Ord + Clone + Debug + 'static> ConcreteCluster<V> {
     /// The full, static replica membership.
     pub fn replicas(&self) -> &[NodeId] {
         &self.replicas
+    }
+
+    /// The slot's designated fast-path leader, if any.
+    pub fn leader(&self) -> Option<NodeId> {
+        self.leader
     }
 
     /// Replicas the driver currently considers live (not crashed).
@@ -157,6 +198,15 @@ impl<V: Ord + Clone + Debug + 'static> ConcreteCluster<V> {
     /// introspection into the randomized-termination behavior).
     pub fn step(&self, id: NodeId) -> u64 {
         self.proposers[&id].borrow().step()
+    }
+
+    /// Whether this replica decided via the phase-0 fast path (§4.2.5, D1)
+    /// -- i.e. in a single round-trip, without ever leaving round 1's first
+    /// step. See `Proposer::decided_via_fast_path`.
+    pub fn decided_via_fast_path(&self, id: NodeId) -> bool {
+        self.proposers
+            .get(&id)
+            .is_some_and(|p| p.borrow().decided_via_fast_path())
     }
 
     /// True once every currently-live replica has decided.

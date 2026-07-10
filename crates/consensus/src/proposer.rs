@@ -26,8 +26,14 @@
 //!
 //! - **Phase 0** (`s mod 4 = 0`, "propose"): draw a fresh random priority
 //!   *per recorder* (§4.2.4 "Proposal randomization" -- yes, literally a
-//!   different priority per recipient; see [`draw_priority`]) and set
-//!   `p <- best_j(f'_j)` over the quorum's first-value replies.
+//!   different priority per recipient; see [`draw_priority`]), *unless*
+//!   this is round 1 (`s = 4`) and `self` is the slot's designated leader
+//!   (§4.2.5), in which case every recorder instead gets the reserved
+//!   priority [`H`] verbatim. Either way, once a quorum of replies is in:
+//!   first check the fast-path decision ([`fast_path_value`]) -- if every
+//!   reply's `first` is `H`-priority, decide right now and skip the rest of
+//!   the round; otherwise set `p <- best_j(f'_j)` over the quorum's
+//!   first-value replies exactly as Phase 2 always did.
 //! - **Phase 1** (`s mod 4 = 1`, "spread E"): no computation; simply
 //!   re-sends the unchanged `p` at the next step, letting the recorders'
 //!   ISRs aggregate it.
@@ -92,6 +98,74 @@
 //!    here from majority intersection over *consecutive* ISR steps instead
 //!    of `tcast`'s explicit set inclusion.
 //!
+//! # The leader fast path (§4.2.5, D1) never risks Agreement
+//!
+//! [`Proposer`] optionally carries a `leader: Option<NodeId>` (set once, at
+//! construction -- see `Proposer::new`). This changes exactly two things,
+//! both confined to round 1 (`s = 4`), both in [`begin_step`] and
+//! [`process_phase`]'s phase-0 arm:
+//!
+//! 1. If `self` *is* the leader, its phase-0 proposal carries [`H`] (the
+//!    reserved maximum priority) instead of a random draw.
+//! 2. Every proposer -- leader or not -- checks [`fast_path_value`] after
+//!    gathering its phase-0 quorum: if every reply's `first` is
+//!    `H`-priority, decide immediately, without ever reaching phase 1.
+//!
+//! Everything else -- the ISR, the recorder, phases 1-3, catch-up, retries
+//! -- is completely unmodified, and a slot built with `leader: None`
+//! reproduces Phase 2's behavior exactly (no leaderless draw is ever `H`,
+//! so `fast_path_value` can never return `Some`). This matters for the
+//! safety argument: the fast path is not a second, separately-justified
+//! decision rule bolted onto the side of the one proven above -- it is a
+//! special case of the *same* one, reached one phase early only because
+//! `H` happens to be unbeatable. Concretely (this is the paper's Lemma
+//! C.10, reproduced here because it is the crux of why fast and leaderless
+//! decisions can never disagree):
+//!
+//! - `H` is `u64::MAX`, strictly greater than anything [`draw_priority`]
+//!   can ever produce, and only ever attached by round 1's `leader`. So if
+//!   a quorum `Q` (a genuine majority) all report `first.priority == H`,
+//!   more than `n/2` recorders wrote *the leader's own proposal* into
+//!   `F[4]` -- and, because `crate::isr::Isr::record` writes `F[s]` only
+//!   once per step (steps never regress -- the same fact point 4 above
+//!   relies on), that write can never be overwritten. Deciding here is
+//!   therefore not a guess; it is already true forever.
+//! - Take *any* other proposer's own round-1 phase-0 quorum `M` (also a
+//!   genuine majority of the same fixed `n`). `Q` and `M` must intersect
+//!   (any two majorities of a fixed universe do), so `M` contains at least
+//!   one recorder whose `F[4]` is the leader's proposal.
+//!   - If that other proposer's quorum is *also* all-`H`, it fast-decides
+//!     too -- and, because only one leader's proposal can ever carry `H`,
+//!     necessarily the *same* value (see `fast_path_value`'s
+//!     `debug_assert!`).
+//!   - Otherwise, it does not fast-decide, but the leader's proposal is
+//!     still one of the replies its `best_j(f'_j)` selects from -- and
+//!     since `H` cannot be beaten, `best_j` is forced to pick it. That
+//!     proposer then spreads the leader's proposal into phase 1 exactly as
+//!     if it were an ordinary round-1 candidate, and the "why this
+//!     preserves Agreement" argument above (deliberately proven for "any
+//!     phase, not just 0") takes over unmodified from there: once spread,
+//!     a value can only be matched or beaten by any future quorum, never
+//!     lost, and nothing can beat `H`.
+//!
+//! So a fast-path decision and a leaderless decision for the same slot are
+//! never *merely consistent* -- they are provably the same value, because
+//! every quorum that does not itself see all-`H` replies is still forced
+//! (not just permitted) to carry the leader's proposal forward, *whenever
+//! that quorum intersects one that did*. A content-aware adversary that
+//! prevents any quorum from ever forming with all-`H` replies (§4.2.5:
+//! always possible in principle -- e.g. delivering the leader's proposal to
+//! every `E` set but no `U` set, or blocking it outright) simply means the
+//! premise of the argument above never triggers *anywhere*, for *any*
+//! proposer: no quorum ever sees all-`H`, so [`fast_path_value`] never
+//! returns `Some`, [`is_leader`]'s branch in `begin_step` never matters to
+//! the outcome, and the round proceeds exactly as an ordinary leaderless
+//! one -- already proven safe on its own terms, with or without a leader's
+//! proposal in the mix. Either the fast path fires and is provably
+//! consistent with everything else, or it never fires at all and
+//! contributes nothing but an extra (harmless) candidate; there is no
+//! third, unsafe outcome. Only latency is ever at stake, never Agreement.
+//!
 //! # Retries
 //!
 //! A step's outbound `record` requests (or their replies) can be delayed,
@@ -121,11 +195,29 @@ use std::collections::BTreeMap;
 use crate::proposal::Proposal;
 use crate::rpc::{ConcreteMsg, RecordRequest, RecordResponse};
 
-/// `H`, the reserved maximum priority (used only to bound the random draw
-/// range `1..H`, i.e. Algorithm 4's `random(1..H-1)`; the value `H` itself
-/// is reserved for the leader fast path, out of scope here -- see the crate
-/// docs). No proposal drawn in leaderless rounds can ever equal `H`.
-pub const MAX_PRIORITY: u64 = u64::MAX;
+/// `H`, the reserved maximum priority (§4.2.5, Appendix A). Two roles:
+///
+/// 1. It bounds the leaderless random draw range `1..H`, i.e. Algorithm 4's
+///    `random(1..H-1)` -- see [`draw_priority`]. No proposal drawn in a
+///    leaderless step can ever equal `H`, by construction (`gen_range`'s
+///    upper bound is exclusive).
+/// 2. In round 1 (`s = 4`) of a leader-based slot, the designated leader
+///    attaches exactly `H` to its proposal instead of drawing randomly (see
+///    [`Proposer::begin_step`]'s phase-0 branch) -- Algorithm 4's `s mod 4 =
+///    0 and (s > 4 or i is not leader)` guard, negated.
+///
+/// Because `H` is `u64::MAX` and every leaderless draw is strictly less
+/// than `H`, `H` is *the* unbeatable maximum of this priority space: once
+/// any proposal carries it, `Ord` guarantees nothing else can ever compare
+/// greater. This is exactly what the phase-0 fast-path decision rule
+/// ([`fast_path_value`]) exploits -- see that function's docs and Lemma
+/// C.10 in the paper.
+pub const H: u64 = u64::MAX;
+
+/// `s = 4*1 + 0`: the threshold-clock step for round 1, phase 0 -- the only
+/// step at which a designated leader ever attaches `H` (§4.2.5), and hence
+/// the only step at which the phase-0 fast path can fire.
+const FIRST_ROUND_STEP: u64 = 4;
 
 /// Retry budget per step before a proposer gives up retrying (but stays
 /// parked, ready to resume if fresh network activity reaches it) -- see the
@@ -156,6 +248,69 @@ fn best_of<V: Ord>(iter: impl Iterator<Item = Option<Proposal<V>>>) -> Option<Pr
     iter.max().flatten()
 }
 
+/// The phase-0 fast-path decision check (§4.2.5, D1): `Some(value)` iff
+/// every reply in this (already-quorum-sized) step-4 response set reports a
+/// `first` proposal at priority `H`.
+///
+/// # Why this is safe (Lemma C.10)
+///
+/// `H` is never drawn by a leaderless proposer ([`H`]'s docs), so only the
+/// designated leader's round-1 proposal can ever carry it. A recorder's ISR
+/// writes `F[4]` (`first`) exactly once, on the *first* `record(4, _)` call
+/// it ever sees (`crate::isr::Isr::record`'s `Ordering::Greater` arm; steps
+/// never regress, so nothing later can overwrite it). So if every recorder
+/// in this quorum reports `first.priority == H`, more than `n/2` recorders
+/// captured *the same* leader proposal in `F[4]`, and it can never be
+/// overwritten.
+///
+/// This is enough to make the decision safe even though no other proposer
+/// has necessarily seen the same thing yet: any other proposer's own
+/// step-4 quorum is also a majority, and any two majorities of a fixed `n`
+/// intersect. So every other proposer's quorum contains at least one
+/// recorder holding the leader's `H`-proposal in `F[4]` -- either that
+/// proposer's own quorum is *also* all-`H` (and it decides the same value
+/// via this same fast path), or it isn't, in which case the leader's
+/// proposal is nevertheless present among the replies that proposer's
+/// `best_j` selects from, and -- because `H` is unbeatable -- `best_j`
+/// necessarily picks it, so that proposer spreads it onward into phase 1
+/// exactly as if it were an ordinary round-1 proposal. From there the
+/// module's general "why this preserves Agreement" argument above (which
+/// is deliberately phrased over "any phase, not just 0") takes over
+/// unchanged: once spread, the value can only ever be matched or beaten,
+/// never lost, by any future quorum -- and nothing can beat `H`. So every
+/// live proposer that does not fast-decide still converges on exactly the
+/// same value through the ordinary leaderless machinery. A fast-path
+/// decision and a leaderless decision for the same slot can therefore never
+/// disagree: they are the same value by construction, not by coincidence.
+///
+/// The `debug_assert!` below is a defense-in-depth structural check of
+/// the "only the leader ever sends `H`, so all `H`-tagged replies in one
+/// quorum must be identical" premise -- it should be unreachable in a
+/// correct build (a single, consistently-configured leader per slot -- see
+/// `Proposer::new`) but a violation here would mean an agreement-threatening
+/// bug, not a benign race, so it is worth catching early in debug/test
+/// builds rather than trusting the premise silently.
+fn fast_path_value<V: Ord + Clone>(responses: &BTreeMap<NodeId, RecordResponse<V>>) -> Option<V> {
+    let mut replies = responses.values();
+    let first_reply = replies.next()?.first.as_ref()?;
+    if first_reply.priority != H {
+        return None;
+    }
+    for resp in responses.values() {
+        match &resp.first {
+            Some(p) if p.priority == H => {
+                debug_assert!(
+                    p == first_reply,
+                    "two distinct H-priority proposals seen in one quorum -- H must be \
+                     attached by exactly one consistently-configured leader"
+                );
+            }
+            _ => return None,
+        }
+    }
+    Some(first_reply.value.clone())
+}
+
 /// One proposer's Algorithm-4 state for one slot.
 pub struct Proposer<V> {
     self_id: NodeId,
@@ -165,6 +320,13 @@ pub struct Proposer<V> {
     /// between two disjoint groups that each satisfy a "live-relative"
     /// majority.
     total_replicas: usize,
+    /// The slot's designated leader, if any (§4.2.5). Every [`Proposer`]
+    /// instance for the same slot must be constructed with the *same*
+    /// value here -- see `Proposer::new`'s docs -- otherwise more than one
+    /// replica could believe itself the leader and attach `H` to more than
+    /// one distinct proposal, which is exactly the premise
+    /// [`fast_path_value`]'s `debug_assert!` guards against.
+    leader: Option<NodeId>,
     /// `s`: the threshold logical clock step, `4*round + phase`.
     step: u64,
     /// `p`: the current working proposal template.
@@ -187,18 +349,34 @@ pub struct Proposer<V> {
 impl<V: Ord + Clone> Proposer<V> {
     /// Build a proposer that has not yet started; call [`Proposer::start`]
     /// (from a `KICKOFF_TIMER` callback) to begin round 1, phase 0.
-    pub fn new(self_id: NodeId, total_replicas: usize, initial_value: V) -> Self {
+    ///
+    /// `leader` designates the slot's fast-path leader (§4.2.5), or `None`
+    /// for a purely leaderless slot (Phase 2 behavior, unchanged). **Every
+    /// proposer for the same slot must be built with the same `leader`
+    /// value** -- this is a cluster-construction invariant (see
+    /// `crate::concrete::ConcreteCluster::new_with_leader`, which enforces
+    /// it by passing one shared value to every `Proposer::new` call), not
+    /// something this constructor can check on its own.
+    pub fn new(
+        self_id: NodeId,
+        total_replicas: usize,
+        initial_value: V,
+        leader: Option<NodeId>,
+    ) -> Self {
         Self {
             self_id,
             total_replicas,
+            leader,
             step: 0,
-            // Initial template per Algorithm 4: `p <- <H, i, v>`. The `H`
-            // priority here is never actually sent (phase 0 always
-            // redraws in leaderless mode -- see `begin_step`); it only
-            // matters as a placeholder before the first real draw.
+            // Initial template per Algorithm 4: `p <- <H, i, v>`. This `H`
+            // priority is never actually sent as-is: phase 0 always either
+            // redraws randomly (leaderless steps) or substitutes the exact
+            // constant `H` explicitly (round-1 leader step) -- see
+            // `begin_step`. It only matters here as a placeholder value
+            // before the first real proposal is prepared.
             proposal: Proposal {
                 value: initial_value,
-                priority: MAX_PRIORITY,
+                priority: H,
                 origin: self_id,
             },
             decided: None,
@@ -218,8 +396,21 @@ impl<V: Ord + Clone> Proposer<V> {
         self.step
     }
 
+    /// Whether this replica has decided *and* did so on the phase-0 fast
+    /// path (§4.2.5, D1) -- i.e. without ever leaving round 1's first step.
+    /// A decision at any later step went through the ordinary
+    /// spread/gather machinery, whether or not a leader was configured.
+    pub fn decided_via_fast_path(&self) -> bool {
+        self.decided.is_some() && self.step == FIRST_ROUND_STEP
+    }
+
     fn quorum_threshold(&self) -> usize {
         self.total_replicas / 2 + 1
+    }
+
+    /// Whether `self` is the slot's designated fast-path leader.
+    fn is_leader(&self) -> bool {
+        self.leader == Some(self.self_id)
     }
 
     /// True majority of the full membership, matching `crate::tcast`.
@@ -230,7 +421,7 @@ impl<V: Ord + Clone> Proposer<V> {
     /// Kick off round 1, phase 0 (`s <- 4*1 + 0`). Called once, from the
     /// driver injecting a `KICKOFF_TIMER`.
     pub fn start(&mut self, ctx: &mut NodeCtx<'_, ConcreteMsg<V>>) {
-        self.step = 4;
+        self.step = FIRST_ROUND_STEP;
         self.begin_step(ctx);
     }
 
@@ -243,13 +434,30 @@ impl<V: Ord + Clone> Proposer<V> {
         self.retries_this_step = 0;
 
         let phase = self.step % 4;
+        // Algorithm 4's phase-0 guard, `s mod 4 = 0 and (s > 4 or i is not
+        // leader)`, negated: this replica is the fast-path leader *and*
+        // this is round 1's phase 0.
+        let is_fast_path_round = phase == 0 && self.step == FIRST_ROUND_STEP && self.is_leader();
         for recorder in self.all_recorders() {
-            let proposal = if phase == 0 {
+            let proposal = if is_fast_path_round {
+                // §4.2.5: the leader attaches the reserved max priority `H`
+                // to every recorder's proposal instead of drawing randomly
+                // -- see `H`'s docs for why this is what makes the phase-0
+                // fast-path check ([`fast_path_value`]) sound.
+                Proposal {
+                    value: self.proposal.value.clone(),
+                    priority: H,
+                    origin: self.self_id,
+                }
+            } else if phase == 0 {
                 // Proposal randomization (§4.2.4): a *fresh, independent*
-                // random priority per recorder, always (leaderless: the
-                // "i is not leader" disjunct in Algorithm 4's condition is
-                // unconditionally true here -- there is no leader role in
-                // this phase).
+                // random priority per recorder. Covers both genuinely
+                // leaderless slots and every non-leader proposer's round-1
+                // phase 0 (unconditional activation, δ=0: backup proposers
+                // are active from round 1 too, just without `H`) and every
+                // proposer's phase 0 in round >= 2 (the leader included --
+                // §4.2.5: "QuePaxa therefore uses a leader only in the
+                // first round of any slot").
                 Proposal {
                     value: self.proposal.value.clone(),
                     priority: draw_priority(ctx),
@@ -383,14 +591,23 @@ impl<V: Ord + Clone> Proposer<V> {
     fn process_phase(&mut self) {
         match self.step % 4 {
             0 => {
-                // Phase 0: propose. (The leader fast-path check --
-                // "if f'_j.priority = H in all replies" -- is intentionally
-                // omitted: it cannot fire in leaderless mode, since no
-                // drawn priority is ever H; see `draw_priority`.)
-                let best = best_of(self.responses.values().map(|r| r.first.clone())).expect(
-                    "a quorum of recorders that just recorded a proposal must report a first value",
-                );
-                self.proposal = best;
+                // Phase 0: propose. First check the leader fast path
+                // (§4.2.5, D1, Lemma C.10): if every reply's `first` is
+                // `H`-priority, more than n/2 recorders captured the
+                // leader's proposal in F[4] and it can never be overwritten
+                // or beaten -- decide immediately, after one round-trip.
+                // In leaderless steps (no configured leader, or any step
+                // past round 1) no drawn priority is ever `H` (see `H`'s
+                // docs), so this can never fire there -- exactly recovering
+                // Phase 2's leaderless behavior.
+                if let Some(value) = fast_path_value(&self.responses) {
+                    self.decided = Some(value);
+                } else {
+                    let best = best_of(self.responses.values().map(|r| r.first.clone())).expect(
+                        "a quorum of recorders that just recorded a proposal must report a first value",
+                    );
+                    self.proposal = best;
+                }
             }
             1 => {
                 // Phase 1: spread E. No action required (Algorithm 4).
@@ -422,5 +639,5 @@ impl<V: Ord + Clone> Proposer<V> {
 /// Algorithm 4's `random(1..H-1)` inclusive-inclusive range), from the
 /// kernel's single seeded PRNG stream via `ctx`.
 fn draw_priority<V>(ctx: &mut NodeCtx<'_, ConcreteMsg<V>>) -> u64 {
-    ctx.rng().gen_range(1..MAX_PRIORITY)
+    ctx.rng().gen_range(1..H)
 }
