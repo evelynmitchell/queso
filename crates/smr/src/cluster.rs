@@ -33,22 +33,20 @@
 //! majority-intersection safety argument, which was never restricted to
 //! proposers present from a slot's very first step.
 //!
-//! # Stage 4b seam (durability / restart, P12)
+//! # Durability / restart (Stage 4b, P9/P12)
 //!
-//! Nothing here is durable. A crashed replica ([`SmrCluster::crash`]) simply
-//! stops responding (crash-*stop*, matching this stage's scope note) --
-//! there is no restart/rejoin path exercised or supported. The design seam
-//! for Stage 4b is exactly the state [`crate::replica::ReplicaState`]
-//! already isolates as "everything this replica knows": its per-slot
-//! [`Recorder`]s' ISR state (`S, F_c, A_c, A_p` -- already `O(1)` per slot,
-//! D5), `next_slot`, and `applied_log`. A durable implementation would
-//! write-before-reply each `Recorder::handle` response and each `Kv::apply`
-//! effect, and a restarted replica would either recover that durable state
-//! or explicitly rejoin as a learner and catch up (via exactly the same
-//! catch-up-via-fresh-`Proposer` mechanism described above) before
-//! participating again -- `queso_sim::node::Node::on_restart` is the hook,
-//! deliberately left at its no-op default here, exactly as
-//! `queso_consensus::concrete::ReplicaNode` documents for the same reason.
+//! A crashed replica ([`SmrCluster::crash`]) stops responding entirely until
+//! [`SmrCluster::restart`] brings it back. Restarting recovers exactly the
+//! *durable* half of [`crate::replica::ReplicaState`] -- its per-slot
+//! [`Recorder`]s' ISR state (`S, F_c, A_c, A_p`, already `O(1)` per slot,
+//! D5), `next_slot`, `applied_log`, and `kv` (see
+//! [`crate::replica::Durable`]'s docs) -- while its volatile half (pending
+//! ops, any in-flight proposer) is dropped, and then rejoins as a learner:
+//! [`crate::replica::SmrNode::on_restart`] drives an internal catch-up probe
+//! through the exact same reads-through-log mechanism described above
+//! before the replica resumes ordinary participation. See that type's docs
+//! for the full recovery sequence and for how the write-before-reply
+//! ordering (P12) is enforced on the recorder side.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -147,12 +145,30 @@ impl SmrCluster {
         &self.live
     }
 
-    /// Crash a replica (crash-*stop* -- see the module docs' Stage 4b seam
-    /// note). Any operation currently in flight through it will simply
-    /// never complete (a liveness cost, per P11/O4 -- never a safety one).
+    /// Crash a replica. Any operation currently in flight through it will
+    /// simply never complete from this attempt (a liveness cost, per
+    /// P11/O4 -- never a safety one); a client retry (same `(client, seq)`,
+    /// to this replica once restarted or to another) is safe via P8a
+    /// dedup. See the module docs' "Durability / restart" section --
+    /// [`SmrCluster::restart`] is the crash-*recovery* counterpart.
     pub fn crash(&mut self, id: NodeId) {
         self.kernel.crash(id);
         self.live.remove(&id);
+    }
+
+    /// Restart a crashed replica (P12): its durable state (recorders' ISR,
+    /// log frontier, applied log, `kv`) is recovered untouched, its
+    /// volatile state is dropped, and it rejoins as a learner, catching up
+    /// on anything decided while it was down before resuming ordinary
+    /// participation -- see [`crate::replica::SmrNode::on_restart`] for the
+    /// exact sequence. Marks `id` live again immediately (matching
+    /// `crash`'s bookkeeping), even though it may still be mid-catch-up
+    /// under the hood; catch-up is safe to overlap with real traffic
+    /// (P10 holds throughout, not just once catch-up finishes -- see that
+    /// type's docs).
+    pub fn restart(&mut self, id: NodeId) {
+        self.kernel.restart(id);
+        self.live.insert(id);
     }
 
     /// A faithful invocation timestamp for a *new* submission: at least
@@ -297,25 +313,48 @@ impl SmrCluster {
 
     /// `replica`'s current KV snapshot (its local application state after
     /// everything it has applied so far -- may lag the true log length; see
-    /// the module docs).
+    /// the module docs). Durable (survives a crash + restart of `replica`,
+    /// see [`crate::replica::Durable`]).
     pub fn kv_snapshot(&self, replica: NodeId) -> BTreeMap<Key, Value> {
-        self.states[&replica].borrow().kv.snapshot()
+        self.states[&replica].borrow().durable.kv.snapshot()
     }
 
     /// `replica`'s exact applied-log prefix so far, `applied_log()[i]` being
     /// slot `i`'s decided command. Used by log-safety tests to assert P5
-    /// (prefix consistency across replicas) and P6 (total order).
+    /// (prefix consistency across replicas) and P6 (total order). Durable
+    /// (survives a crash + restart of `replica`).
     pub fn applied_log(&self, replica: NodeId) -> Vec<Command> {
-        self.states[&replica].borrow().applied_log.clone()
+        self.states[&replica].borrow().durable.applied_log.clone()
     }
 
     /// `replica`'s current frontier (first not-yet-applied slot index).
     /// Always equals `applied_log(replica).len()` -- gap-free application
     /// (P7) is structural here, not merely tested for: a replica only ever
     /// pushes onto `applied_log` one slot at a time, in order (see
-    /// `crate::replica::SmrNode::finish_attempt`).
+    /// `crate::replica::SmrNode::finish_attempt`). Durable (survives a
+    /// crash + restart of `replica`).
     pub fn next_slot(&self, replica: NodeId) -> u64 {
-        self.states[&replica].borrow().next_slot
+        self.states[&replica].borrow().durable.next_slot
+    }
+
+    /// `replica`'s recorder state for `slot` (the ISR's `(S, F_c, A_p)`
+    /// summary), if that recorder has ever been touched. Test/introspection
+    /// only -- used to demonstrate write-before-reply (P12) durability
+    /// directly: a recorder's ISR state, once it has answered a `record`
+    /// RPC, must be observable here unchanged after a crash + restart of
+    /// `replica` (see `crate::replica::Durable`'s docs and
+    /// `tests/restart_recovery.rs`).
+    pub fn recorder_summary(
+        &self,
+        replica: NodeId,
+        slot: u64,
+    ) -> Option<queso_consensus::isr::IsrSummary<Command>> {
+        self.states[&replica]
+            .borrow()
+            .durable
+            .recorders
+            .get(&slot)
+            .map(|r| r.peek())
     }
 
     /// The kernel's recorded trace so far (for determinism/reproducibility

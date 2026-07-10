@@ -118,6 +118,50 @@ fn log_safety_holds_across_seeds_n5_with_tolerated_crashes() {
     }
 }
 
+/// P5/P6/P7 (and, structurally, P12) under crash + **restart**, not just
+/// crash-stop: the crashed replicas from `scenario`'s setup come back
+/// midway through the workload and must rejoin without ever diverging from
+/// the rest of the log.
+fn scenario_with_restart(n: usize, seed: u64, workload_seed: u64, crash_count: usize) {
+    let adversary = ContentObliviousAdversary::new(1, 8).with_drop_probability(0.15);
+    let mut cluster = SmrCluster::new(seed, SchedulerKind::Oblivious(Box::new(adversary)), n);
+
+    let f = (n - 1) / 2;
+    let crash_count = crash_count.min(f);
+    let crashed: Vec<NodeId> = (0..crash_count as u32).map(NodeId).collect();
+    for &id in &crashed {
+        cluster.crash(id);
+    }
+
+    // Run half the workload with the crashed replicas down, then bring them
+    // back and run the rest while they catch up as learners.
+    run_random_workload(&mut cluster, workload_seed, 12);
+    for &id in &crashed {
+        cluster.restart(id);
+    }
+    run_random_workload(
+        &mut cluster,
+        workload_seed.wrapping_mul(7).wrapping_add(3),
+        12,
+    );
+
+    assert_log_safety(&cluster);
+}
+
+#[test]
+fn log_safety_holds_across_seeds_n3_with_a_restarted_replica() {
+    for seed in 0..8u64 {
+        scenario_with_restart(3, seed, seed.wrapping_mul(31) + 1, 1);
+    }
+}
+
+#[test]
+fn log_safety_holds_across_seeds_n5_with_restarted_replicas() {
+    for seed in 0..6u64 {
+        scenario_with_restart(5, seed, seed.wrapping_mul(41) + 3, 2);
+    }
+}
+
 #[test]
 fn log_safety_holds_even_without_a_live_majority() {
     // Excess crashes (more than f) may cost liveness but must never cost

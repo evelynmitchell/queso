@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Phase 4a: a multi-slot replicated log (SMR) driving a linearizable in-memory KV store, atop queso-consensus's concrete per-slot protocol."
+description = "Phase 4: a multi-slot replicated log (SMR) driving a linearizable in-memory KV store, atop queso-consensus's concrete per-slot protocol, with crash-recovery restart safety (P9/P12)."
 
 [lints]
 workspace = true
