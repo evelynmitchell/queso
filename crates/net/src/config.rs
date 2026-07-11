@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use queso_sim::ids::NodeId;
@@ -43,4 +44,10 @@ pub struct NodeConfig {
     /// no single shared stream to reproduce, so seeds only need to avoid
     /// correlated priorities across replicas, not reproduce a whole run.
     pub seed: u64,
+    /// Directory this replica's durable state is persisted into (see
+    /// `crate::persist::Store`) -- one `node-{id}.durable.bin` file per
+    /// replica, so an entire cluster's replicas can safely share the same
+    /// `data_dir` (as `queso-node`'s CLI default does) without colliding.
+    /// Created if it does not already exist.
+    pub data_dir: PathBuf,
 }

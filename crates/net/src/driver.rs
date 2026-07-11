@@ -3,6 +3,51 @@
 //! the real-network analogue of `queso_smr::cluster::SmrCluster` driving
 //! the same type over `queso_sim::kernel::Kernel`.
 //!
+//! # Durability across a real process restart (issue #36, P9/P12)
+//!
+//! `queso_sim::kernel::Kernel::restart` recovers a crashed node's durable
+//! state for free -- it calls [`queso_smr::SmrNode`]'s
+//! [`Node::on_restart`] on the *exact same*, still-heap-resident node it had
+//! held the whole time (see `queso_smr::replica::Durable`'s docs). A real
+//! process has no such luxury: `SIGKILL` followed by a fresh `exec` starts
+//! from a blank heap. `run_node` closes that gap:
+//!
+//! 1. **Boot**: [`crate::persist::Store::load`] checks whether this node id
+//!    has a snapshot on disk already. If so, this is a genuine restart:
+//!    build the [`SmrNode`] from the loaded [`Durable`] via
+//!    [`SmrNode::from_durable`], restore [`RealCtx`]'s logical-time
+//!    baseline from the snapshot's `max_tick`, and immediately call
+//!    [`Node::on_restart`] -- the same learner/catch-up entry point the sim
+//!    uses -- before this replica processes a single real event. If not,
+//!    this is a genuinely fresh replica: build a blank [`SmrNode`] exactly
+//!    as before, `on_restart` is never called (there is nothing to recover
+//!    from, and calling it would only cost an unnecessary catch-up round
+//!    trip).
+//! 2. **Write-before-reply, on real disk (P12)**: every dispatched
+//!    [`Event::Message`] can mutate this replica's `Durable` half (a
+//!    `Request` mutates its recorder's ISR; a `Response` that completes a
+//!    quorum mutates `next_slot`/`applied_log`/`kv` via
+//!    `SmrNode::finish_attempt`) -- see `queso_smr::replica`'s module docs.
+//!    After dispatching such an event, this loop snapshots the replica's
+//!    current `Durable` ([`SmrNode::durable_snapshot`]) and durably
+//!    persists it ([`crate::persist::Store::save`], fsync'd, atomic-rename)
+//!    *before* calling [`RealCtx::flush_outbound`] -- i.e. before anything
+//!    that event's processing produced (a `RecordResponse` reply, a
+//!    proposer's own requests, a self-loopback vote) actually reaches the
+//!    network or this replica's own inbox, and before any client `Outcome`
+//!    reply for an operation that just completed is sent. A crash between
+//!    "decided/recorded in memory" and "fsync'd" can therefore never be
+//!    observed by any peer or client -- exactly the guarantee
+//!    `queso_smr::replica::SmrNode::on_message`'s doc comment already
+//!    promised for a "real deployment", now made real. `Event::Timer` and
+//!    `Event::ClientSubmit` never mutate `Durable` (see the call sites in
+//!    `queso_smr::replica`), so this loop skips the fsync for those --
+//!    their `flush_outbound` runs immediately, with nothing to protect.
+//!
+//! See `crate::persist`'s module docs for the on-disk format/write scheme,
+//! and `crate::ctx::RealCtx`'s docs for the outbound-buffering and
+//! logical-time-baseline mechanisms this depends on.
+//!
 //! # Single-threaded ownership (why `SmrNode` needs no `Send`/`Sync`/locks)
 //!
 //! [`queso_smr::SmrNode`] is built on `Rc<RefCell<_>>` (see that crate's
@@ -22,7 +67,8 @@ use std::collections::BTreeMap;
 
 use queso_consensus::rpc::ConcreteMsg;
 use queso_sim::ids::{NodeId, TimerId};
-use queso_sim::node::Node;
+use queso_sim::node::{Ctx, Node};
+use queso_sim::time::LogicalTime;
 use queso_smr::{Command, OpId, OpRecord, Outcome, SmrNode};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -31,6 +77,7 @@ use tracing::info;
 use crate::client;
 use crate::config::NodeConfig;
 use crate::ctx::RealCtx;
+use crate::persist;
 use crate::transport;
 
 /// Everything that can happen to one replica: a message arrived, a timer
@@ -84,14 +131,42 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<()> {
     info!(id = ?config.id, addr = %config.client_listen_addr, "listening for clients");
     tokio::spawn(client::accept_clients(client_listener, inbox_tx.clone()));
 
-    let mut node = SmrNode::new_fixed_leader(config.total_replicas, config.leader);
+    // Durability across a real restart (issue #36, P9/P12) -- see this
+    // module's docs. `store` is this replica's on-disk snapshot handle;
+    // `load()` tells us whether this is a genuine restart (a snapshot
+    // already exists for this node id) or a still-cold first boot.
+    let store = persist::Store::new(&config.data_dir, config.id)?;
+    let loaded = store.load()?;
+    let is_restart = loaded.is_some();
+    let (mut node, baseline) = match loaded {
+        Some((durable, max_tick)) => (
+            SmrNode::from_durable(config.total_replicas, config.leader, durable),
+            LogicalTime(max_tick),
+        ),
+        None => (
+            SmrNode::new_fixed_leader(config.total_replicas, config.leader),
+            LogicalTime::ZERO,
+        ),
+    };
     let mut ctx = RealCtx::new(
         config.id,
         config.seed,
         config.tick,
+        baseline,
         outbound,
         inbox_tx.clone(),
     );
+
+    if is_restart {
+        info!(id = ?config.id, max_tick = baseline.0, "recovered durable state, rejoining as a learner");
+        ctx.tick_now();
+        // No fsync needed before this flush: `on_restart` only clears
+        // volatile state and starts a catch-up `Proposer` (see
+        // `queso_smr::replica::SmrNode::on_restart`'s docs) -- it does not
+        // itself mutate `Durable`, so there is nothing new to persist yet.
+        node.on_restart(&mut ctx);
+        ctx.flush_outbound();
+    }
 
     let mut pending: BTreeMap<OpId, oneshot::Sender<Outcome>> = BTreeMap::new();
     let mut next_op_id: u64 = 0;
@@ -102,6 +177,15 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<()> {
         // before invoking a `Node` callback -- see `RealCtx::tick_now`'s
         // docs.
         ctx.tick_now();
+        // Only an incoming `Message` can mutate this replica's `Durable`
+        // half (a `Request` mutates its recorder's ISR; a `Response` that
+        // completes a quorum mutates `next_slot`/`applied_log`/`kv` via
+        // `SmrNode::finish_attempt`) -- see this module's docs. `Timer` and
+        // `ClientSubmit` never do (a timer only re-drives an already-live
+        // `Proposer`/starts a fresh one; `submit` only touches the volatile
+        // op queue), so there is nothing to fsync before releasing their
+        // effects.
+        let may_mutate_durable = matches!(event, Event::Message { .. });
         match event {
             Event::Message { from, payload } => node.on_message(from, payload, &mut ctx),
             Event::Timer(timer_id) => node.on_timer(timer_id, &mut ctx),
@@ -113,11 +197,25 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<()> {
             }
         }
 
+        // Write-before-reply (P12, on real disk): persist this event's
+        // durable mutations, if any, before anything it produced -- a
+        // recorder's `RecordResponse`, a proposer's own requests, a
+        // self-loopback vote, or (via the completed-ops check just below)
+        // a client's `Outcome` -- is allowed to actually leave this
+        // replica. See this module's docs and `crate::persist`'s.
+        if may_mutate_durable {
+            let snapshot = node.durable_snapshot();
+            store.save(&snapshot, ctx.now().0)?;
+        }
+        ctx.flush_outbound();
+
         // A submitted op usually completes several events later than the
         // one that submitted it (whichever message/timer finally drives
         // its slot to a decision) -- so every dispatch, not just
         // `ClientSubmit`, must check whether any pending op just finished
-        // and, if so, answer its waiting client.
+        // and, if so, answer its waiting client. Only reached after the
+        // write-before-reply persist above, so a client can never be told
+        // an operation succeeded before that success is durable.
         let completed: Vec<OpId> = pending
             .keys()
             .copied()

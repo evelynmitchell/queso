@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
@@ -47,6 +48,14 @@ struct Args {
     /// should use distinct seeds.
     #[arg(long)]
     seed: u64,
+
+    /// Directory this replica's durable state is persisted into (fsync'd,
+    /// crash-consistent -- see `queso_net::persist`). Created if it does
+    /// not already exist. Every replica should get its own directory (a
+    /// shared directory is safe across *replicas* -- files are keyed by
+    /// `--id` -- but not across two instances of the *same* `--id`).
+    #[arg(long, default_value = "data")]
+    data_dir: PathBuf,
 }
 
 fn parse_peer(spec: &str) -> anyhow::Result<(NodeId, SocketAddr)> {
@@ -83,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         leader: args.leader.map(NodeId),
         tick: Duration::from_millis(args.tick_ms),
         seed: args.seed,
+        data_dir: args.data_dir,
     };
 
     queso_net::run_node(config).await

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Phase 7.1: a real-TCP transport and node binary driving the sim-verified queso-consensus/queso-smr core unchanged, over tokio."
+description = "Phase 7: a real-TCP transport and node binary driving the sim-verified queso-consensus/queso-smr core unchanged, over tokio, with fsync'd on-disk durability across process restarts."
 
 # This crate is the deliberate real-I/O boundary (see the crate docs):
 # real sockets, real wall-clock time, real OS entropy. It does NOT opt into
@@ -31,3 +31,4 @@ anyhow = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tempfile = "3"

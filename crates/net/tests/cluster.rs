@@ -11,6 +11,8 @@
 
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -28,6 +30,19 @@ fn free_addr() -> SocketAddr {
     listener.local_addr().expect("read back the bound address")
 }
 
+/// A fresh, never-before-used directory under the OS temp dir for one
+/// test's replicas to persist their durable state into (see
+/// `queso_net::persist::Store`). These particular tests never restart a
+/// node, so there is nothing to clean up mid-test -- unlike
+/// `tests/restart_recovery.rs`, which keeps a `tempfile::TempDir` guard
+/// alive for its whole test body since it deliberately reuses the same
+/// directory across a simulated restart.
+fn fresh_data_dir() -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("queso-net-test-{}-{n}", std::process::id()))
+}
+
 /// Boot a 3-node cluster, each replica on its own thread + tokio runtime,
 /// and return every replica's client-facing address.
 fn spawn_three_node_cluster(leader: Option<NodeId>) -> Vec<SocketAddr> {
@@ -38,6 +53,7 @@ fn spawn_three_node_cluster(leader: Option<NodeId>) -> Vec<SocketAddr> {
     let peers: BTreeMap<NodeId, SocketAddr> =
         (0..n).map(|i| (NodeId(i as u32), peer_addrs[i])).collect();
 
+    let data_dir = fresh_data_dir();
     for i in 0..n {
         let config = NodeConfig {
             id: NodeId(i as u32),
@@ -48,6 +64,7 @@ fn spawn_three_node_cluster(leader: Option<NodeId>) -> Vec<SocketAddr> {
             leader,
             tick: Duration::from_millis(5),
             seed: 1_000 + i as u64,
+            data_dir: data_dir.clone(),
         };
         thread::Builder::new()
             .name(format!("queso-node-{i}"))
@@ -130,6 +147,7 @@ fn spawn_cluster_with_only(leader: Option<NodeId>, live: &[usize]) -> Vec<Socket
     let peers: BTreeMap<NodeId, SocketAddr> =
         (0..n).map(|i| (NodeId(i as u32), peer_addrs[i])).collect();
 
+    let data_dir = fresh_data_dir();
     for &i in live {
         let config = NodeConfig {
             id: NodeId(i as u32),
@@ -140,6 +158,7 @@ fn spawn_cluster_with_only(leader: Option<NodeId>, live: &[usize]) -> Vec<Socket
             leader,
             tick: Duration::from_millis(5),
             seed: 2_000 + i as u64,
+            data_dir: data_dir.clone(),
         };
         thread::Builder::new()
             .name(format!("queso-node-{i}"))

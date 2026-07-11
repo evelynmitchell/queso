@@ -10,6 +10,9 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use crate::command::{ClientId, Command, Key, Value};
 
 /// What applying one [`Command`] produced.
@@ -46,7 +49,12 @@ impl Applied {
 /// `Ord`/`Eq` are derived so a whole `Kv` can be used as a search-state key
 /// (see [`crate::linearizability`]) -- both fields are `BTreeMap`s, so this
 /// stays a total order with no incidental (hash-based) nondeterminism.
+///
+/// `Serialize`/`Deserialize` (feature-gated, bookkeeping only) let a real
+/// driver persist this as part of [`crate::replica::Durable`] -- see that
+/// type's docs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Kv {
     map: BTreeMap<Key, Value>,
     last_seq: BTreeMap<ClientId, u64>,

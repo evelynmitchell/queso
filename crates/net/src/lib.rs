@@ -57,11 +57,18 @@
 //!   owns one replica's [`queso_smr::SmrNode`] and drives it from
 //!   messages/timers/client submissions, exactly as
 //!   `queso_smr::cluster::SmrCluster` drives it over the sim kernel.
+//! - [`persist`] -- [`persist::Store`], fsync'd, crash-consistent on-disk
+//!   persistence for a replica's [`queso_smr::Durable`] state (issue #36):
+//!   what makes a real process restart recover instead of coming back
+//!   blank. See that module's docs for the write-before-reply ordering and
+//!   the atomic-rename write scheme, and this crate's README for the
+//!   current honest status of real-transport durability.
 
 pub mod client;
 pub mod config;
 pub mod ctx;
 pub mod driver;
+pub mod persist;
 pub mod transport;
 pub mod wire;
 
