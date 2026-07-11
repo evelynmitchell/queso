@@ -66,12 +66,20 @@
 //! - [`metrics`] -- Phase 7.2's throughput/latency metrics
 //!   ([`metrics::Recorder`], [`metrics::Summary`]) used by the
 //!   `queso-bench` load generator binary (`src/bin/queso-bench.rs`).
+//! - [`nemesis`] -- Phase 7.4's in-transport fault injector
+//!   ([`nemesis::Nemesis`]): configurable latency/jitter, frame drop,
+//!   connection reset, and network partition against real peer
+//!   connections, off by default (`NodeConfig::nemesis: Option<Arc<Nemesis>>`)
+//!   so it never affects an ordinary `queso-node` run. See that module's
+//!   docs for the fault model and this crate's README for how to run the
+//!   adversarial perf harness (`tests/nemesis.rs`).
 
 pub mod client;
 pub mod config;
 pub mod ctx;
 pub mod driver;
 pub mod metrics;
+pub mod nemesis;
 pub mod persist;
 pub mod transport;
 pub mod wire;

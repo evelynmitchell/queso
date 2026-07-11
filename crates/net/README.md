@@ -6,7 +6,11 @@ tokio event loop instead of `queso_sim::kernel::Kernel`'s deterministic
 in-memory harness. Phase 7.2 adds a real client library (`client::Client`,
 with a replica-address pool and retry-to-another-replica) and a
 `queso-bench` load generator with throughput/latency metrics on top of that
-transport. See the crate's `src/lib.rs` docs for the architecture and
+transport. Phase 7.4 (issue #34) adds an in-transport fault injector
+(`nemesis::Nemesis`: latency/jitter, frame drop, connection reset, network
+partition) and adversarial perf tests that run `queso-bench`-style load
+through it — see "Phase 7.4: nemesis fault injection + adversarial perf"
+below. See the crate's `src/lib.rs` docs for the architecture and
 `docs/STATUS.md` §4a / issues #30/#36 for how this fits into the project's
 phases. Phase 7.3 (issue #33) adds deployment artifacts for running a real
 cluster on fly.io -- see `docs/deploy-flyio.md` for the runbook and
@@ -130,6 +134,7 @@ from a scratch program, or just run this crate's own integration tests
 cargo test -p queso-net --test cluster
 cargo test -p queso-net --test bench
 cargo test -p queso-net --test restart_recovery
+cargo test -p queso-net --test nemesis
 ```
 
 `tests/cluster.rs` boots a 3-node cluster entirely in-process (each
@@ -148,6 +153,11 @@ concurrent workers, a read/write mix, latency samples funneled through a
 collector task — and asserts the run produces every expected sample with
 zero errors, positive throughput, and a monotonic (p50 ≤ p90 ≤ p99 ≤ max)
 latency histogram for reads, writes, and overall.
+
+`tests/nemesis.rs` is issue #34's (Phase 7.4) acceptance test: fault
+injection and adversarial perf against real 3-node clusters — see "Phase
+7.4: nemesis fault injection + adversarial perf" above for the full
+breakdown of its three scenarios.
 
 `tests/restart_recovery.rs` is issue #36's regression test: it spawns the
 actual `queso-node` binary as independent OS processes, `SIGKILL`s a
@@ -205,16 +215,152 @@ queso-bench: 15670 ops in 8.04s = 1950.2 ops/sec (0 errors)
   writes   count=7869     errors=0      mean= 33037.2us  p50=  30863us  p90=  62879us  p99=  81279us  max=  93887us
 ```
 
-## Scope (Phase 7.1 + 7.2 — see the crate docs)
+## Phase 7.4: nemesis fault injection + adversarial perf (issue #34)
 
-Transport + node binary + client-facing wire protocol (Phase 7.1), plus a
-client library with a replica-address pool and retry-to-another-replica,
-and the `queso-bench` load generator with throughput/latency metrics
-(Phase 7.2). Explicitly **not** in this crate yet:
+`src/nemesis.rs`'s `Nemesis` is an **in-transport** fault injector for this
+crate's replica-to-replica connections — the real-network analogue of
+`queso_sim::fault`'s scripted crash/partition/slow-node model, but wired
+into `transport::spawn_peer_dialer` so it runs against a real, in-process,
+real-TCP cluster instead of the deterministic sim kernel. It is consulted
+once per outbound peer frame, immediately before the frame would be
+written to the socket, and supports:
+
+- **Latency/jitter**: a fixed delay plus uniform random jitter added before
+  every frame.
+- **Frame drop**: silently discard a frame instead of sending it (the same
+  "message just doesn't arrive" fault `queso_sim::fault` already models —
+  safe by the same argument: `queso_consensus::proposer`'s unbounded
+  retry-with-backoff re-sends whatever a live proposer still needs).
+- **Connection reset**: force the peer connection to close and let the
+  existing dialer reconnect loop (`transport::spawn_peer_dialer`'s
+  `RECONNECT_DELAY`) take back over, modelling a mid-stream TCP RST.
+- **Network partition (majority/minority splits + heal)**: split the
+  cluster into two groups of `NodeId`s that cannot exchange peer frames
+  with each other (`Nemesis::partition`/`Nemesis::heal`); `Nemesis::isolate`
+  is sugar for cutting off one node against the rest — the leader-targeting
+  scenario below.
+
+It is **off by default**: `NodeConfig::nemesis` is `Option<Arc<Nemesis>>`,
+`None` everywhere except a test/bench harness that explicitly builds one
+(`queso-node`'s CLI never does), and every hook this module adds is a
+strict no-op when it's `None` — an ordinary `queso-node` run is unaffected.
+Its own randomness is seeded (`FaultPlan::seed`) so a fault plan's *rate/
+shape* is reproducible run to run (see `src/nemesis.rs`'s module docs for
+the exact determinism caveat — real tokio tasks racing a shared RNG means
+this reproduces the sequence of fault decisions, not which message each
+one lands on).
+
+Why in-transport rather than an external proxy like
+[toxiproxy](https://github.com/Shopify/toxiproxy): toxiproxy is a
+legitimate way to fuzz a *real deployment* (Phase 7.3's fly.io territory),
+but it needs an out-of-process component wired into the network topology —
+awkward to stand up deterministically inside `cargo test`/CI. `Nemesis`
+instead keeps the whole adversarial story self-contained in this crate,
+runnable with nothing but `cargo test`. The trade-off is scope: it can only
+fault traffic this crate's own transport originates, and it is a
+**message-level** partition/drop model (the underlying TCP connection is
+left alone; only application frames stop crossing it) rather than a
+socket-level one — see `src/nemesis.rs`'s docs for the full "what it
+deliberately does not cover" list.
+
+### Tests (`tests/nemesis.rs`)
+
+```sh
+cargo test -p queso-net --test nemesis
+```
+
+Three `#[tokio::test(flavor = "multi_thread")]` scenarios against real
+3-node, real-TCP clusters:
+
+- **`partition_then_heal_preserves_acknowledged_write_and_minority_stalls`**
+  — the safety test. A write is acknowledged, *then* the cluster is split
+  into a 1-node minority and a 2-node majority. The live majority keeps
+  deciding new operations throughout the partition; the isolated minority
+  replica is asserted to never answer *anything* on its own (submitting to
+  it directly must not produce a successful `Outcome` within a bounded
+  deadline — a 1-of-3 replica can never reach the quorum its own new
+  attempt needs, so the only safe thing it can do is stall, not fabricate
+  or serve a stale value). After `Nemesis::heal`, both the pre-partition
+  and during-partition writes are read back correctly *from the
+  previously-isolated replica* — nothing acknowledged before/during the
+  partition was lost, and the healed replica agrees with the majority
+  rather than diverging.
+- **`isolating_the_leader_lets_the_majority_keep_deciding`** — the
+  leader-targeting / QuePaxa-vs-Raft scenario. `Nemesis::isolate` DoSes the
+  fixed fast-path leader completely away from its peers — the node a
+  Raft-style single-leader protocol would need to re-elect around, forcing
+  a stall until an election timeout elapses. The test drives load at only
+  the two non-leader replicas and asserts every operation still completes
+  (and reads back correctly) well inside a generous deadline, no election
+  required — demonstrating Meerkat/QuePaxa's leaderless-tolerant hedging
+  (any live majority of recorders can still decide) against exactly the
+  fault that would stall a single-leader protocol.
+- **`adversarial_load_stays_safe_and_shows_measurable_degradation`** — the
+  adversarial perf harness the issue asks for: the same
+  `queso_net::client::Client` + `queso_net::metrics::Recorder` machinery
+  `queso-bench`/`tests/bench.rs` use, run once against a clean baseline
+  cluster and once against an independent cluster under continuous
+  latency/jitter/frame-drop/connection-reset fuzzing (deliberately *no*
+  partition, so the whole cluster stays majority-connected and every
+  operation should eventually land). Asserts: most writes still land
+  despite continuous faults (a generous bound, not an exact throughput
+  number); the degraded run's mean latency clears an absolute floor
+  structurally implied by the configured fault plan (deliberately *not* a
+  ratio against the separately-run baseline cluster — see "Flakiness risk"
+  below for why); and, the actual safety property this test exists for,
+  every write the cluster *acknowledged* under fault injection is read
+  back afterward with its exact value — no lost, stale, or divergent
+  acknowledged write, even with the link actively dropping frames,
+  delaying them, and resetting connections throughout the run.
+
+Run individually with `--nocapture` to see both runs' full
+throughput/latency summaries (`Summary::to_text`) printed for comparison.
+
+### What Phase 7.4 does *not* cover (honest limits)
+
+- **Client-facing connections are untouched.** `Nemesis` only wraps
+  replica-to-replica peer traffic, not `crate::client`'s connections — a
+  partitioned/DoS'd replica's client port itself is not blocked. This
+  models "this replica cannot make progress" faithfully (the point of the
+  scenarios above) without needing to simulate client-side unreachability
+  too; a real caller routes around it via `Client`'s own
+  retry-to-another-replica, exactly as the leader-isolation test exercises.
+- **Message-level, not socket-level.** A partitioned/faulted link's
+  underlying TCP connection is left alone; this cannot exercise "the OS/
+  firewall itself refuses or black-holes the connection" as a distinct
+  failure mode from "the connection is up but application frames don't get
+  through".
+- **No packet reordering/corruption/duplication** — only delay, drop,
+  reset, and partition are modelled (the fault vocabulary
+  `queso_sim::fault` already covers on the sim side; corruption in
+  particular is out of scope for both since `wire::decode`'s bincode
+  framing would just reject a corrupted frame rather than exercise any
+  interesting new behavior).
+- **No `queso-bench`-CLI-level `--nemesis-plan` flag yet** — the fault
+  plans in `tests/nemesis.rs` are constructed and driven directly in Rust
+  (`Nemesis::partition`/`heal`/`isolate`/`set_*`, or the scripted
+  `nemesis::run_plan` helper for a pre-timed scenario); wiring an
+  equivalent CLI surface onto `queso-bench` itself is a natural follow-up,
+  not built here.
+- **Flakiness risk**: the adversarial-perf test's degradation assertion is
+  deliberately an absolute latency floor rather than a baseline ratio (see
+  the test's own comment) specifically because a ratio against a
+  separately-run baseline cluster proved flaky under heavy concurrent
+  `cargo test` load in development (the baseline cluster's own latency can
+  spike from unrelated CPU contention). The remaining tests use generous,
+  multi-second deadlines rather than tight timing windows for the same
+  reason.
+
+## Scope (Phase 7.1 + 7.2 + 7.4 — see the crate docs)
+
+Transport + node binary + client-facing wire protocol (Phase 7.1), a
+client library with a replica-address pool and retry-to-another-replica
+plus the `queso-bench` load generator with throughput/latency metrics
+(Phase 7.2), and an in-transport fault injector plus adversarial perf tests
+(Phase 7.4, above). Explicitly **not** in this crate yet:
 
 - session/seq management beyond A6's one-in-flight-per-`ClientId` minimum,
   connection pooling/reuse, or pipelining in the client library;
-- fault injection / fuzzing against the real network — Phase 7.4;
 - comparisons against alternative systems — Phase 7.5 (this crate's
   `--output json`/`csv` exist so those runs have something to diff against);
 - TLS — Phase 7 (A3's content-oblivious-adversary assumption is not

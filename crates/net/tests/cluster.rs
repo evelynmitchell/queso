@@ -76,6 +76,7 @@ fn spawn_cluster_with_only(leader: Option<NodeId>, live: &[usize]) -> Vec<Socket
             tick: Duration::from_millis(5),
             seed: 2_000 + i as u64,
             data_dir: data_dir.clone(),
+            nemesis: None,
         };
         thread::Builder::new()
             .name(format!("queso-node-{i}"))

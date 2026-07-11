@@ -7,9 +7,12 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use queso_sim::ids::NodeId;
+
+use crate::nemesis::Nemesis;
 
 /// One replica's full real-network configuration.
 #[derive(Debug, Clone)]
@@ -62,4 +65,13 @@ pub struct NodeConfig {
     /// `data_dir` (as `queso-node`'s CLI default does) without colliding.
     /// Created if it does not already exist.
     pub data_dir: PathBuf,
+    /// Phase 7.4's in-transport fault injector for this replica's outbound
+    /// peer traffic (see `crate::nemesis`'s docs) -- `None` (the default
+    /// everywhere except test/bench harnesses that build one explicitly,
+    /// e.g. `tests/nemesis.rs`) is a strict no-op: `queso-node`'s CLI never
+    /// sets this, so an ordinary run is unaffected. Shared (`Arc`) rather
+    /// than owned since one `Nemesis` typically drives fault decisions for
+    /// every replica in a scenario at once (a partition needs both sides to
+    /// agree on which pairs are cut off).
+    pub nemesis: Option<Arc<Nemesis>>,
 }

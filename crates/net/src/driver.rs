@@ -120,7 +120,11 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<()> {
         }
         let (tx, rx) = mpsc::channel(transport::OUTBOUND_QUEUE_CAPACITY);
         outbound.insert(peer_id, tx);
-        transport::spawn_peer_dialer(config.id, addr.clone(), rx);
+        // Phase 7.4: `config.nemesis` is `None` for every real `queso-node`
+        // run (see `NodeConfig::nemesis`'s docs) -- only test/bench
+        // harnesses that build one explicitly reach the fault-injection
+        // path inside `spawn_peer_dialer`.
+        transport::spawn_peer_dialer(config.id, peer_id, addr.clone(), rx, config.nemesis.clone());
     }
 
     let peer_listener = TcpListener::bind(config.listen_addr).await?;

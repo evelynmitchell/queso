@@ -21,10 +21,12 @@ use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use queso_net::config::NodeConfig;
+use queso_net::nemesis::Nemesis;
 use queso_net::{client, run_node};
 use queso_sim::ids::NodeId;
 use queso_smr::{Command, Outcome};
@@ -54,6 +56,28 @@ pub fn fresh_data_dir() -> PathBuf {
 /// Boot an `n`-node cluster, each replica on its own thread + tokio
 /// runtime, and return every replica's client-facing address.
 pub fn spawn_cluster(n: usize, leader: Option<NodeId>) -> Vec<SocketAddr> {
+    spawn_cluster_inner(n, leader, None)
+}
+
+/// Like [`spawn_cluster`], but every replica shares `nemesis` (Phase 7.4,
+/// `queso_net::nemesis`) for its outbound peer traffic -- see
+/// `tests/nemesis.rs`. Sharing one [`Nemesis`] across every replica (rather
+/// than giving each its own) is deliberate: a partition/isolate call needs
+/// every replica's dialer to agree on which pairs are cut off, which only
+/// works if they all consult the same fault state.
+pub fn spawn_cluster_with_nemesis(
+    n: usize,
+    leader: Option<NodeId>,
+    nemesis: Arc<Nemesis>,
+) -> Vec<SocketAddr> {
+    spawn_cluster_inner(n, leader, Some(nemesis))
+}
+
+fn spawn_cluster_inner(
+    n: usize,
+    leader: Option<NodeId>,
+    nemesis: Option<Arc<Nemesis>>,
+) -> Vec<SocketAddr> {
     let peer_addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
     let client_addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
 
@@ -73,6 +97,7 @@ pub fn spawn_cluster(n: usize, leader: Option<NodeId>) -> Vec<SocketAddr> {
             tick: Duration::from_millis(5),
             seed: 1_000 + i as u64,
             data_dir: data_dir.clone(),
+            nemesis: nemesis.clone(),
         };
         thread::Builder::new()
             .name(format!("queso-node-{i}"))
