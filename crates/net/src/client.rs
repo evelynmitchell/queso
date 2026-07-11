@@ -1,14 +1,36 @@
-//! The minimal client-facing protocol this stage needs to prove the
-//! end-to-end path: a client connects to a replica's client port, sends
-//! one length-delimited, bincode-encoded `queso_smr::Command` frame, and
-//! receives back one length-delimited, bincode-encoded `queso_smr::Outcome`
-//! frame -- one request per connection, no pipelining, no retry-to-another-
-//! replica-on-failure. A full client library (session/seq management,
-//! connection reuse, retry policy, load generation) is Phase 7.2's scope,
-//! not this one's; see [`submit`] for the "just enough to prove it works"
-//! helper this crate's own integration test uses.
+//! The client-facing protocol and client library.
+//!
+//! The wire protocol itself is deliberately minimal: a client connects to a
+//! replica's client port, sends one length-delimited, bincode-encoded
+//! `queso_smr::Command` frame, and receives back one length-delimited,
+//! bincode-encoded `queso_smr::Outcome` frame -- one request per connection,
+//! no pipelining. [`submit`] is the "just enough to prove it works" helper
+//! that speaks exactly that protocol with zero retry policy, used by this
+//! crate's own `tests/cluster.rs`.
+//!
+//! [`Client`] (Phase 7.2) is what a real caller -- `queso-bench` included --
+//! should actually use: it wraps [`submit`] with the two things a client
+//! talking to a Meerkat-style cluster over a real, lossy network needs that
+//! a single fire-and-forget call does not provide:
+//!
+//! 1. **A pool of replica addresses** rather than one fixed address, so a
+//!    client isn't wired to a single replica that might be down.
+//! 2. **Retry-to-another-replica** on connection failure or timeout, with a
+//!    short backoff once every address in the pool has been tried, so a
+//!    client survives a replica crashing, a partition, or (once one exists)
+//!    a leadership change -- without the caller having to hand-roll retry
+//!    logic itself.
+//!
+//! It deliberately does *not* add pipelining or pooled/reused connections:
+//! each attempt is a fresh one-shot [`submit`] call, matching the wire
+//! protocol above. That keeps [`Client`] simple and, per `queso_smr`'s A6
+//! precondition (see `queso_smr::command::ClientSession`'s docs), correct --
+//! a session may have at most one operation in flight at a time, which a
+//! single outstanding `submit` per `Client::submit` call trivially satisfies.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
@@ -71,10 +93,12 @@ async fn serve_one_client(
 /// possible client: one command, one connection, no retry -- if `addr`
 /// isn't the fast-path leader (or crashes, or is partitioned), the command
 /// can still be decided (per Meerkat's leaderless-tolerant design, see
-/// `queso_smr::cluster`'s module docs) but this helper will simply hang
-/// until it is, since a real client's retry-to-a-different-replica policy
-/// is Phase 7.2 scope. Good enough to prove the real-TCP path end-to-end
-/// (see this crate's `tests/cluster.rs`).
+/// `queso_smr::cluster`'s module docs) but this helper will simply hang, or
+/// fail with a connection error, rather than trying anywhere else. Good
+/// enough to prove the real-TCP path end-to-end (see this crate's
+/// `tests/cluster.rs`); most real callers want [`Client::submit`] instead,
+/// which wraps exactly this call with a pool of addresses and
+/// retry-to-another-replica.
 pub async fn submit(addr: SocketAddr, command: &Command) -> anyhow::Result<Outcome> {
     let stream = TcpStream::connect(addr).await?;
     let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
@@ -86,4 +110,159 @@ pub async fn submit(addr: SocketAddr, command: &Command) -> anyhow::Result<Outco
     let bytes: BytesMut = frame?;
     let outcome: Outcome = bincode::deserialize(&bytes)?;
     Ok(outcome)
+}
+
+/// [`Client`]'s retry policy knobs. The defaults are deliberately modest --
+/// a load generator or interactive caller can tune these, but they need to
+/// do *something* sane with zero configuration.
+#[derive(Debug, Clone)]
+pub struct ClientConfig {
+    /// How long to wait for one attempt (connect + request + response)
+    /// against a single address before treating it as failed and moving to
+    /// the next one.
+    pub attempt_timeout: Duration,
+    /// How many full passes over the address pool to attempt before giving
+    /// up and returning the last error. `1` means "try every address once";
+    /// `0` is treated as `1` (a client with nothing to try is not useful).
+    pub max_rounds: usize,
+    /// How long to sleep between rounds once every address in the pool has
+    /// been tried and failed once -- a short pause so a client that has
+    /// outrun a cluster mid-election (say) doesn't spin-retry it into the
+    /// ground.
+    pub retry_backoff: Duration,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            attempt_timeout: Duration::from_secs(2),
+            max_rounds: 5,
+            retry_backoff: Duration::from_millis(50),
+        }
+    }
+}
+
+/// A client that knows about a whole cluster, not just one replica.
+///
+/// Holds a fixed pool of candidate client-port addresses (typically every
+/// replica's, though a subset works too) and, on every [`Client::submit`]
+/// call, tries them in a rotating order -- starting from a different
+/// address each call (via a shared round-robin cursor, so concurrent
+/// callers naturally spread their *first* attempt across the pool instead
+/// of piling onto address `0`) -- retrying against the next address in the
+/// pool on any connection failure, I/O error, or per-attempt timeout. See
+/// the module docs for why this is the right amount of robustness and no
+/// more (no pooled connections, no pipelining).
+#[derive(Debug)]
+pub struct Client {
+    addrs: Vec<SocketAddr>,
+    cursor: AtomicUsize,
+    config: ClientConfig,
+}
+
+impl Client {
+    /// Build a client over `addrs` (must be non-empty) with the default
+    /// [`ClientConfig`].
+    pub fn new(addrs: Vec<SocketAddr>) -> Self {
+        Self::with_config(addrs, ClientConfig::default())
+    }
+
+    /// Build a client over `addrs` (must be non-empty) with an explicit
+    /// [`ClientConfig`].
+    pub fn with_config(addrs: Vec<SocketAddr>, config: ClientConfig) -> Self {
+        assert!(
+            !addrs.is_empty(),
+            "Client needs at least one replica address"
+        );
+        Self {
+            addrs,
+            cursor: AtomicUsize::new(0),
+            config,
+        }
+    }
+
+    /// This client's configured address pool, in the fixed order it was
+    /// built with (not the per-call rotation order).
+    pub fn addrs(&self) -> &[SocketAddr] {
+        &self.addrs
+    }
+
+    /// Submit `command`, retrying against other addresses in the pool on
+    /// failure or timeout, per [`ClientConfig`]. Returns the last error
+    /// encountered if every address fails on every round.
+    pub async fn submit(&self, command: &Command) -> anyhow::Result<Outcome> {
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % self.addrs.len();
+        let rounds = self.config.max_rounds.max(1);
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for round in 0..rounds {
+            for offset in 0..self.addrs.len() {
+                let addr = self.addrs[(start + offset) % self.addrs.len()];
+                match tokio::time::timeout(self.config.attempt_timeout, submit(addr, command)).await
+                {
+                    Ok(Ok(outcome)) => return Ok(outcome),
+                    Ok(Err(err)) => {
+                        warn!(%addr, %err, "queso-net client: attempt failed");
+                        last_err = Some(err);
+                    }
+                    Err(_) => {
+                        warn!(%addr, timeout = ?self.config.attempt_timeout, "queso-net client: attempt timed out");
+                        last_err = Some(anyhow::anyhow!(
+                            "request to {addr} timed out after {:?}",
+                            self.config.attempt_timeout
+                        ));
+                    }
+                }
+            }
+            let last_round = round + 1 == rounds;
+            if !last_round {
+                tokio::time::sleep(self.config.retry_backoff).await;
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Client::submit: address pool was empty")))
+    }
+}
+
+#[cfg(test)]
+mod client_pool_tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "at least one replica address")]
+    fn rejects_an_empty_pool() {
+        let _ = Client::new(vec![]);
+    }
+
+    /// A pool where every address is unreachable (nothing listening) must
+    /// exhaust its retries and return an error rather than hang -- the
+    /// property `queso-bench` depends on to count/report failed ops instead
+    /// of stalling the whole run.
+    #[tokio::test]
+    async fn exhausts_retries_and_returns_an_error_when_every_address_is_dead() {
+        // Bind-then-drop three listeners to get addresses that are free
+        // (nothing accepting connections there) but were real, valid local
+        // ports a moment ago -- deterministic "connection refused" rather
+        // than relying on a hardcoded unused port range.
+        let mut dead_addrs = Vec::new();
+        for _ in 0..3 {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            dead_addrs.push(listener.local_addr().unwrap());
+        }
+        let client = Client::with_config(
+            dead_addrs,
+            ClientConfig {
+                attempt_timeout: Duration::from_millis(200),
+                max_rounds: 1,
+                retry_backoff: Duration::from_millis(1),
+            },
+        );
+        let command = Command::Get {
+            client: queso_smr::ClientId(0),
+            seq: 0,
+            key: 0,
+        };
+        let result = client.submit(&command).await;
+        assert!(result.is_err(), "expected every dead address to fail");
+    }
 }
