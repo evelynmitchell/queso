@@ -464,6 +464,28 @@ run both experiments across the resulting real WAN links.
    pointed at the respective `fly proxy` tunnels instead of localhost --
    identical `queso-compare` invocations, now measuring real cross-region
    (`iad`/`lhr`/`nrt`) WAN latency for both systems instead of loopback.
+
+   > **WAN caveat — a connection-reuse asymmetry that only matters off
+   > loopback.** `QuesoTarget` drives `queso_net::client::Client`, which by
+   > design opens a **fresh TCP connection per operation** (no pooling/
+   > pipelining -- see `crates/net/README.md`'s "Honest limits"), while
+   > `EtcdTarget` uses `reqwest`'s default **HTTP/1.1 keep-alive connection
+   > pool**, so etcd reuses a warm connection across ops. On loopback (§6)
+   > that difference is lost in the hundreds-of-ms fsync-dominated latency
+   > and does not affect the leader-DoS conclusion. **Over a real WAN it is
+   > not negligible:** a fresh connection costs Queso a full extra
+   > handshake RTT *per op* that pooled etcd does not pay, which
+   > structurally penalizes Queso's raw-latency/throughput numbers for
+   > reasons that have nothing to do with the consensus protocol. So when
+   > reading §6's normal-case numbers over the WAN, treat any Queso-vs-etcd
+   > *latency/throughput* gap as **confounded by transport, not a protocol
+   > result** -- the apples-to-apples protocol claim this doc actually
+   > stands behind is the §8 leader-DoS *behavior* (does the cluster stall
+   > for an election?), which does not depend on connection reuse. To
+   > remove the confound before publishing WAN latency numbers, either add
+   > pooling to `Client` (a `queso-net` change, out of scope here) or drive
+   > Queso through a warm-connection client shim; until then, do not present
+   > the WAN normal-case ops/sec as a fair head-to-head.
 5. **Run §8's leader-DoS procedure** against both clusters via `fly ssh
    console -a <app>` (or `fly machine stop`, for a cleaner "the machine is
    gone" fault than a same-container process kill) targeting whichever
