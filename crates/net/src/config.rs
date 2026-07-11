@@ -25,7 +25,19 @@ pub struct NodeConfig {
     /// including this replica's own entry (harmlessly unused: nothing ever
     /// dials or sends to `self.id`, see `crate::driver::run_node`). Its
     /// length is also this cluster's total replica count.
-    pub peers: BTreeMap<NodeId, SocketAddr>,
+    ///
+    /// Each value is a `host:port` string, not a pre-resolved
+    /// [`SocketAddr`]: a literal IP (`"127.0.0.1:7000"`) is accepted
+    /// directly, but a hostname (e.g. fly.io's private `.internal` DNS --
+    /// see `docs/deploy-flyio.md`) is deliberately *not* resolved here at
+    /// startup. It is resolved lazily, fresh on every dial attempt, by
+    /// `crate::transport::spawn_peer_dialer` (via
+    /// `crate::transport::resolve_peer_addr`) -- necessary because that DNS
+    /// may not have propagated yet the instant this process starts, and
+    /// because the address behind a given hostname can legitimately change
+    /// across a peer's restart (a new fly machine, a rescheduled
+    /// container, ...).
+    pub peers: BTreeMap<NodeId, String>,
     /// Total replica count (`peers.len()`, kept as an explicit field since
     /// `queso_smr::SmrNode::new_fixed_leader` wants a plain `usize` and
     /// re-deriving it from `peers` at every call site would be redundant).

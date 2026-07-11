@@ -1,0 +1,40 @@
+# fly.io app config for queso replica 2 -- see deploy/fly.toml (replica 0)
+# for the full rationale (one fly app per replica, `.internal` DNS peer
+# discovery, why [::]  binds, why no TLS handler, why the volume matters,
+# why this must never scale to zero) and docs/deploy-flyio.md for the
+# runbook. Only the app name, region, --id/--seed, and volume name differ
+# from deploy/fly.toml.
+app = "queso-2"
+primary_region = "nrt"
+
+[build]
+  dockerfile = "deploy/Dockerfile"
+
+[env]
+  RUST_LOG = "info"
+
+[processes]
+  app = "/usr/local/bin/queso-node --id 2 --seed 303 --listen [::]:7000 --client-listen [::]:8000 --peer 0=queso-0.internal:7000 --peer 1=queso-1.internal:7000 --peer 2=queso-2.internal:7000 --leader 0 --data-dir /data"
+
+[mounts]
+  source = "queso2_data"
+  destination = "/data"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8000
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 8000
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "4s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

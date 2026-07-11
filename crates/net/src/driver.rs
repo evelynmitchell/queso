@@ -114,13 +114,13 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<()> {
     // `RealCtx::send` handles `dst == self_id` as a loopback through the
     // inbox rather than this `outbound` map -- see that method's docs.
     let mut outbound = BTreeMap::new();
-    for (&peer_id, &addr) in &config.peers {
+    for (&peer_id, addr) in &config.peers {
         if peer_id == config.id {
             continue;
         }
         let (tx, rx) = mpsc::channel(transport::OUTBOUND_QUEUE_CAPACITY);
         outbound.insert(peer_id, tx);
-        transport::spawn_peer_dialer(config.id, addr, rx);
+        transport::spawn_peer_dialer(config.id, addr.clone(), rx);
     }
 
     let peer_listener = TcpListener::bind(config.listen_addr).await?;

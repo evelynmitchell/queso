@@ -1,0 +1,95 @@
+# fly.io app config for queso replica 0 of a 3-replica cluster
+# (queso-0 / queso-1 / queso-2 -- see deploy/fly.queso-1.toml and
+# deploy/fly.queso-2.toml for the other two, and docs/deploy-flyio.md for
+# the full runbook: build/push, volumes, deploy, verification, teardown).
+#
+# ONE FLY APP PER REPLICA, deliberately. This is the stable-address scheme
+# this deployment relies on for peer discovery (see docs/deploy-flyio.md's
+# "Peer discovery" section for the full rationale): fly gives every app a
+# fixed private DNS name on its 6PN network, `<app-name>.internal`, that
+# resolves to that app's machine(s) regardless of which physical host they
+# land on or how many times they restart. Naming the apps `queso-0`,
+# `queso-1`, `queso-2` (matching each replica's `--id`) means every
+# replica's `--peer` dial address is simply `<that-app>.internal:7000` --
+# fixed at deploy time, no service discovery, no coordination beyond
+# picking app names up front. A single multi-machine fly app would NOT
+# give each machine a stable, individually addressable hostname the same
+# way, which is why this scheme uses N single-machine apps instead of one
+# N-machine app.
+app = "queso-0"
+primary_region = "iad"
+
+[build]
+  dockerfile = "deploy/Dockerfile"
+
+[env]
+  RUST_LOG = "info"
+
+# This replica's full command line -- see crates/net/src/bin/queso-node.rs
+# for every flag's meaning. Every replica's --peer list is identical and
+# includes all three (including itself, harmlessly unused -- see
+# crates/net/src/config.rs's NodeConfig::peers docs) so that the cluster's
+# membership is fixed and explicit in each app's own config, not derived
+# from any runtime discovery mechanism.
+#
+# --listen/--client-listen bind `[::]:PORT` (all IPv6 interfaces) rather
+# than `127.0.0.1`: fly machines are reachable over their private 6PN
+# network (and by fly's edge proxy for [[services]] below) via an IPv6
+# address on the machine's own interface, not loopback -- see
+# docs/deploy-flyio.md's "Peer discovery" section.
+[processes]
+  app = "/usr/local/bin/queso-node --id 0 --seed 101 --listen [::]:7000 --client-listen [::]:8000 --peer 0=queso-0.internal:7000 --peer 1=queso-1.internal:7000 --peer 2=queso-2.internal:7000 --leader 0 --data-dir /data"
+
+# Durability (issue #36/#38) depends on this surviving restarts/redeploys
+# -- crates/net/README.md's "Status" section: a replica that reloads a
+# *different*, empty --data-dir on restart silently behaves like a replica
+# that lost its disk. `fly volumes create` provisions this once per app
+# (see docs/deploy-flyio.md); fly re-attaches the same volume to a
+# replacement machine on redeploy/restart within the volume's region.
+#
+# NOTE: a fly volume is still single-copy, host-local durable storage (no
+# built-in cross-host replication) -- exactly the "single-copy durability,
+# not replicated backup" limit crates/net/README.md already documents for
+# this crate's on-disk state; losing the underlying volume is still only
+# recoverable via catch-up from a live majority, same as a bare-metal disk
+# failure would be.
+[mounts]
+  source = "queso0_data"
+  destination = "/data"
+
+# The client-facing port -- exposed publicly through fly's TCP proxy so a
+# client (or queso-bench) outside the fly org's network can reach it at
+# `queso-0.fly.dev:8000` (see docs/deploy-flyio.md's verification steps).
+# Deliberately plain `tcp` (no `handlers`): queso-net's client wire
+# protocol (crate::wire) is a custom length-delimited binary framing, not
+# HTTP, so an HTTP/TLS-terminating handler would misinterpret it -- see
+# `docs/deploy-flyio.md`'s note A3 on why no app-level TLS is added here
+# (fly's `.internal`/6PN mesh is already WireGuard-encrypted).
+#
+# Peer traffic (port 7000) deliberately has NO [[services]] block at all:
+# it only needs to be reachable over the private 6PN network at
+# `queso-0.internal:7000`, which every other fly machine in this org can
+# already reach without any public ingress configuration, as long as this
+# process is listening on that port -- see docs/deploy-flyio.md.
+[[services]]
+  protocol = "tcp"
+  internal_port = 8000
+  # A consensus replica must stay up to keep serving its share of quorum
+  # traffic -- unlike a stateless web app, it must NOT be scaled to zero
+  # for lack of recent requests, and a request should never implicitly
+  # spin up a fresh (empty-quorum) machine.
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 8000
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "4s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

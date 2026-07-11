@@ -1,0 +1,9 @@
+# Docker build context excludes -- see deploy/Dockerfile (built from the
+# repo root so it can see the whole Cargo workspace).
+target
+.git
+.github
+*.pdf
+spec
+docs
+README.md
