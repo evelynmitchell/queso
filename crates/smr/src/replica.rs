@@ -70,6 +70,8 @@ use queso_consensus::rpc::ConcreteMsg;
 use queso_sim::ids::{NodeId, TimerId};
 use queso_sim::node::{Ctx, Node};
 use queso_sim::time::LogicalTime;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 use crate::command::{ClientId, Command, Value};
 use crate::kv::Kv;
@@ -147,6 +149,7 @@ pub struct OpId(pub u64);
 
 /// What a completed operation returned to its caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Outcome {
     /// The write was decided (and, unless it was itself a duplicate, took
     /// effect) somewhere in the log.
@@ -410,6 +413,77 @@ pub struct SmrNode {
 }
 
 impl SmrNode {
+    /// Build a single fresh replica participating in an `n`-replica cluster
+    /// (`total_replicas`) with a fixed (or, if `None`, absent) fast-path
+    /// leader for every slot -- the exact same per-replica construction
+    /// [`crate::cluster::SmrCluster::build`] performs internally for its
+    /// `Kernel`-driven nodes, just exposed publicly so a non-sim driver
+    /// (`queso-net`'s real-network event loop) can build and drive this
+    /// same, unmodified [`Node`] implementation over a real transport
+    /// without depending on anything `Kernel`-specific.
+    ///
+    /// There is no `id` parameter: nothing in [`SmrNode`] itself stores
+    /// this replica's own id -- every callback learns it afresh from
+    /// `ctx.self_id()` (see e.g. [`Self::begin_next_attempt`]), so it is
+    /// entirely the driver's responsibility (sim `Kernel::add_node`'s key,
+    /// or a real driver's own config) to keep a `SmrNode` instance and the
+    /// id it is driven under consistent.
+    pub fn new_fixed_leader(total_replicas: usize, leader: Option<NodeId>) -> Self {
+        SmrNode {
+            state: Rc::new(RefCell::new(ReplicaState::default())),
+            results: Rc::new(RefCell::new(BTreeMap::new())),
+            total_replicas,
+            leader_policy: LeaderPolicy::Fixed(leader),
+            local_step: Rc::new(Cell::new(0)),
+        }
+    }
+
+    /// Submit `command`, tagged `op_id`, as a fresh client-visible
+    /// operation this replica should propose -- mirrors
+    /// [`crate::cluster::SmrCluster::submit`]'s enqueue-then-kick logic
+    /// exactly (record a pending [`OpRecord`], push onto the queue, and if
+    /// the replica was idle a moment ago schedule a zero-delay
+    /// [`KICKOFF_TIMER`]), so any driver reaches [`Self::begin_next_attempt`]
+    /// through the identical `Node::on_timer` path the sim harness already
+    /// exhaustively tests -- rather than calling it directly, which would
+    /// (harmlessly, but needlessly) diverge from that verified path just
+    /// because a real driver happens to already hold a live `ctx` where
+    /// `SmrCluster::submit` (called from outside any `Node` callback) does
+    /// not.
+    pub fn submit(
+        &self,
+        op_id: OpId,
+        replica: NodeId,
+        command: Command,
+        ctx: &mut dyn Ctx<ConcreteMsg<Command>>,
+    ) {
+        self.results.borrow_mut().insert(
+            op_id,
+            OpRecord {
+                replica,
+                command: command.clone(),
+                invoked_at: ctx.now(),
+                completed_at: None,
+                outcome: None,
+                decided_slot: None,
+            },
+        );
+        let should_kick = {
+            let mut st = self.state.borrow_mut();
+            st.queue.push_back(QueuedOp { op_id, command });
+            st.queue.len() == 1
+        };
+        if should_kick {
+            ctx.schedule_timer(0, KICKOFF_TIMER);
+        }
+    }
+
+    /// Read back a previously [`Self::submit`]ted operation's result, if it
+    /// has completed.
+    pub fn result(&self, op_id: OpId) -> Option<OpRecord> {
+        self.results.borrow().get(&op_id).cloned()
+    }
+
     /// If this replica is idle (no attempt in flight) and has something
     /// queued, start a fresh [`Proposer`] for the front of the queue,
     /// targeting the current frontier slot. No-op otherwise (called

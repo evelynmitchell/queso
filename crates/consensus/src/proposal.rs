@@ -13,6 +13,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use queso_sim::ids::NodeId;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /// A value proposed by some replica, tagged with the random priority that
 /// replica drew for it this round, and the replica that drew it.
@@ -30,6 +32,7 @@ use queso_sim::ids::NodeId;
 /// [`NodeId`]) and then `value` itself, both total orders, so `Proposal`'s
 /// `Ord` is a genuine total order with no ambiguity, ever.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Proposal<V> {
     /// The proposed value.
     pub value: V,

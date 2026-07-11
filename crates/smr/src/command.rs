@@ -9,6 +9,8 @@
 //! or session expiry (out of scope; see the crate docs).
 
 use queso_sim::ids::NodeId;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /// A key in the KV store. Kept small/`Copy` on purpose -- this is a "hello
 /// world" application (O2), not a general-purpose database.
@@ -20,6 +22,7 @@ pub type Value = i64;
 /// A stable client identity (A6). Distinct from [`NodeId`]: a client is not
 /// a replica, and many clients may submit through the same replica.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ClientId(pub u32);
 
 /// The smallest usable client-session concept satisfying A6: a stable
@@ -98,6 +101,7 @@ impl ClientSession {
 /// decided for this slot is the one I submitted" (see
 /// `crate::replica::ReplicaState`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Command {
     Put {
         client: ClientId,

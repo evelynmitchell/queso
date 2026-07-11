@@ -1,11 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/sim", "crates/consensus", "crates/smr"]
+members = ["crates/sim", "crates/consensus", "crates/smr", "crates/net"]
 
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Queso contributors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"
