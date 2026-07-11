@@ -60,8 +60,9 @@ fn spawn_cluster_with_only(leader: Option<NodeId>, live: &[usize]) -> Vec<Socket
     let peer_addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
     let client_addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
 
-    let peers: BTreeMap<NodeId, SocketAddr> =
-        (0..n).map(|i| (NodeId(i as u32), peer_addrs[i])).collect();
+    let peers: BTreeMap<NodeId, String> = (0..n)
+        .map(|i| (NodeId(i as u32), peer_addrs[i].to_string()))
+        .collect();
 
     let data_dir = support::fresh_data_dir();
     for &i in live {

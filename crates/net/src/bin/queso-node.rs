@@ -58,13 +58,24 @@ struct Args {
     data_dir: PathBuf,
 }
 
-fn parse_peer(spec: &str) -> anyhow::Result<(NodeId, SocketAddr)> {
+/// Parse one `--peer id=host:port` flag. `host` may be a literal IP or a
+/// hostname (e.g. fly.io's private `.internal` DNS -- see
+/// `docs/deploy-flyio.md`); this only validates the `host:port` *shape* (a
+/// trailing `:<numeric port>`), it deliberately does not resolve `host`
+/// here -- see `queso_net::config::NodeConfig::peers`'s docs for why
+/// resolution happens lazily, per dial attempt, instead.
+fn parse_peer(spec: &str) -> anyhow::Result<(NodeId, String)> {
     let (id_str, addr_str) = spec
         .split_once('=')
         .ok_or_else(|| anyhow::anyhow!("peer spec must be id=host:port, got {spec:?}"))?;
     let id: u32 = id_str.parse()?;
-    let addr: SocketAddr = addr_str.parse()?;
-    Ok((NodeId(id), addr))
+    let (_, port_str) = addr_str
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("peer address must be host:port, got {addr_str:?}"))?;
+    port_str
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("peer address port must be numeric, got {addr_str:?}"))?;
+    Ok((NodeId(id), addr_str.to_string()))
 }
 
 #[tokio::main]
@@ -96,4 +107,41 @@ async fn main() -> anyhow::Result<()> {
     };
 
     queso_net::run_node(config).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_peer_accepts_an_ip_literal() {
+        let (id, addr) = parse_peer("0=127.0.0.1:7000").unwrap();
+        assert_eq!(id, NodeId(0));
+        assert_eq!(addr, "127.0.0.1:7000");
+    }
+
+    #[test]
+    fn parse_peer_accepts_a_hostname_like_flys_internal_dns() {
+        // Not resolved here at all -- see `parse_peer`'s docs -- so this
+        // must succeed even though `queso-1.internal` resolves to nothing
+        // in this test process.
+        let (id, addr) = parse_peer("1=queso-1.internal:7000").unwrap();
+        assert_eq!(id, NodeId(1));
+        assert_eq!(addr, "queso-1.internal:7000");
+    }
+
+    #[test]
+    fn parse_peer_rejects_a_missing_port() {
+        assert!(parse_peer("0=127.0.0.1").is_err());
+    }
+
+    #[test]
+    fn parse_peer_rejects_a_non_numeric_port() {
+        assert!(parse_peer("0=127.0.0.1:notaport").is_err());
+    }
+
+    #[test]
+    fn parse_peer_rejects_a_missing_equals() {
+        assert!(parse_peer("0-127.0.0.1:7000").is_err());
+    }
 }

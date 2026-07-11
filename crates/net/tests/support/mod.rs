@@ -57,8 +57,9 @@ pub fn spawn_cluster(n: usize, leader: Option<NodeId>) -> Vec<SocketAddr> {
     let peer_addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
     let client_addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
 
-    let peers: BTreeMap<NodeId, SocketAddr> =
-        (0..n).map(|i| (NodeId(i as u32), peer_addrs[i])).collect();
+    let peers: BTreeMap<NodeId, String> = (0..n)
+        .map(|i| (NodeId(i as u32), peer_addrs[i].to_string()))
+        .collect();
 
     let data_dir = fresh_data_dir();
     for i in 0..n {

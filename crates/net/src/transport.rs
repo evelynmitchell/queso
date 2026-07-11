@@ -69,32 +69,66 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(200);
 /// a few thousand small messages per down peer, not unbounded growth.
 pub const OUTBOUND_QUEUE_CAPACITY: usize = 1024;
 
-/// Spawn the outbound-connection manager for one peer: dial (retrying
-/// forever on failure), send a [`WireMsg::Hello`] handshake identifying
-/// this replica, then forward every message enqueued on `rx` as a frame --
-/// until `rx` is closed (this replica shutting down) or the connection
-/// drops, in which case it reconnects and resumes draining `rx` from
-/// wherever it left off. Nothing already queued in `rx` is lost across a
-/// reconnect (it is an ordinary in-process channel, untouched by the
-/// socket dropping); a message can still be lost either by racing an
-/// in-flight write failure, or -- while this peer is unreachable for a
-/// long time -- by being dropped for exceeding [`OUTBOUND_QUEUE_CAPACITY`]
-/// (see that constant's docs). Both are exactly the "message drop" fault
-/// the consensus layer's own unbounded retry-with-backoff
-/// (`queso_consensus::proposer`'s module docs) already tolerates by
-/// design -- this transport does not need its own delivery guarantees on
-/// top of that.
+/// Resolve one peer's dial target, accepting either a literal `ip:port`
+/// (parsed synchronously, no DNS involved) or a `host:port` hostname
+/// (resolved via async DNS through [`tokio::net::lookup_host`], taking its
+/// first result). Used by [`spawn_peer_dialer`], called fresh on *every*
+/// dial attempt rather than once -- see `crate::config::NodeConfig::peers`'
+/// docs for why eager, startup-time resolution is not good enough for a
+/// deployment like fly.io's private `.internal` DNS (see
+/// `docs/deploy-flyio.md`): that DNS may not have propagated yet the
+/// instant this process starts, and the address behind a hostname can
+/// legitimately change across a peer's restart.
+pub async fn resolve_peer_addr(addr: &str) -> std::io::Result<SocketAddr> {
+    if let Ok(sock_addr) = addr.parse::<SocketAddr>() {
+        return Ok(sock_addr);
+    }
+    tokio::net::lookup_host(addr).await?.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("DNS lookup for {addr:?} returned no addresses"),
+        )
+    })
+}
+
+/// Spawn the outbound-connection manager for one peer: resolve its
+/// address, dial (retrying forever on failure, and re-resolving on every
+/// attempt -- see [`resolve_peer_addr`]), send a [`WireMsg::Hello`]
+/// handshake identifying this replica, then forward every message enqueued
+/// on `rx` as a frame -- until `rx` is closed (this replica shutting down)
+/// or the connection drops, in which case it reconnects and resumes
+/// draining `rx` from wherever it left off. Nothing already queued in `rx`
+/// is lost across a reconnect (it is an ordinary in-process channel,
+/// untouched by the socket dropping); a message can still be lost either
+/// by racing an in-flight write failure, or -- while this peer is
+/// unreachable for a long time -- by being dropped for exceeding
+/// [`OUTBOUND_QUEUE_CAPACITY`] (see that constant's docs). Both are exactly
+/// the "message drop" fault the consensus layer's own unbounded
+/// retry-with-backoff (`queso_consensus::proposer`'s module docs) already
+/// tolerates by design -- this transport does not need its own delivery
+/// guarantees on top of that.
+///
+/// `peer_addr` is a `host:port` string, not a pre-resolved [`SocketAddr`]
+/// -- see `crate::config::NodeConfig::peers`'s docs.
 pub fn spawn_peer_dialer(
     self_id: NodeId,
-    peer_addr: SocketAddr,
+    peer_addr: String,
     mut rx: mpsc::Receiver<ConcreteMsg<Command>>,
 ) {
     tokio::spawn(async move {
         loop {
-            let stream = match TcpStream::connect(peer_addr).await {
+            let resolved = match resolve_peer_addr(&peer_addr).await {
+                Ok(addr) => addr,
+                Err(err) => {
+                    debug!(%peer_addr, %err, "peer address resolution failed, retrying");
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    continue;
+                }
+            };
+            let stream = match TcpStream::connect(resolved).await {
                 Ok(s) => s,
                 Err(err) => {
-                    debug!(%peer_addr, %err, "dial failed, retrying");
+                    debug!(%peer_addr, %resolved, %err, "dial failed, retrying");
                     tokio::time::sleep(RECONNECT_DELAY).await;
                     continue;
                 }
@@ -185,5 +219,46 @@ async fn handle_peer_connection(
                 warn!(%addr, ?from, %err, "decode error, dropping frame");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A literal `ip:port` peer address (the only kind used by every
+    /// existing local/CI cluster -- see `crates/net/README.md`) must
+    /// resolve without touching DNS at all, i.e. this must succeed even
+    /// with no network access.
+    #[tokio::test]
+    async fn resolve_peer_addr_accepts_ip_literal_without_dns() {
+        let resolved = resolve_peer_addr("127.0.0.1:7000").await.unwrap();
+        assert_eq!(resolved, "127.0.0.1:7000".parse::<SocketAddr>().unwrap());
+    }
+
+    /// A hostname (fly.io's `.internal` DNS in production -- see
+    /// `docs/deploy-flyio.md`) must go through the async DNS fallback
+    /// instead of failing the synchronous `SocketAddr` parse.
+    /// `localhost` is used here (rather than a real `.internal` name) so
+    /// this test resolves via the machine's own hosts file/resolver and
+    /// needs no external network access.
+    #[tokio::test]
+    async fn resolve_peer_addr_resolves_a_hostname_via_dns() {
+        let resolved = resolve_peer_addr("localhost:7000").await.unwrap();
+        assert_eq!(resolved.port(), 7000);
+        assert!(resolved.ip().is_loopback());
+    }
+
+    /// An address DNS genuinely cannot resolve must be a clean error, not
+    /// a panic or a hang -- `spawn_peer_dialer`'s loop depends on this to
+    /// keep retrying rather than getting stuck. The exact `ErrorKind`
+    /// varies by platform/resolver (a real NXDOMAIN vs. no resolver
+    /// configured at all in a sandboxed test environment), so this only
+    /// asserts that resolution fails cleanly, not which `ErrorKind` it
+    /// fails with.
+    #[tokio::test]
+    async fn resolve_peer_addr_rejects_an_unresolvable_hostname() {
+        let result = resolve_peer_addr("this-host-does-not-exist.invalid:7000").await;
+        assert!(result.is_err());
     }
 }

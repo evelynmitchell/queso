@@ -8,7 +8,12 @@ with a replica-address pool and retry-to-another-replica) and a
 `queso-bench` load generator with throughput/latency metrics on top of that
 transport. See the crate's `src/lib.rs` docs for the architecture and
 `docs/STATUS.md` §4a / issues #30/#36 for how this fits into the project's
-phases.
+phases. Phase 7.3 (issue #33) adds deployment artifacts for running a real
+cluster on fly.io -- see `docs/deploy-flyio.md` for the runbook and
+`deploy/Dockerfile`/`deploy/fly.toml` for the config; that phase is also
+where `--peer`'s `host:port` addresses gained hostname resolution (see
+`resolve_peer_addr` in `src/transport.rs`) so peers can dial each other by
+DNS name, not just literal IP.
 
 This crate is the deliberate real-I/O boundary: real sockets, real
 wall-clock time, real OS entropy. It is exempt from the workspace's
