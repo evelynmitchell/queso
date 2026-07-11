@@ -14,6 +14,7 @@
 //! targets.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -27,6 +28,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
 
 use crate::driver::Event;
+use crate::nemesis::{LinkAction, Nemesis};
 use crate::wire::{decode, encode, WireMsg};
 
 /// How long to wait between reconnect attempts (dial failure, or an
@@ -110,10 +112,21 @@ pub async fn resolve_peer_addr(addr: &str) -> std::io::Result<SocketAddr> {
 ///
 /// `peer_addr` is a `host:port` string, not a pre-resolved [`SocketAddr`]
 /// -- see `crate::config::NodeConfig::peers`'s docs.
+///
+/// `nemesis` (Phase 7.4, `crate::nemesis`) is consulted once per outbound
+/// frame, immediately before it would be written: `None` (every call site
+/// outside a test/bench harness that opts in via `NodeConfig::nemesis`)
+/// skips the check entirely -- see that module's docs for the fault model
+/// this implements ([`LinkAction::Drop`]/[`LinkAction::ResetConnection`]
+/// and [`Nemesis::delay`]'s latency/jitter). It faults on the `(self_id,
+/// peer_id)` pair, so it is checked against the *logical* peer identity,
+/// independent of whatever address `resolve_peer_addr` produced this dial.
 pub fn spawn_peer_dialer(
     self_id: NodeId,
+    peer_id: NodeId,
     peer_addr: String,
     mut rx: mpsc::Receiver<ConcreteMsg<Command>>,
+    nemesis: Option<Arc<Nemesis>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -143,6 +156,23 @@ pub fn spawn_peer_dialer(
             loop {
                 match rx.recv().await {
                     Some(msg) => {
+                        // Phase 7.4 nemesis hook: a no-op (no lock, no RNG
+                        // draw, no delay) whenever `nemesis` is `None` -- see
+                        // this function's docs and `crate::nemesis`'s.
+                        if let Some(nem) = &nemesis {
+                            match nem.decide(self_id, peer_id) {
+                                LinkAction::Drop => continue,
+                                LinkAction::ResetConnection => {
+                                    warn!(?self_id, ?peer_id, "nemesis: forcing connection reset");
+                                    break;
+                                }
+                                LinkAction::Send => {}
+                            }
+                            let delay = nem.delay(self_id, peer_id);
+                            if !delay.is_zero() {
+                                tokio::time::sleep(delay).await;
+                            }
+                        }
                         if framed.send(encode(&WireMsg::App(msg))).await.is_err() {
                             warn!(%peer_addr, "write failed, reconnecting");
                             break;

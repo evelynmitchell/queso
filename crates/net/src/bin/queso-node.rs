@@ -104,6 +104,10 @@ async fn main() -> anyhow::Result<()> {
         tick: Duration::from_millis(args.tick_ms),
         seed: args.seed,
         data_dir: args.data_dir,
+        // Phase 7.4's in-transport nemesis (`queso_net::nemesis`) is a
+        // test/bench-harness knob, not a CLI flag here -- always off for a
+        // real `queso-node` run. See `NodeConfig::nemesis`'s docs.
+        nemesis: None,
     };
 
     queso_net::run_node(config).await

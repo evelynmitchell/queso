@@ -21,13 +21,16 @@ use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use queso_net::config::NodeConfig;
-use queso_net::{client, run_node};
+use queso_net::nemesis::Nemesis;
+use queso_net::{client, run_node_with_listeners};
 use queso_sim::ids::NodeId;
 use queso_smr::{Command, Outcome};
+use tokio::net::TcpListener as TokioTcpListener;
 
 /// An ephemeral, currently-free localhost port. Binds and immediately
 /// drops a listener to let the OS pick one -- a small, standard,
@@ -54,15 +57,57 @@ pub fn fresh_data_dir() -> PathBuf {
 /// Boot an `n`-node cluster, each replica on its own thread + tokio
 /// runtime, and return every replica's client-facing address.
 pub fn spawn_cluster(n: usize, leader: Option<NodeId>) -> Vec<SocketAddr> {
-    let peer_addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
-    let client_addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
+    spawn_cluster_inner(n, leader, None)
+}
+
+/// Like [`spawn_cluster`], but every replica shares `nemesis` (Phase 7.4,
+/// `queso_net::nemesis`) for its outbound peer traffic -- see
+/// `tests/nemesis.rs`. Sharing one [`Nemesis`] across every replica (rather
+/// than giving each its own) is deliberate: a partition/isolate call needs
+/// every replica's dialer to agree on which pairs are cut off, which only
+/// works if they all consult the same fault state.
+pub fn spawn_cluster_with_nemesis(
+    n: usize,
+    leader: Option<NodeId>,
+    nemesis: Arc<Nemesis>,
+) -> Vec<SocketAddr> {
+    spawn_cluster_inner(n, leader, Some(nemesis))
+}
+
+fn spawn_cluster_inner(
+    n: usize,
+    leader: Option<NodeId>,
+    nemesis: Option<Arc<Nemesis>>,
+) -> Vec<SocketAddr> {
+    // Bind every listener up front and keep it open until the node that owns
+    // it adopts it via `run_node_with_listeners`. This closes the `free_addr`
+    // TOCTOU: probing a free port, dropping the probe listener, and only then
+    // asking `run_node` to re-bind that address leaves a window in which a
+    // concurrently-booting test cluster's own probe can grab the same port,
+    // so one of the two nodes then fails to bind and its whole cluster never
+    // forms (observed as a flaky "node exited" / "submit never succeeded").
+    // Handing over the already-bound listener means there is never a moment
+    // the port is free for anyone else to take.
+    let mut peer_listeners: Vec<StdTcpListener> = Vec::with_capacity(n);
+    let mut client_listeners: Vec<StdTcpListener> = Vec::with_capacity(n);
+    let mut peer_addrs: Vec<SocketAddr> = Vec::with_capacity(n);
+    let mut client_addrs: Vec<SocketAddr> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let pl = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind a peer listener");
+        let cl = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind a client listener");
+        peer_addrs.push(pl.local_addr().expect("read peer listener addr"));
+        client_addrs.push(cl.local_addr().expect("read client listener addr"));
+        peer_listeners.push(pl);
+        client_listeners.push(cl);
+    }
 
     let peers: BTreeMap<NodeId, String> = (0..n)
         .map(|i| (NodeId(i as u32), peer_addrs[i].to_string()))
         .collect();
 
     let data_dir = fresh_data_dir();
-    for i in 0..n {
+    let listeners = peer_listeners.into_iter().zip(client_listeners);
+    for (i, (peer_listener, client_listener)) in listeners.enumerate() {
         let config = NodeConfig {
             id: NodeId(i as u32),
             listen_addr: peer_addrs[i],
@@ -73,6 +118,7 @@ pub fn spawn_cluster(n: usize, leader: Option<NodeId>) -> Vec<SocketAddr> {
             tick: Duration::from_millis(5),
             seed: 1_000 + i as u64,
             data_dir: data_dir.clone(),
+            nemesis: nemesis.clone(),
         };
         thread::Builder::new()
             .name(format!("queso-node-{i}"))
@@ -81,12 +127,21 @@ pub fn spawn_cluster(n: usize, leader: Option<NodeId>) -> Vec<SocketAddr> {
                     .enable_all()
                     .build()
                     .expect("build a per-node tokio runtime");
-                // `run_node` only returns on a fatal startup error (a bind
-                // failure) or once its inbox channel closes (never, in a
-                // test -- the sending halves outlive the test process); any
-                // `Err` here means the cluster never came up, so surface it
-                // loudly instead of silently stalling the test.
-                if let Err(err) = rt.block_on(run_node(config)) {
+                // Returns only on a fatal startup error or once the inbox
+                // closes (never, in a test -- the sending halves outlive the
+                // process); any `Err` means the cluster never came up, so
+                // surface it loudly rather than silently stalling the test.
+                let result = rt.block_on(async move {
+                    // `from_std` requires the listener be non-blocking and be
+                    // called inside a runtime -- hence the conversion here,
+                    // not before the thread's runtime exists.
+                    peer_listener.set_nonblocking(true)?;
+                    client_listener.set_nonblocking(true)?;
+                    let peer_listener = TokioTcpListener::from_std(peer_listener)?;
+                    let client_listener = TokioTcpListener::from_std(client_listener)?;
+                    run_node_with_listeners(config, peer_listener, client_listener).await
+                });
+                if let Err(err) = result {
                     panic!("node {i} exited: {err:?}");
                 }
             })
