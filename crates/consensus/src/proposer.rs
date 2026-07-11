@@ -784,9 +784,36 @@ impl<V: Ord + Clone> Proposer<V> {
             self.maybe_activate_after_hedge(ctx);
             return;
         }
-        if self.decided.is_some() || timer_id.0 != self.step {
+        if self.decided.is_some() || !self.activated || timer_id.0 != self.step {
             // Stale retry timer for a step we've since left (via advance,
             // catch-up, or decision) -- no-op.
+            //
+            // `!self.activated` is also required, not merely a redundant
+            // strengthening of the `timer_id.0 != self.step` check: raw step
+            // numbers (`retry_timer_id`) are only unique *within* one
+            // `Proposer`'s own lifetime, not across separate `Proposer`
+            // instances that happen to share a `NodeId`'s timer namespace --
+            // exactly what `crate::concrete`'s single-slot driver never
+            // exercises (one `Proposer` per node, ever) but a multi-slot
+            // driver like `queso_smr::replica::SmrNode` does: it runs one
+            // slot's `Proposer` at a time, and a *superseded* attempt's
+            // uncancelled retry timer (the kernel has no facility to cancel
+            // an already-scheduled timer) can still be sitting in the queue
+            // when the *next* slot's fresh `Proposer` starts -- also at
+            // `self.step == FIRST_ROUND_STEP` almost always, so the naive
+            // `timer_id.0 != self.step` check alone cannot tell the two
+            // apart. Without this guard, a stale retry misrouted to a fresh,
+            // still-hedged (not yet `begin_step`-activated) proposer would
+            // index `self.sent` for a recorder it has never actually sent
+            // anything to yet -- a genuine panic, not merely a benign no-op
+            // -- since `begin_step` is what populates `self.sent` and it is
+            // exactly what a hedged-but-not-yet-activated proposer has not
+            // run. `begin_step` always sets `self.activated = true` as its
+            // very first action, strictly before it ever schedules a retry
+            // timer for the step in question, so this can never suppress a
+            // *genuine* retry -- only a misrouted one. Purely a liveness/
+            // robustness fix (which stale timer gets ignored); it does not
+            // touch what a quorum, a step, or a decision means.
             return;
         }
         if self.responses.len() >= self.quorum_threshold() {
