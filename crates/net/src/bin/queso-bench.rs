@@ -182,10 +182,24 @@ impl StopCondition {
     }
 }
 
-/// Build, submit, and time one operation using (and mutating) `session`'s
-/// seq/RNG state, returning the [`Sample`] it produced.
-async fn do_one_op(client: &Client, session: &mut Session, keys: u32, read_frac: f64) -> Sample {
-    let is_read = session.rng.gen_range(0.0..1.0) < read_frac;
+/// Build, submit, and time one operation of the caller-chosen kind
+/// (`is_read`) using (and mutating) `session`'s seq/RNG state for the key,
+/// returning the [`Sample`] it produced.
+///
+/// The read/write decision is made by the caller, not here, so that
+/// open-loop can attribute a *dropped* op (one that never gets a session)
+/// to the correct kind, and latency is measured from the caller-supplied
+/// `start` rather than from entry here -- the caller passes the moment the
+/// op was released (open-loop: when its tick fired), so time spent queued
+/// for a free session is included in the latency (the coordinated-omission
+/// correction the module docs promise), not silently omitted.
+async fn do_one_op(
+    client: &Client,
+    session: &mut Session,
+    keys: u32,
+    is_read: bool,
+    start: Instant,
+) -> Sample {
     let key = session.rng.gen_range(0..keys.max(1));
     let seq = session.seq;
     session.seq += 1;
@@ -212,7 +226,6 @@ async fn do_one_op(client: &Client, session: &mut Session, keys: u32, read_frac:
         )
     };
 
-    let start = Instant::now();
     let result = client.submit(&command).await;
     let latency = start.elapsed();
     Sample {
@@ -243,7 +256,14 @@ async fn closed_loop_run(
         workers.spawn(async move {
             let mut session = Session::new(idx, seed);
             while !stop.should_stop(&op_counter) {
-                let sample = do_one_op(&client, &mut session, keys, read_frac).await;
+                // Draw the read/write choice from the session RNG (same
+                // draw order as before this was hoisted out of do_one_op),
+                // then time from here: a closed-loop worker owns its session
+                // for the whole run, so there is no queueing to include --
+                // `start` here is exactly the operation's service latency.
+                let is_read = session.rng.gen_range(0.0..1.0) < read_frac;
+                let start = Instant::now();
+                let sample = do_one_op(&client, &mut session, keys, is_read, start).await;
                 op_counter.fetch_add(1, Ordering::Relaxed);
                 let _ = sample_tx.send(sample);
             }
@@ -285,6 +305,14 @@ async fn open_loop_run(
     let pool_rx = Arc::new(Mutex::new(pool_rx));
     let admission = Arc::new(Semaphore::new(concurrency * 8));
 
+    // A scheduler-level RNG for the read/write choice, independent of which
+    // pooled session (if any) an op ends up running on. Deciding the kind
+    // here, before admission, lets a *dropped* op -- which never gets a
+    // session -- still be attributed to the correct read/write side of the
+    // mix instead of always being charged to writes. Its own stream (seed
+    // perturbed) so it doesn't shadow any session's key/value draws.
+    let mut sched_rng = StdRng::seed_from_u64(seed ^ 0x00D5_C7ED_0BEE_F00D);
+
     let mut tasks = JoinSet::new();
     loop {
         if stop.should_stop(&op_counter) {
@@ -295,6 +323,13 @@ async fn open_loop_run(
             break;
         }
 
+        // The op is "released" now (its scheduled tick fired); time it from
+        // here so any wait for a free session counts toward its latency
+        // (coordinated-omission correction), and pick its kind now so a drop
+        // is attributed correctly.
+        let scheduled = Instant::now();
+        let is_read = sched_rng.gen_range(0.0..1.0) < read_frac;
+
         let Ok(permit) = Arc::clone(&admission).try_acquire_owned() else {
             // The client-side admission queue is already full: the offered
             // rate is outrunning what `concurrency` sessions plus the
@@ -302,7 +337,7 @@ async fn open_loop_run(
             // growing memory unboundedly.
             op_counter.fetch_add(1, Ordering::Relaxed);
             let _ = sample_tx.send(Sample {
-                kind: OpKind::Write,
+                kind: if is_read { OpKind::Read } else { OpKind::Write },
                 latency: Duration::ZERO,
                 ok: false,
             });
@@ -323,7 +358,7 @@ async fn open_loop_run(
                     None => return, // pool sender dropped: run is shutting down.
                 }
             };
-            let sample = do_one_op(&client, &mut session, keys, read_frac).await;
+            let sample = do_one_op(&client, &mut session, keys, is_read, scheduled).await;
             op_counter.fetch_add(1, Ordering::Relaxed);
             let _ = sample_tx.send(sample);
             let _ = pool_tx.send(session).await;
