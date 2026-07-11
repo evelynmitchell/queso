@@ -49,10 +49,10 @@
 //! - [`ctx`] -- [`ctx::RealCtx`], the real-network `Ctx` implementation.
 //! - [`transport`] -- TCP dial/reconnect (outbound) and accept (inbound)
 //!   loops that feed [`driver::Event`]s into a node's single inbox.
-//! - [`client`] -- the minimal client-facing protocol this stage needs to
-//!   prove the end-to-end path: one `Command` frame in, one `Outcome`
-//!   frame out, per connection. A full client library (retries, session
-//!   management, load generation) is Phase 7.2's scope, not this one's.
+//! - [`client`] -- the client-facing protocol: one `Command` frame in, one
+//!   `Outcome` frame out, per connection ([`client::submit`]), plus the
+//!   Phase 7.2 client library ([`client::Client`]) built on top of it --
+//!   a pool of replica addresses and retry-to-another-replica.
 //! - [`driver`] -- [`driver::run_node`], the single-task event loop that
 //!   owns one replica's [`queso_smr::SmrNode`] and drives it from
 //!   messages/timers/client submissions, exactly as
@@ -63,11 +63,15 @@
 //!   blank. See that module's docs for the write-before-reply ordering and
 //!   the atomic-rename write scheme, and this crate's README for the
 //!   current honest status of real-transport durability.
+//! - [`metrics`] -- Phase 7.2's throughput/latency metrics
+//!   ([`metrics::Recorder`], [`metrics::Summary`]) used by the
+//!   `queso-bench` load generator binary (`src/bin/queso-bench.rs`).
 
 pub mod client;
 pub mod config;
 pub mod ctx;
 pub mod driver;
+pub mod metrics;
 pub mod persist;
 pub mod transport;
 pub mod wire;
