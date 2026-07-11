@@ -13,5 +13,11 @@ workspace = true
 queso-consensus = { path = "../consensus" }
 queso-sim = { path = "../sim" }
 rand = "0.8"
+serde = { workspace = true, optional = true }
+
+[features]
+# See queso-sim's "serde" feature docs; forwarded so queso-net can enable
+# wire (de)serialization for this crate's Command type too.
+serde = ["dep:serde", "queso-consensus/serde", "queso-sim/serde"]
 
 [dev-dependencies]

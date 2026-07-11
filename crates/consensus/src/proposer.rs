@@ -295,7 +295,7 @@
 //! does.
 
 use queso_sim::ids::{NodeId, TimerId};
-use queso_sim::node::NodeCtx;
+use queso_sim::node::Ctx;
 use rand::Rng;
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -638,7 +638,7 @@ impl<V: Ord + Clone> Proposer<V> {
     /// `begin_step` to [`Proposer::maybe_activate_after_hedge`]. With no
     /// hedging configured (`activation_delay == 0`, the default), this is
     /// exactly Phase 3's unconditional behavior: activate right now.
-    pub fn start(&mut self, ctx: &mut NodeCtx<'_, ConcreteMsg<V>>) {
+    pub fn start(&mut self, ctx: &mut dyn Ctx<ConcreteMsg<V>>) {
         self.step = FIRST_ROUND_STEP;
         if self.activation_delay == 0 {
             self.begin_step(ctx);
@@ -652,7 +652,7 @@ impl<V: Ord + Clone> Proposer<V> {
     /// [`HEDGE_RECHECK_TICKS`] has. Decide whether to stay passive (defer
     /// again) or activate -- see the module docs' "Hedging" and "Why no δ
     /// can cause a permanent stall" sections for the full reasoning.
-    fn maybe_activate_after_hedge(&mut self, ctx: &mut NodeCtx<'_, ConcreteMsg<V>>) {
+    fn maybe_activate_after_hedge(&mut self, ctx: &mut dyn Ctx<ConcreteMsg<V>>) {
         if self.decided.is_some() {
             // Nothing to activate for -- already done (only reachable if a
             // caller somehow drove this proposer to a decision through some
@@ -680,7 +680,7 @@ impl<V: Ord + Clone> Proposer<V> {
     /// Prepare and send this step's `record` requests to every recorder,
     /// then arm the retry timer. Used both for the very first step (via
     /// `start`, possibly hedged) and every subsequent step/catch-up.
-    fn begin_step(&mut self, ctx: &mut NodeCtx<'_, ConcreteMsg<V>>) {
+    fn begin_step(&mut self, ctx: &mut dyn Ctx<ConcreteMsg<V>>) {
         self.activated = true;
         self.responses.clear();
         self.sent.clear();
@@ -729,7 +729,7 @@ impl<V: Ord + Clone> Proposer<V> {
         &self,
         recorder: NodeId,
         proposal: Proposal<V>,
-        ctx: &mut NodeCtx<'_, ConcreteMsg<V>>,
+        ctx: &mut dyn Ctx<ConcreteMsg<V>>,
     ) {
         ctx.send(
             recorder,
@@ -750,7 +750,7 @@ impl<V: Ord + Clone> Proposer<V> {
         &mut self,
         from: NodeId,
         resp: RecordResponse<V>,
-        ctx: &mut NodeCtx<'_, ConcreteMsg<V>>,
+        ctx: &mut dyn Ctx<ConcreteMsg<V>>,
     ) {
         if self.decided.is_some() {
             return;
@@ -775,7 +775,7 @@ impl<V: Ord + Clone> Proposer<V> {
     }
 
     /// A retry, hedge, or kickoff timer has fired.
-    pub fn on_timer(&mut self, timer_id: TimerId, ctx: &mut NodeCtx<'_, ConcreteMsg<V>>) {
+    pub fn on_timer(&mut self, timer_id: TimerId, ctx: &mut dyn Ctx<ConcreteMsg<V>>) {
         if timer_id == KICKOFF_TIMER {
             self.start(ctx);
             return;
@@ -838,7 +838,7 @@ impl<V: Ord + Clone> Proposer<V> {
     /// on whether they all agree on our step (normal phase processing) or
     /// whether we've fallen behind (catch-up), exactly mirroring Algorithm
     /// 4's `if s'_j = s in all replies ... else if any reply has s'_j > s`.
-    fn process_quorum(&mut self, ctx: &mut NodeCtx<'_, ConcreteMsg<V>>) {
+    fn process_quorum(&mut self, ctx: &mut dyn Ctx<ConcreteMsg<V>>) {
         let all_at_step = self.responses.values().all(|r| r.step == self.step);
         if all_at_step {
             self.process_phase();
@@ -922,6 +922,6 @@ impl<V: Ord + Clone> Proposer<V> {
 /// Draw a fresh random priority in `1..H` (`H` exclusive, matching
 /// Algorithm 4's `random(1..H-1)` inclusive-inclusive range), from the
 /// kernel's single seeded PRNG stream via `ctx`.
-fn draw_priority<V>(ctx: &mut NodeCtx<'_, ConcreteMsg<V>>) -> u64 {
+fn draw_priority<V>(ctx: &mut dyn Ctx<ConcreteMsg<V>>) -> u64 {
     ctx.rng().gen_range(1..H)
 }

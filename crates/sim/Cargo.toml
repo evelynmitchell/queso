@@ -11,5 +11,12 @@ workspace = true
 
 [dependencies]
 rand = "0.8"
+serde = { workspace = true, optional = true }
+
+[features]
+# Wire (de)serialization support for the id/payload types, consumed by
+# queso-net's real-network transport. Off by default: the sim/consensus/smr
+# core has no business depending on serde.
+serde = ["dep:serde"]
 
 [dev-dependencies]

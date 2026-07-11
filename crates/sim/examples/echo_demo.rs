@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use queso_sim::fault::DropReason;
 use queso_sim::ids::{NodeId, TimerId};
-use queso_sim::node::{Node, NodeCtx};
+use queso_sim::node::{Ctx, Node};
 use queso_sim::payload::{Inspectable, Payload};
 use queso_sim::scheduler::{ContentObliviousAdversary, SchedulerKind};
 use queso_sim::time::LogicalTime;
@@ -56,7 +56,7 @@ struct EchoNode {
 }
 
 impl Node<Msg> for EchoNode {
-    fn on_message(&mut self, from: NodeId, payload: Msg, ctx: &mut NodeCtx<'_, Msg>) {
+    fn on_message(&mut self, from: NodeId, payload: Msg, ctx: &mut dyn Ctx<Msg>) {
         *self.seen.borrow_mut() += 1;
         if let Msg::Ping(round) = payload {
             ctx.send(from, Msg::Pong(round));
@@ -67,9 +67,9 @@ impl Node<Msg> for EchoNode {
         }
     }
 
-    fn on_timer(&mut self, _timer_id: TimerId, _ctx: &mut NodeCtx<'_, Msg>) {}
+    fn on_timer(&mut self, _timer_id: TimerId, _ctx: &mut dyn Ctx<Msg>) {}
 
-    fn on_restart(&mut self, _ctx: &mut NodeCtx<'_, Msg>) {
+    fn on_restart(&mut self, _ctx: &mut dyn Ctx<Msg>) {
         println!("  node {} restarted (volatile state cleared)", self.id);
     }
 }

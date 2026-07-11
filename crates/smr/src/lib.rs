@@ -85,5 +85,5 @@ pub use cluster::SmrCluster;
 pub use command::{ClientId, ClientSession, Command, Key, Value};
 pub use kv::{Applied, Kv};
 pub use linearizability::{history_from_records, is_linearizable, HistoryOp};
-pub use replica::{OpId, OpRecord, Outcome};
+pub use replica::{OpId, OpRecord, Outcome, SmrNode};
 pub use tuning::EpochTuner;

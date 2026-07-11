@@ -12,6 +12,8 @@
 //! on which one arrived.
 
 use queso_sim::payload::{Inspectable, Payload};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 use crate::proposal::Proposal;
 
@@ -39,6 +41,7 @@ use crate::proposal::Proposal;
 /// inspect it -- it is inert plumbing here, load-bearing only once a caller
 /// actually multiplexes more than one slot over the same replica addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct RecordRequest<V> {
     pub slot: u64,
     pub req_step: u64,
@@ -49,6 +52,7 @@ pub struct RecordRequest<V> {
 /// [`crate::isr::IsrSummary`]), plus `req_step` (and `slot`) echoed from the
 /// [`RecordRequest`] this answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct RecordResponse<V> {
     /// Echoed from the request -- see [`RecordRequest::slot`]'s docs.
     pub slot: u64,
@@ -70,6 +74,7 @@ pub struct RecordResponse<V> {
 /// proposer). No other message shapes exist -- per §4.2.1, "proposers never
 /// interact directly with each other, and neither do recorders".
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum ConcreteMsg<V> {
     Request(RecordRequest<V>),
     Response(RecordResponse<V>),

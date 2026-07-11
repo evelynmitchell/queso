@@ -68,8 +68,10 @@ use queso_consensus::proposer::{Proposer, KICKOFF_TIMER, RETRY_DELAY_TICKS};
 use queso_consensus::recorder::Recorder;
 use queso_consensus::rpc::ConcreteMsg;
 use queso_sim::ids::{NodeId, TimerId};
-use queso_sim::node::{Node, NodeCtx};
+use queso_sim::node::{Ctx, Node};
 use queso_sim::time::LogicalTime;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 use crate::command::{ClientId, Command, Value};
 use crate::kv::Kv;
@@ -147,6 +149,7 @@ pub struct OpId(pub u64);
 
 /// What a completed operation returned to its caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Outcome {
     /// The write was decided (and, unless it was itself a duplicate, took
     /// effect) somewhere in the log.
@@ -410,16 +413,116 @@ pub struct SmrNode {
 }
 
 impl SmrNode {
+    /// Build a single fresh replica participating in an `n`-replica cluster
+    /// (`total_replicas`) with a fixed (or, if `None`, absent) fast-path
+    /// leader for every slot -- the exact same per-replica construction
+    /// [`crate::cluster::SmrCluster::build`] performs internally for its
+    /// `Kernel`-driven nodes, just exposed publicly so a non-sim driver
+    /// (`queso-net`'s real-network event loop) can build and drive this
+    /// same, unmodified [`Node`] implementation over a real transport
+    /// without depending on anything `Kernel`-specific.
+    ///
+    /// There is no `id` parameter: nothing in [`SmrNode`] itself stores
+    /// this replica's own id -- every callback learns it afresh from
+    /// `ctx.self_id()` (see e.g. [`Self::begin_next_attempt`]), so it is
+    /// entirely the driver's responsibility (sim `Kernel::add_node`'s key,
+    /// or a real driver's own config) to keep a `SmrNode` instance and the
+    /// id it is driven under consistent.
+    pub fn new_fixed_leader(total_replicas: usize, leader: Option<NodeId>) -> Self {
+        SmrNode {
+            state: Rc::new(RefCell::new(ReplicaState::default())),
+            results: Rc::new(RefCell::new(BTreeMap::new())),
+            total_replicas,
+            leader_policy: LeaderPolicy::Fixed(leader),
+            local_step: Rc::new(Cell::new(0)),
+        }
+    }
+
+    /// Submit `command`, tagged `op_id`, as a fresh client-visible
+    /// operation this replica should propose -- mirrors
+    /// [`crate::cluster::SmrCluster::submit`]'s enqueue-then-kick logic
+    /// exactly (guard against [`CATCH_UP_CLIENT`], compute a
+    /// monotonic `invoked_at`, record a pending [`OpRecord`], push onto the
+    /// queue, and if the replica was idle a moment ago schedule a
+    /// zero-delay [`KICKOFF_TIMER`]), so any driver reaches
+    /// [`Self::begin_next_attempt`] through the identical `Node::on_timer`
+    /// path the sim harness already exhaustively tests -- rather than
+    /// calling it directly, which would (harmlessly, but needlessly)
+    /// diverge from that verified path just because a real driver happens
+    /// to already hold a live `ctx` where `SmrCluster::submit` (called from
+    /// outside any `Node` callback) does not.
+    pub fn submit(
+        &self,
+        op_id: OpId,
+        replica: NodeId,
+        command: Command,
+        ctx: &mut dyn Ctx<ConcreteMsg<Command>>,
+    ) {
+        debug_assert_ne!(
+            command.client_seq().0,
+            CATCH_UP_CLIENT,
+            "ClientId(u32::MAX) is reserved for this crate's internal restart catch-up probes \
+             (see crate::replica::CATCH_UP_CLIENT's docs) -- a real client/test must never \
+             submit using it"
+        );
+        let invoked_at = self.next_invoked_at(ctx.now());
+        self.results.borrow_mut().insert(
+            op_id,
+            OpRecord {
+                replica,
+                command: command.clone(),
+                invoked_at,
+                completed_at: None,
+                outcome: None,
+                decided_slot: None,
+            },
+        );
+        let should_kick = {
+            let mut st = self.state.borrow_mut();
+            st.queue.push_back(QueuedOp { op_id, command });
+            st.queue.len() == 1
+        };
+        if should_kick {
+            ctx.schedule_timer(0, KICKOFF_TIMER);
+        }
+    }
+
+    /// A faithful invocation timestamp for a *new* submission: at least
+    /// `now`, but strictly after every operation that has already completed
+    /// by this point -- the exact same tie-avoidance treatment
+    /// [`crate::cluster::SmrCluster::next_invoked_at`] applies (see that
+    /// method's docs for the full soundness argument against
+    /// [`crate::linearizability`]). `SmrNode` has no single shared clock to
+    /// consult beyond `ctx.now()` and no driver-external call site the way
+    /// `SmrCluster::submit` does (this is always called from inside a live
+    /// `ctx`), but the tie it closes is the same one: two submissions
+    /// separated by an observed completion must never be assigned an
+    /// identical `invoked_at`.
+    fn next_invoked_at(&self, now: LogicalTime) -> LogicalTime {
+        let max_completed = self
+            .results
+            .borrow()
+            .values()
+            .filter_map(|r| r.completed_at)
+            .max();
+        match max_completed {
+            Some(t) => std::cmp::max(now, t.advance(1)),
+            None => now,
+        }
+    }
+
+    /// Read back a previously [`Self::submit`]ted operation's result, if it
+    /// has completed.
+    pub fn result(&self, op_id: OpId) -> Option<OpRecord> {
+        self.results.borrow().get(&op_id).cloned()
+    }
+
     /// If this replica is idle (no attempt in flight) and has something
     /// queued, start a fresh [`Proposer`] for the front of the queue,
     /// targeting the current frontier slot. No-op otherwise (called
     /// defensively from several call sites; only one of them will ever find
     /// both conditions true at once).
-    fn begin_next_attempt(
-        &self,
-        st: &mut ReplicaState,
-        ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>,
-    ) {
+    fn begin_next_attempt(&self, st: &mut ReplicaState, ctx: &mut dyn Ctx<ConcreteMsg<Command>>) {
         if st.current_attempt.is_some() {
             return;
         }
@@ -460,7 +563,7 @@ impl SmrNode {
     ///
     /// No-op if an attempt is already in flight (defensive; `on_restart` is
     /// the only real caller and always starts from an idle state).
-    fn begin_catch_up(&self, st: &mut ReplicaState, ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>) {
+    fn begin_catch_up(&self, st: &mut ReplicaState, ctx: &mut dyn Ctx<ConcreteMsg<Command>>) {
         if st.current_attempt.is_some() {
             return;
         }
@@ -499,7 +602,7 @@ impl SmrNode {
     fn arm_catch_up_watchdog(
         &self,
         st: &mut ReplicaState,
-        ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>,
+        ctx: &mut dyn Ctx<ConcreteMsg<Command>>,
         slot: u64,
     ) {
         st.watchdog_generation += 1;
@@ -548,11 +651,7 @@ impl SmrNode {
     /// harmless, provenance-agnostic extra evidence the algorithm already
     /// tolerates by design. This never touches ISR/decision/quorum logic
     /// itself -- `Recorder`/`Proposer` are used completely unmodified.
-    fn on_catch_up_watchdog(
-        &self,
-        st: &mut ReplicaState,
-        ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>,
-    ) {
+    fn on_catch_up_watchdog(&self, st: &mut ReplicaState, ctx: &mut dyn Ctx<ConcreteMsg<Command>>) {
         let Some((watched_slot, watched_generation)) = st.watchdog_armed_for else {
             return;
         };
@@ -594,7 +693,7 @@ impl SmrNode {
         &self,
         st: &mut ReplicaState,
         decided: Command,
-        ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>,
+        ctx: &mut dyn Ctx<ConcreteMsg<Command>>,
     ) {
         let attempt = st
             .current_attempt
@@ -675,7 +774,7 @@ impl Node<ConcreteMsg<Command>> for SmrNode {
         &mut self,
         from: NodeId,
         payload: ConcreteMsg<Command>,
-        ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>,
+        ctx: &mut dyn Ctx<ConcreteMsg<Command>>,
     ) {
         match payload {
             ConcreteMsg::Request(req) => {
@@ -734,7 +833,7 @@ impl Node<ConcreteMsg<Command>> for SmrNode {
         }
     }
 
-    fn on_timer(&mut self, timer_id: TimerId, ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>) {
+    fn on_timer(&mut self, timer_id: TimerId, ctx: &mut dyn Ctx<ConcreteMsg<Command>>) {
         let mut st = self.state.borrow_mut();
         if timer_id == KICKOFF_TIMER {
             // Fired by `SmrCluster::submit` to kick off the very first
@@ -791,7 +890,7 @@ impl Node<ConcreteMsg<Command>> for SmrNode {
     /// `crate::cluster`'s module docs) -- restart catch-up is what keeps
     /// that "everything decided so far" bound tight, not what makes P10
     /// hold in the first place.
-    fn on_restart(&mut self, ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>) {
+    fn on_restart(&mut self, ctx: &mut dyn Ctx<ConcreteMsg<Command>>) {
         let mut st = self.state.borrow_mut();
         st.queue.clear();
         st.current_attempt = None;
