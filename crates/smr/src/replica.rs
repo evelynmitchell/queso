@@ -60,7 +60,7 @@
 //! is a pure liveness action that never touches ISR/decision/quorum
 //! correctness.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
@@ -73,6 +73,68 @@ use queso_sim::time::LogicalTime;
 
 use crate::command::{ClientId, Command, Value};
 use crate::kv::Kv;
+use crate::tuning::EpochTuner;
+
+/// How a replica's [`Proposer`]s decide who the slot's fast-path leader is
+/// and (Phase 5/6) what hedging delay each replica gets.
+///
+/// - `Fixed` reproduces every pre-Phase-6 constructor's behavior exactly:
+///   one caller-supplied `leader` (or `None`, purely leaderless) for every
+///   slot in the run, unconditional δ=0 activation (no
+///   [`Proposer::with_hedging`] call at all) -- unchanged from Phase 4.
+/// - `Tuned` (Phase 6, D4) hands that choice to a shared [`EpochTuner`]
+///   instead: leader and hedging schedule are derived per-slot from the
+///   slot's epoch (see `crate::tuning`'s module docs), and every proposer is
+///   built with [`Proposer::with_hedging`] even when its delay happens to be
+///   `0` (harmless -- `0` collapses to the exact same immediate-activation
+///   behavior, see `Proposer::start`'s docs).
+///
+/// `Clone` is required because every replica's [`SmrNode`] needs its own
+/// copy: `Fixed`'s payload is `Copy`, and `Tuned`'s is an `Rc` clone of the
+/// one shared tuner all replicas consult (see `crate::tuning`'s module docs
+/// on why a single shared handle is this harness's deliberate
+/// simplification of real cross-replica tuning agreement).
+#[derive(Clone)]
+pub(crate) enum LeaderPolicy {
+    Fixed(Option<NodeId>),
+    Tuned(Rc<RefCell<EpochTuner>>),
+}
+
+impl LeaderPolicy {
+    fn leader_for(&self, slot: u64) -> Option<NodeId> {
+        match self {
+            LeaderPolicy::Fixed(leader) => *leader,
+            LeaderPolicy::Tuned(tuner) => Some(tuner.borrow().leader_for_slot(slot)),
+        }
+    }
+
+    /// This replica's hedging activation delay for `slot`, or `None` if
+    /// hedging is not in play at all (the `Fixed` policy never hedges,
+    /// matching every pre-Phase-6 constructor's unconditional-activation
+    /// behavior unchanged).
+    fn delay_for(&self, slot: u64, id: NodeId) -> Option<u64> {
+        match self {
+            LeaderPolicy::Fixed(_) => None,
+            LeaderPolicy::Tuned(tuner) => Some(tuner.borrow().delay_for_slot(slot, id)),
+        }
+    }
+
+    /// Record keeping for the tuner (a no-op under `Fixed`): the slot's
+    /// first proposal attempt just started.
+    fn note_attempt_start(&self, slot: u64, now: LogicalTime) {
+        if let LeaderPolicy::Tuned(tuner) = self {
+            tuner.borrow_mut().note_attempt_start(slot, now);
+        }
+    }
+
+    /// Record keeping for the tuner (a no-op under `Fixed`): the slot has
+    /// just decided.
+    fn note_slot_decided(&self, slot: u64, now: LogicalTime) {
+        if let LeaderPolicy::Tuned(tuner) = self {
+            tuner.borrow_mut().note_slot_decided(slot, now);
+        }
+    }
+}
 
 /// Identifies one client-visible operation submitted via
 /// [`crate::cluster::SmrCluster::submit`], distinct from `(client, seq)`
@@ -172,11 +234,17 @@ fn catch_up_probe(slot: u64) -> Command {
 const CATCH_UP_WATCHDOG_TICKS: u64 = 128 * RETRY_DELAY_TICKS;
 
 /// Reserved timer id for the catch-up quiescence watchdog. Distinct from
-/// [`KICKOFF_TIMER`] (`TimerId(u64::MAX)`) and from any live [`Proposer`]'s
-/// own per-step retry timer (`TimerId(step)`, always far smaller in any run
-/// this crate's tests exercise -- A7, step counts are practically bounded),
-/// so the three timer namespaces a replica uses never collide.
-const CATCH_UP_WATCHDOG_TIMER: TimerId = TimerId(u64::MAX - 1);
+/// [`KICKOFF_TIMER`] (`TimerId(u64::MAX)`), from [`queso_consensus::proposer::HEDGE_TIMER`]
+/// (`TimerId(u64::MAX - 1)` -- live in this crate as of Phase 6's
+/// `LeaderPolicy::Tuned`, see `crate::tuning`'s module docs; Phase 4b picked
+/// `u64::MAX - 1` for *this* constant before this crate ever called
+/// [`Proposer::with_hedging`], so the two were only accidentally distinct
+/// until now -- this is `u64::MAX - 2` specifically to fix that collision,
+/// not incidentally), and from any live [`Proposer`]'s own per-step retry
+/// timer (`TimerId(step)`, always far smaller in any run this crate's tests
+/// exercise -- A7, step counts are practically bounded), so the four timer
+/// namespaces a replica uses never collide.
+const CATCH_UP_WATCHDOG_TIMER: TimerId = TimerId(u64::MAX - 2);
 
 /// Which of two things a [`CurrentAttempt`] is standing in for: a real
 /// client-visible operation, or this replica's own internal restart
@@ -326,7 +394,19 @@ pub struct SmrNode {
     pub(crate) state: Rc<RefCell<ReplicaState>>,
     pub(crate) results: Rc<RefCell<BTreeMap<OpId, OpRecord>>>,
     pub(crate) total_replicas: usize,
-    pub(crate) leader: Option<NodeId>,
+    pub(crate) leader_policy: LeaderPolicy,
+    /// This replica's own co-located recorder's most-recently-observed ISR
+    /// step *for whichever slot this replica's own current attempt targets*
+    /// -- the hedging evidence-of-progress signal (see
+    /// `queso_consensus::proposer`'s module docs' "Hedging" section), scoped
+    /// per-slot below in [`SmrNode::on_message`] since (unlike
+    /// `queso_consensus::concrete::ConcreteCluster`, which has exactly one
+    /// recorder per replica) this replica's single recorder map answers
+    /// `record` requests for many different slots, most of them irrelevant
+    /// to this replica's *own* in-flight attempt. Only consulted when
+    /// `leader_policy` is `LeaderPolicy::Tuned`; harmlessly unused
+    /// otherwise.
+    pub(crate) local_step: Rc<Cell<u64>>,
 }
 
 impl SmrNode {
@@ -347,13 +427,18 @@ impl SmrNode {
             return;
         };
         let slot = st.durable.next_slot;
+        let leader = self.leader_policy.leader_for(slot);
         let mut proposer = Proposer::new(
             ctx.self_id(),
             self.total_replicas,
             op.command.clone(),
-            self.leader,
+            leader,
             slot,
         );
+        if let Some(delay) = self.leader_policy.delay_for(slot, ctx.self_id()) {
+            proposer = proposer.with_hedging(delay, self.local_step.clone());
+        }
+        self.leader_policy.note_attempt_start(slot, ctx.now());
         proposer.start(ctx);
         st.current_attempt = Some(CurrentAttempt {
             origin: AttemptOrigin::Op(op.op_id),
@@ -381,13 +466,18 @@ impl SmrNode {
         }
         let slot = st.durable.next_slot;
         let command = catch_up_probe(slot);
+        let leader = self.leader_policy.leader_for(slot);
         let mut proposer = Proposer::new(
             ctx.self_id(),
             self.total_replicas,
             command.clone(),
-            self.leader,
+            leader,
             slot,
         );
+        if let Some(delay) = self.leader_policy.delay_for(slot, ctx.self_id()) {
+            proposer = proposer.with_hedging(delay, self.local_step.clone());
+        }
+        self.leader_policy.note_attempt_start(slot, ctx.now());
         proposer.start(ctx);
         st.current_attempt = Some(CurrentAttempt {
             origin: AttemptOrigin::CatchUp,
@@ -518,6 +608,14 @@ impl SmrNode {
         let applied = st.durable.kv.apply(&decided);
         st.durable.applied_log.push(decided.clone());
         st.durable.next_slot += 1;
+        // Auto-tuning bookkeeping (D4, no-op under `LeaderPolicy::Fixed`):
+        // this is the first time *this replica* has observed `attempt.slot`
+        // decide, but the tuner itself dedupes against every other
+        // replica's own observation of the same slot (see
+        // `EpochTuner::note_slot_decided`'s docs), so calling this
+        // unconditionally here -- regardless of attempt origin -- is safe.
+        self.leader_policy
+            .note_slot_decided(attempt.slot, ctx.now());
 
         match attempt.origin {
             AttemptOrigin::Op(op_id) => {
@@ -602,12 +700,18 @@ impl Node<ConcreteMsg<Command>> for SmrNode {
                 // (Phase-8 hardening); the ordering guarantee is identical,
                 // only the storage medium differs.
                 let mut st = self.state.borrow_mut();
-                let resp = st
-                    .durable
-                    .recorders
-                    .entry(req.slot)
-                    .or_default()
-                    .handle(req);
+                let slot = req.slot;
+                let resp = st.durable.recorders.entry(slot).or_default().handle(req);
+                // Hedging evidence-of-progress signal (see `local_step`'s
+                // field docs): only meaningful when this reply is about the
+                // exact slot this replica's own attempt (if any) is
+                // currently working -- a reply about some other slot this
+                // replica happens to be a passive recorder for tells this
+                // replica's *own* proposer nothing about its own slot's
+                // progress.
+                if st.current_attempt.as_ref().is_some_and(|a| a.slot == slot) {
+                    self.local_step.set(resp.step);
+                }
                 ctx.send(from, ConcreteMsg::Response(resp));
             }
             ConcreteMsg::Response(resp) => {

@@ -48,7 +48,7 @@
 //! for the full recovery sequence and for how the write-before-reply
 //! ordering (P12) is enforced on the recorder side.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
@@ -61,7 +61,8 @@ use queso_sim::trace::Trace;
 use queso_sim::Kernel;
 
 use crate::command::{ClientId, Command, Key, Value};
-use crate::replica::{OpId, OpRecord, QueuedOp, ReplicaState, SmrNode};
+use crate::replica::{LeaderPolicy, OpId, OpRecord, QueuedOp, ReplicaState, SmrNode};
+use crate::tuning::EpochTuner;
 
 /// Drives the multi-slot replicated log + KV application across a fixed set
 /// of replicas, on top of one [`Kernel`]. `V` is fixed to [`Command`] (the
@@ -73,7 +74,16 @@ pub struct SmrCluster {
     replicas: Vec<NodeId>,
     states: BTreeMap<NodeId, Rc<RefCell<ReplicaState>>>,
     results: Rc<RefCell<BTreeMap<OpId, OpRecord>>>,
+    /// The cluster's *fixed* leader, if built via [`Self::new`]/
+    /// [`Self::new_with_leader`] -- `None` both for the purely leaderless
+    /// case and for a [`Self::new_with_tuning`] cluster (whose leader is
+    /// chosen dynamically; see [`Self::current_leader`] for the value that
+    /// covers both cases uniformly).
     leader: Option<NodeId>,
+    /// Present only for a [`Self::new_with_tuning`] cluster (Phase 6, D4) --
+    /// the shared explore/exploit tuner every replica's [`SmrNode`]
+    /// consults. See `crate::tuning`'s module docs.
+    tuner: Option<Rc<RefCell<EpochTuner>>>,
     live: BTreeSet<NodeId>,
     next_op_id: u64,
 }
@@ -97,8 +107,72 @@ impl SmrCluster {
         n: usize,
         leader: Option<NodeId>,
     ) -> Self {
+        Self::build(
+            seed,
+            scheduler,
+            n,
+            LeaderPolicy::Fixed(leader),
+            leader,
+            None,
+        )
+    }
+
+    /// Build a cluster of `n` replicas whose leader and hedging schedule are
+    /// **auto-tuned** (Phase 6, §5.3, D4) instead of fixed: an
+    /// [`EpochTuner`] shared by every replica groups the log into
+    /// `epoch_len`-slot epochs, round-robins the leader across the first
+    /// `2n+1` epochs while measuring each leader's observed average epoch
+    /// completion time, then exploits by leading with the fastest-observed
+    /// replica and staggering the rest by `base_delay` (Phase 5's δ) in
+    /// speed order -- switching leaders thereafter only if the incumbent
+    /// measurably degrades relative to the next-ranked replica, never
+    /// requiring a crash. See `crate::tuning`'s module docs for the full
+    /// design and [`Self::current_leader`]/[`Self::tuning_epoch`]/
+    /// [`Self::tuning_schedule`]/[`Self::tuning_is_exploring`]/
+    /// [`Self::tuning_switch_count`]/[`Self::tuning_leader_log`]/
+    /// [`Self::tuning_average`] for the introspection this driver exposes on
+    /// top of it.
+    pub fn new_with_tuning(
+        seed: u64,
+        scheduler: SchedulerKind<ConcreteMsg<Command>>,
+        n: usize,
+        epoch_len: u64,
+        base_delay: u64,
+    ) -> Self {
+        let replica_ids: Vec<NodeId> = (0..n as u32).map(NodeId).collect();
+        let tuner = Rc::new(RefCell::new(EpochTuner::new(
+            replica_ids,
+            epoch_len,
+            base_delay,
+        )));
+        let initial_leader = Some(tuner.borrow().leader());
+        Self::build(
+            seed,
+            scheduler,
+            n,
+            LeaderPolicy::Tuned(tuner.clone()),
+            initial_leader,
+            Some(tuner),
+        )
+    }
+
+    fn build(
+        seed: u64,
+        scheduler: SchedulerKind<ConcreteMsg<Command>>,
+        n: usize,
+        policy: LeaderPolicy,
+        kernel_leader_hint: Option<NodeId>,
+        tuner: Option<Rc<RefCell<EpochTuner>>>,
+    ) -> Self {
         let mut kernel = Kernel::new(seed, scheduler);
-        kernel.set_leader(leader);
+        // Purely a hook for adversary schedulers that target "the leader"
+        // (see `Kernel::set_leader`'s docs) -- set once, to the *initial*
+        // leader, for both policies. For `LeaderPolicy::Tuned` this does
+        // *not* track subsequent epoch/leader changes (out of scope here:
+        // no test in this phase exercises a leader-targeting adversary
+        // together with auto-tuning), which is worth being explicit about
+        // rather than silently stale.
+        kernel.set_leader(kernel_leader_hint);
         let results = Rc::new(RefCell::new(BTreeMap::new()));
         let mut states = BTreeMap::new();
         let mut replicas = Vec::new();
@@ -110,7 +184,8 @@ impl SmrCluster {
                 state: state.clone(),
                 results: results.clone(),
                 total_replicas: n,
-                leader,
+                leader_policy: policy.clone(),
+                local_step: Rc::new(Cell::new(0)),
             };
             kernel.add_node(id, Box::new(node));
             states.insert(id, state);
@@ -118,6 +193,10 @@ impl SmrCluster {
         }
         replicas.sort();
         let live = replicas.iter().copied().collect();
+        let leader = match &policy {
+            LeaderPolicy::Fixed(l) => *l,
+            LeaderPolicy::Tuned(_) => None,
+        };
 
         Self {
             kernel,
@@ -125,6 +204,7 @@ impl SmrCluster {
             states,
             results,
             leader,
+            tuner,
             live,
             next_op_id: 0,
         }
@@ -135,14 +215,90 @@ impl SmrCluster {
         &self.replicas
     }
 
-    /// The cluster's designated fast-path leader, if any.
+    /// The cluster's **fixed** designated leader, if any -- `None` for both
+    /// the purely leaderless case and for a [`Self::new_with_tuning`]
+    /// cluster (whose leader changes over time; see [`Self::current_leader`]
+    /// for the accessor that covers both cases).
     pub fn leader(&self) -> Option<NodeId> {
         self.leader
+    }
+
+    /// The replica currently acting as fast-path leader, whether fixed (see
+    /// [`Self::leader`]) or auto-tuned (Phase 6, D4) -- the current epoch's
+    /// leader for a [`Self::new_with_tuning`] cluster, `None` only for the
+    /// purely leaderless case.
+    pub fn current_leader(&self) -> Option<NodeId> {
+        self.leader
+            .or_else(|| self.tuner.as_ref().map(|t| t.borrow().leader()))
+    }
+
+    /// The current epoch number of a [`Self::new_with_tuning`] cluster's
+    /// tuner, or `None` if this cluster was not built with tuning.
+    pub fn tuning_epoch(&self) -> Option<u64> {
+        self.tuner.as_ref().map(|t| t.borrow().epoch())
+    }
+
+    /// How many epochs a [`Self::new_with_tuning`] cluster's tuner spends
+    /// exploring (`2n+1`), or `None` if this cluster was not built with
+    /// tuning.
+    pub fn tuning_explore_epochs(&self) -> Option<u64> {
+        self.tuner.as_ref().map(|t| t.borrow().explore_epochs())
+    }
+
+    /// Whether a [`Self::new_with_tuning`] cluster's tuner is still in its
+    /// initial round-robin exploration phase, or `None` if this cluster was
+    /// not built with tuning.
+    pub fn tuning_is_exploring(&self) -> Option<bool> {
+        self.tuner.as_ref().map(|t| t.borrow().is_exploring())
+    }
+
+    /// The current epoch's full hedging schedule (leader first, the rest in
+    /// ascending speed order once exploration has finished), or `None` if
+    /// this cluster was not built with tuning.
+    pub fn tuning_schedule(&self) -> Option<Vec<NodeId>> {
+        self.tuner.as_ref().map(|t| t.borrow().schedule().to_vec())
+    }
+
+    /// How many times the tuner has switched leaders away from a degraded
+    /// incumbent during the exploit phase (§5.3's monitoring trigger), or
+    /// `None` if this cluster was not built with tuning.
+    pub fn tuning_switch_count(&self) -> Option<u64> {
+        self.tuner.as_ref().map(|t| t.borrow().switch_count())
+    }
+
+    /// The leader assigned to every epoch so far, in epoch order, or `None`
+    /// if this cluster was not built with tuning.
+    pub fn tuning_leader_log(&self) -> Option<Vec<NodeId>> {
+        self.tuner
+            .as_ref()
+            .map(|t| t.borrow().leader_log().to_vec())
+    }
+
+    /// `replica`'s observed average epoch-completion time (as leader), or
+    /// `None` if this cluster was not built with tuning or that replica has
+    /// not yet led a measured epoch.
+    pub fn tuning_average(&self, replica: NodeId) -> Option<u64> {
+        self.tuner
+            .as_ref()
+            .and_then(|t| t.borrow().average_for(replica))
     }
 
     /// Replicas the driver currently considers live (not crashed).
     pub fn live(&self) -> &BTreeSet<NodeId> {
         &self.live
+    }
+
+    /// Multiply message delay to/from `id` by `multiplier` (>= 1) -- test/
+    /// demo fault injection (`queso_sim::fault`'s slow-node facility),
+    /// wrapped here the same way [`Self::crash`]/[`Self::restart`] wrap
+    /// their own `Kernel` calls.
+    pub fn set_slow(&mut self, id: NodeId, multiplier: u64) {
+        self.kernel.set_slow(id, multiplier);
+    }
+
+    /// Remove a previously-set slow-node multiplier for `id`.
+    pub fn clear_slow(&mut self, id: NodeId) {
+        self.kernel.clear_slow(id);
     }
 
     /// Crash a replica. Any operation currently in flight through it will

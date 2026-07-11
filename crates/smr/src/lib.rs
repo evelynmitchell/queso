@@ -29,18 +29,23 @@
 //!    faithfully against the harness's actual restart semantics, and
 //!    [`replica::SmrNode::on_restart`] for the recovery sequence.
 //!
-//! # Scope (Stage 4a + 4b)
+//! # Scope (Stage 4a + 4b, plus Phase 5/6)
 //!
 //! Single cluster, single log. Crash-**recovery** (not merely crash-stop):
 //! a replica may crash and later restart via [`cluster::SmrCluster::restart`]
 //! without losing acknowledged writes or diverging (P9/P12) -- see
-//! [`replica::Durable`]'s docs. No hedging tuning (Phase 5), no auto-tuning
-//! (Phase 6), no reconfiguration/membership change (Phase 8), no real
-//! fsync/WAL (also Phase-8 hardening -- durability is modeled faithfully in
-//! memory against the harness's restart semantics, not backed by real
-//! disk). Slots are processed with no pipelining -- a replica runs at most
-//! one `Proposer` at a time, always at its own frontier -- noted as future
-//! work in the project outline, not a correctness shortcut (log safety and
+//! [`replica::Durable`]'s docs. [`cluster::SmrCluster::new`]/
+//! [`cluster::SmrCluster::new_with_leader`] keep the original fixed-leader,
+//! no-hedging behavior unchanged; [`cluster::SmrCluster::new_with_tuning`]
+//! (Phase 6, D4) layers the hedging schedule (Phase 5, reused unmodified from
+//! `queso_consensus::proposer::Proposer::with_hedging`) and leader choice on
+//! top of an epoch-based explore/exploit tuner -- see [`tuning`]'s module
+//! docs. No reconfiguration/membership change (Phase 8), no real fsync/WAL
+//! (also Phase-8 hardening -- durability is modeled faithfully in memory
+//! against the harness's restart semantics, not backed by real disk). Slots
+//! are processed with no pipelining -- a replica runs at most one `Proposer`
+//! at a time, always at its own frontier -- noted as future work in the
+//! project outline, not a correctness shortcut (log safety and
 //! linearizability do not depend on pipelining).
 //!
 //! # Layout
@@ -66,15 +71,19 @@
 //!   searches for *some* total order consistent with the real-time partial
 //!   order that replays correctly against [`kv::Kv`] as the sequential
 //!   spec.
+//! - [`tuning`] -- [`tuning::EpochTuner`], the Phase-6 explore/exploit
+//!   multi-armed-bandit leader/hedging-schedule tuner (D4/§5.3).
 
 pub mod cluster;
 pub mod command;
 pub mod kv;
 pub mod linearizability;
 pub mod replica;
+pub mod tuning;
 
 pub use cluster::SmrCluster;
 pub use command::{ClientId, ClientSession, Command, Key, Value};
 pub use kv::{Applied, Kv};
 pub use linearizability::{history_from_records, is_linearizable, HistoryOp};
 pub use replica::{OpId, OpRecord, Outcome};
+pub use tuning::EpochTuner;
