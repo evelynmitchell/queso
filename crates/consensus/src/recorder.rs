@@ -4,12 +4,19 @@
 //! replying to that proposer's own request -- all per §4.2.1's "all
 //! communication is RPC-style, proposer-to-recorder".
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use crate::isr::Isr;
 use crate::rpc::{RecordRequest, RecordResponse};
 
 /// One replica's recorder state for one slot: just an [`Isr`] plus the
 /// glue to turn a [`RecordRequest`] into a [`RecordResponse`].
+///
+/// `Serialize`/`Deserialize` (feature-gated, bookkeeping only) let a real
+/// driver persist this durably -- see [`Isr`]'s docs.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Recorder<V> {
     isr: Isr<V>,
 }

@@ -324,7 +324,22 @@ struct CurrentAttempt {
 /// equivalent) written synchronously before any RPC reply that depends on
 /// it -- see `SmrNode::on_message`'s `Request` arm for where that
 /// write-before-reply ordering is enforced here.
-#[derive(Default)]
+///
+/// # Real persistence (Phase 7 hardening, issue #36)
+///
+/// `Clone` plus feature-gated `Serialize`/`Deserialize` are bookkeeping
+/// additions only -- no change to the fields above or to any consensus/ISR/
+/// quorum/decision logic. They exist so a real driver (`queso-net`) can call
+/// [`SmrNode::durable_snapshot`] to obtain an owned, serializable copy of
+/// this replica's durable state, write it to fsync'd on-disk storage via the
+/// atomic-rename pattern, and -- on a subsequent boot -- reload it and hand
+/// it to [`SmrNode::from_durable`] so a restarted *process* (not just a
+/// restarted in-sim `Node`) recovers with its memory intact instead of
+/// starting blank. See `crates/net/src/driver.rs`'s module docs and
+/// `crates/net/src/persist.rs` for exactly how those two methods are wired
+/// into the write-before-reply ordering on real disk.
+#[derive(Default, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Durable {
     /// Persistent per-slot recorder state, created lazily the first time
     /// any proposer (this replica's own, or a remote one during a `record`
@@ -436,6 +451,43 @@ impl SmrNode {
             leader_policy: LeaderPolicy::Fixed(leader),
             local_step: Rc::new(Cell::new(0)),
         }
+    }
+
+    /// Build a replica whose durable state is *not* empty: seeded from a
+    /// previously [`Self::durable_snapshot`]ted (and, in a real deployment,
+    /// persisted-then-reloaded) [`Durable`], as if this replica's process
+    /// had never lost that state at all. Every volatile field
+    /// ([`ReplicaState::queue`], the in-flight attempt, the watchdog
+    /// bookkeeping) starts fresh, exactly like [`Self::new_fixed_leader`] --
+    /// a real crash genuinely loses those (see [`Durable`]'s docs).
+    ///
+    /// This constructor deliberately does **not** call [`Node::on_restart`]
+    /// itself: only the caller knows whether `durable` came from a real
+    /// reload (a genuine restart, which must rejoin as a learner) or is a
+    /// still-cold first boot's default `Durable` (which must not), so
+    /// driving `on_restart` is left to the caller once it has a live `ctx`
+    /// -- see `crates/net/src/driver.rs::run_node`'s boot sequence for the
+    /// real driver that makes this call.
+    pub fn from_durable(total_replicas: usize, leader: Option<NodeId>, durable: Durable) -> Self {
+        SmrNode {
+            state: Rc::new(RefCell::new(ReplicaState {
+                durable,
+                ..ReplicaState::default()
+            })),
+            results: Rc::new(RefCell::new(BTreeMap::new())),
+            total_replicas,
+            leader_policy: LeaderPolicy::Fixed(leader),
+            local_step: Rc::new(Cell::new(0)),
+        }
+    }
+
+    /// An owned snapshot of this replica's current [`Durable`] state --
+    /// bookkeeping only, no logic change (a plain `Clone` of the shared
+    /// `Rc<RefCell<_>>`'s durable half). See [`Self::from_durable`] and
+    /// [`Durable`]'s "real persistence" docs for how a real driver uses
+    /// this.
+    pub fn durable_snapshot(&self) -> Durable {
+        self.state.borrow().durable.clone()
     }
 
     /// Submit `command`, tagged `op_id`, as a fresh client-visible

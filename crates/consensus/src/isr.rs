@@ -28,6 +28,9 @@
 
 use std::cmp::Ordering;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use crate::proposal::Proposal;
 
 /// The `(s', f', a')` triple `record` returns: the ISR's current step, the
@@ -56,7 +59,13 @@ pub struct IsrSummary<V> {
 /// One `Isr<V>` per recorder per slot: this is deliberately *not* itself a
 /// [`queso_sim::node::Node`] -- it is the passive state a
 /// [`crate::recorder::Recorder`] wraps and drives from `on_message`.
+///
+/// `Serialize`/`Deserialize` (feature-gated, bookkeeping only -- no logic
+/// change) let a real driver (`queso-net`) persist this to disk as part of
+/// [`crate::recorder::Recorder`]/`queso_smr::replica::Durable`: see that
+/// type's docs for the write-before-reply ordering this exists to support.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Isr<V> {
     /// `S`, initially 0.
     step: u64,
