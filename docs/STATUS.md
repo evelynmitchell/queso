@@ -135,7 +135,16 @@ node.** The whole system is driven in-process by the sim.
   membership loading. Today there is nothing to start. *~Phase 7/8.*
 - **Real durability.** Phase-4b models durability in-memory (survives *sim* restart);
   there is **no fsync/WAL/crash-consistent on-disk storage**. A real crash needs real
-  persistence. *~Phase 8.*
+  persistence. *~Phase 8.* **Update (issue #36):** a real `queso-net` process restart
+  used to come back with a *blank* `Durable` (no persistence, no `on_restart` call at
+  all) — a majority reboot after an acknowledged write silently re-decided that slot
+  as empty, losing the write and diverging from the surviving replica. Fixed on the
+  `claude/phase-7-durable-transport` branch: `Durable` is now persisted to fsync'd,
+  atomically-renamed on-disk storage, write-before-reply, and reloaded (with
+  `on_restart` learner catch-up) on boot — see `crates/net/src/persist.rs` and
+  `crates/net/README.md`'s "Status"/"Honest limits" for exactly what's covered
+  (per-RPC fsync, whole-snapshot writes, no compaction/WAL yet — real hardening of
+  *those* remains Phase 8) and what isn't.
 - **A client API.** The KV is driven in-process; there is no network-facing client
   protocol or SDK, and no client-side retry/session library. *~Phase 7.*
 
