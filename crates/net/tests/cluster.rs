@@ -10,14 +10,15 @@
 //! the same runtime.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::thread;
 use std::time::Duration;
 
 use queso_net::config::NodeConfig;
-use queso_net::run_node;
+use queso_net::run_node_with_listeners;
 use queso_sim::ids::NodeId;
 use queso_smr::{ClientId, Command, Outcome};
+use tokio::net::TcpListener as TokioTcpListener;
 
 #[path = "support/mod.rs"]
 mod support;
@@ -57,15 +58,39 @@ async fn three_node_cluster_forms_over_tcp_and_serves_put_then_get() {
 /// down ones, which the caller must not submit to).
 fn spawn_cluster_with_only(leader: Option<NodeId>, live: &[usize]) -> Vec<SocketAddr> {
     let n = 3;
-    let peer_addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
-    let client_addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
+    // Bind each *live* replica's listeners up front and keep them open until
+    // its node adopts them via `run_node_with_listeners` -- gap-free, so
+    // there is no probe-then-drop-then-rebind window for a concurrent test
+    // to steal the port (the `free_addr` TOCTOU, which flaked in CI here as
+    // "Address already in use"). A never-booted replica needs only an address
+    // in the peer map, never a real bind, so a plain `free_addr` probe is
+    // fine for it: nothing ever listens there.
+    let mut live_listeners: Vec<Option<(StdTcpListener, StdTcpListener)>> = Vec::with_capacity(n);
+    let mut peer_addrs: Vec<SocketAddr> = Vec::with_capacity(n);
+    let mut client_addrs: Vec<SocketAddr> = Vec::with_capacity(n);
+    for i in 0..n {
+        if live.contains(&i) {
+            let pl = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind a peer listener");
+            let cl = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind a client listener");
+            peer_addrs.push(pl.local_addr().expect("read peer listener addr"));
+            client_addrs.push(cl.local_addr().expect("read client listener addr"));
+            live_listeners.push(Some((pl, cl)));
+        } else {
+            peer_addrs.push(free_addr());
+            client_addrs.push(free_addr());
+            live_listeners.push(None);
+        }
+    }
 
     let peers: BTreeMap<NodeId, String> = (0..n)
         .map(|i| (NodeId(i as u32), peer_addrs[i].to_string()))
         .collect();
 
     let data_dir = support::fresh_data_dir();
-    for &i in live {
+    for (i, slot) in live_listeners.into_iter().enumerate() {
+        let Some((peer_listener, client_listener)) = slot else {
+            continue; // never-booted replica
+        };
         let config = NodeConfig {
             id: NodeId(i as u32),
             listen_addr: peer_addrs[i],
@@ -85,7 +110,14 @@ fn spawn_cluster_with_only(leader: Option<NodeId>, live: &[usize]) -> Vec<Socket
                     .enable_all()
                     .build()
                     .expect("build a per-node tokio runtime");
-                if let Err(err) = rt.block_on(run_node(config)) {
+                let result = rt.block_on(async move {
+                    peer_listener.set_nonblocking(true)?;
+                    client_listener.set_nonblocking(true)?;
+                    let peer_listener = TokioTcpListener::from_std(peer_listener)?;
+                    let client_listener = TokioTcpListener::from_std(client_listener)?;
+                    run_node_with_listeners(config, peer_listener, client_listener).await
+                });
+                if let Err(err) = result {
                     panic!("node {i} exited: {err:?}");
                 }
             })
