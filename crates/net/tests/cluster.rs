@@ -116,6 +116,103 @@ async fn three_node_cluster_forms_over_tcp_and_serves_put_then_get() {
     assert_eq!(get_outcome, Outcome::Get(Some(7)));
 }
 
+/// Boot a 3-node cluster **configuration** (peer/client addresses for all 3
+/// replicas), but only actually start the replicas whose index is in
+/// `live` -- the rest never boot at all, modeling a permanently crashed
+/// replica (stronger than a partition: nothing ever listens on its peer or
+/// client ports). Returns every replica's client address (including the
+/// down ones, which the caller must not submit to).
+fn spawn_cluster_with_only(leader: Option<NodeId>, live: &[usize]) -> Vec<SocketAddr> {
+    let n = 3;
+    let peer_addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
+    let client_addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
+
+    let peers: BTreeMap<NodeId, SocketAddr> =
+        (0..n).map(|i| (NodeId(i as u32), peer_addrs[i])).collect();
+
+    for &i in live {
+        let config = NodeConfig {
+            id: NodeId(i as u32),
+            listen_addr: peer_addrs[i],
+            client_listen_addr: client_addrs[i],
+            peers: peers.clone(),
+            total_replicas: n,
+            leader,
+            tick: Duration::from_millis(5),
+            seed: 2_000 + i as u64,
+        };
+        thread::Builder::new()
+            .name(format!("queso-node-{i}"))
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build a per-node tokio runtime");
+                if let Err(err) = rt.block_on(run_node(config)) {
+                    panic!("node {i} exited: {err:?}");
+                }
+            })
+            .expect("spawn node thread");
+    }
+
+    client_addrs
+}
+
+/// Regression test for the critical review finding on this branch:
+/// `RealCtx::send` used to look up `dst` in its `outbound` map
+/// unconditionally, including for `dst == self_id`. Since a replica never
+/// dials itself, `outbound` has no entry for its own id, so every
+/// proposer's `RecordRequest` to *itself* (Meerkat's `Proposer` fans a
+/// step's requests out to *all* `n` recorders, including its own --
+/// `queso_consensus::proposer::Proposer::all_recorders`) was silently
+/// dropped. That is invisible with the full membership live (a proposer
+/// still reaches majority using only its `n-1` peers), but at the actual
+/// fault-tolerance boundary -- here, a 3-node cluster with only 2
+/// replicas live, so a majority of 2 is required and available only by
+/// counting a live replica's *own* vote plus its one live peer's -- no
+/// proposer could ever reach quorum and the cluster stalled forever.
+///
+/// This must fail (hang, caught by the outer timeout below) on the
+/// pre-fix code and pass once `RealCtx::send` loops a self-send back
+/// through the replica's own inbox instead of dropping it.
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_survives_at_its_fault_tolerance_boundary() {
+    // Replica 2 never boots at all -- only 0 and 1 are live, out of 3.
+    let client_addrs = spawn_cluster_with_only(Some(NodeId(0)), &[0, 1]);
+    let timeout = Duration::from_secs(10);
+
+    let put = Command::Put {
+        client: ClientId(1),
+        seq: 0,
+        key: 7,
+        value: 77,
+    };
+    // Wrapped in its own outer timeout: if the cluster is stalled (the bug
+    // this test targets), `client::submit` connects fine but then hangs
+    // forever awaiting a response that never comes, so
+    // `submit_with_retry`'s own internal deadline (which only re-checks
+    // between *failed* connection attempts) never gets a chance to fire.
+    let put_outcome =
+        tokio::time::timeout(timeout, submit_with_retry(client_addrs[0], &put, timeout))
+            .await
+            .expect(
+                "put must complete using only the live majority (2 of 3) -- \
+             a proposer's own vote must count toward quorum",
+            );
+    assert_eq!(put_outcome, Outcome::Put);
+
+    let get = Command::Get {
+        client: ClientId(1),
+        seq: 1,
+        key: 7,
+    };
+    let get_outcome =
+        tokio::time::timeout(timeout, submit_with_retry(client_addrs[1], &get, timeout))
+            .await
+            .expect("get must complete using only the live majority (2 of 3)");
+    assert_eq!(get_outcome, Outcome::Get(Some(77)));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn three_node_cluster_is_leaderless_capable_too() {
     let client_addrs = spawn_three_node_cluster(None);

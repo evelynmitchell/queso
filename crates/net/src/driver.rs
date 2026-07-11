@@ -60,16 +60,18 @@ pub enum Event {
 pub async fn run_node(config: NodeConfig) -> anyhow::Result<()> {
     let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<Event>();
 
-    // One outbound queue per *other* replica -- a replica never dials or
-    // sends to itself (`Ctx::send` is never called with `dst ==
-    // ctx.self_id()` by any `Node` impl in this codebase, matching every
-    // sim-driven test).
+    // One outbound queue per *other* replica -- a replica never *dials*
+    // itself. It can still be sent to by its own `Node` impl (a proposer's
+    // `RecordRequest` fan-out deliberately includes its own recorder, see
+    // `queso_consensus::proposer::Proposer::all_recorders`'s docs) but
+    // `RealCtx::send` handles `dst == self_id` as a loopback through the
+    // inbox rather than this `outbound` map -- see that method's docs.
     let mut outbound = BTreeMap::new();
     for (&peer_id, &addr) in &config.peers {
         if peer_id == config.id {
             continue;
         }
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(transport::OUTBOUND_QUEUE_CAPACITY);
         outbound.insert(peer_id, tx);
         transport::spawn_peer_dialer(config.id, addr, rx);
     }

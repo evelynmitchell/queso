@@ -441,15 +441,16 @@ impl SmrNode {
     /// Submit `command`, tagged `op_id`, as a fresh client-visible
     /// operation this replica should propose -- mirrors
     /// [`crate::cluster::SmrCluster::submit`]'s enqueue-then-kick logic
-    /// exactly (record a pending [`OpRecord`], push onto the queue, and if
-    /// the replica was idle a moment ago schedule a zero-delay
-    /// [`KICKOFF_TIMER`]), so any driver reaches [`Self::begin_next_attempt`]
-    /// through the identical `Node::on_timer` path the sim harness already
-    /// exhaustively tests -- rather than calling it directly, which would
-    /// (harmlessly, but needlessly) diverge from that verified path just
-    /// because a real driver happens to already hold a live `ctx` where
-    /// `SmrCluster::submit` (called from outside any `Node` callback) does
-    /// not.
+    /// exactly (guard against [`CATCH_UP_CLIENT`], compute a
+    /// monotonic `invoked_at`, record a pending [`OpRecord`], push onto the
+    /// queue, and if the replica was idle a moment ago schedule a
+    /// zero-delay [`KICKOFF_TIMER`]), so any driver reaches
+    /// [`Self::begin_next_attempt`] through the identical `Node::on_timer`
+    /// path the sim harness already exhaustively tests -- rather than
+    /// calling it directly, which would (harmlessly, but needlessly)
+    /// diverge from that verified path just because a real driver happens
+    /// to already hold a live `ctx` where `SmrCluster::submit` (called from
+    /// outside any `Node` callback) does not.
     pub fn submit(
         &self,
         op_id: OpId,
@@ -457,12 +458,20 @@ impl SmrNode {
         command: Command,
         ctx: &mut dyn Ctx<ConcreteMsg<Command>>,
     ) {
+        debug_assert_ne!(
+            command.client_seq().0,
+            CATCH_UP_CLIENT,
+            "ClientId(u32::MAX) is reserved for this crate's internal restart catch-up probes \
+             (see crate::replica::CATCH_UP_CLIENT's docs) -- a real client/test must never \
+             submit using it"
+        );
+        let invoked_at = self.next_invoked_at(ctx.now());
         self.results.borrow_mut().insert(
             op_id,
             OpRecord {
                 replica,
                 command: command.clone(),
-                invoked_at: ctx.now(),
+                invoked_at,
                 completed_at: None,
                 outcome: None,
                 decided_slot: None,
@@ -475,6 +484,30 @@ impl SmrNode {
         };
         if should_kick {
             ctx.schedule_timer(0, KICKOFF_TIMER);
+        }
+    }
+
+    /// A faithful invocation timestamp for a *new* submission: at least
+    /// `now`, but strictly after every operation that has already completed
+    /// by this point -- the exact same tie-avoidance treatment
+    /// [`crate::cluster::SmrCluster::next_invoked_at`] applies (see that
+    /// method's docs for the full soundness argument against
+    /// [`crate::linearizability`]). `SmrNode` has no single shared clock to
+    /// consult beyond `ctx.now()` and no driver-external call site the way
+    /// `SmrCluster::submit` does (this is always called from inside a live
+    /// `ctx`), but the tie it closes is the same one: two submissions
+    /// separated by an observed completion must never be assigned an
+    /// identical `invoked_at`.
+    fn next_invoked_at(&self, now: LogicalTime) -> LogicalTime {
+        let max_completed = self
+            .results
+            .borrow()
+            .values()
+            .filter_map(|r| r.completed_at)
+            .max();
+        match max_completed {
+            Some(t) => std::cmp::max(now, t.advance(1)),
+            None => now,
         }
     }
 
