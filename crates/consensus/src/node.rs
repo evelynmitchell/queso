@@ -3,7 +3,7 @@
 //! A replica needs exactly two things from the kernel:
 //!
 //! 1. **Draw a priority from the kernel's single seeded PRNG stream.** The
-//!    only way to reach that stream is [`queso_sim::node::NodeCtx::rng`],
+//!    only way to reach that stream is [`queso_sim::node::Ctx::rng`],
 //!    which is only available inside a `Node` callback -- so priority
 //!    generation happens in `on_timer`, triggered by the driver injecting a
 //!    zero-delay timer for every live replica at the start of each round.
@@ -26,7 +26,7 @@ use std::rc::Rc;
 use rand::Rng;
 
 use queso_sim::ids::{NodeId, TimerId};
-use queso_sim::node::{Node, NodeCtx};
+use queso_sim::node::{Ctx, Node};
 
 use crate::message::TcastMsg;
 use crate::proposal::ProposalSet;
@@ -76,12 +76,7 @@ impl<V> ReplicaNode<V> {
 }
 
 impl<V: Ord + Clone> Node<TcastMsg<V>> for ReplicaNode<V> {
-    fn on_message(
-        &mut self,
-        from: NodeId,
-        payload: TcastMsg<V>,
-        _ctx: &mut NodeCtx<'_, TcastMsg<V>>,
-    ) {
+    fn on_message(&mut self, from: NodeId, payload: TcastMsg<V>, _ctx: &mut dyn Ctx<TcastMsg<V>>) {
         // First writer wins for a given sender within a step: retries (see
         // `crate::tcast::tcast`) may resend the same sender's set more than
         // once, and since it's the same set every time, keeping the first
@@ -93,14 +88,14 @@ impl<V: Ord + Clone> Node<TcastMsg<V>> for ReplicaNode<V> {
             .or_insert(payload.set);
     }
 
-    fn on_timer(&mut self, timer_id: TimerId, ctx: &mut NodeCtx<'_, TcastMsg<V>>) {
+    fn on_timer(&mut self, timer_id: TimerId, ctx: &mut dyn Ctx<TcastMsg<V>>) {
         if timer_id == DRAW_PRIORITY_TIMER {
             let priority: u64 = ctx.rng().gen();
             *self.drawn_priority.borrow_mut() = Some(priority);
         }
     }
 
-    fn on_restart(&mut self, _ctx: &mut NodeCtx<'_, TcastMsg<V>>) {
+    fn on_restart(&mut self, _ctx: &mut dyn Ctx<TcastMsg<V>>) {
         self.mailbox.borrow_mut().received.clear();
         *self.drawn_priority.borrow_mut() = None;
     }

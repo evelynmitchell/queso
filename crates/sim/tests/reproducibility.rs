@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use queso_sim::fault::FaultCommand;
 use queso_sim::ids::{NodeId, TimerId};
-use queso_sim::node::{Node, NodeCtx};
+use queso_sim::node::{Ctx, Node};
 use queso_sim::payload::{Inspectable, Payload};
 use queso_sim::scheduler::{
     ContentAwareAdversary, ContentObliviousAdversary, Fifo, RandomScheduler, SchedulerKind,
@@ -56,7 +56,7 @@ struct EchoNode {
 }
 
 impl Node<Msg> for EchoNode {
-    fn on_message(&mut self, from: NodeId, payload: Msg, ctx: &mut NodeCtx<'_, Msg>) {
+    fn on_message(&mut self, from: NodeId, payload: Msg, ctx: &mut dyn Ctx<Msg>) {
         self.received.borrow_mut().push((from, payload.clone()));
         if let Msg::Ping(round) = payload {
             ctx.send(from, Msg::Pong(round));
@@ -67,7 +67,7 @@ impl Node<Msg> for EchoNode {
         }
     }
 
-    fn on_timer(&mut self, _timer_id: TimerId, _ctx: &mut NodeCtx<'_, Msg>) {}
+    fn on_timer(&mut self, _timer_id: TimerId, _ctx: &mut dyn Ctx<Msg>) {}
 }
 
 const RING_SIZE: u32 = 5;

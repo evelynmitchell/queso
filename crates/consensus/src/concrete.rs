@@ -36,7 +36,7 @@ use std::rc::Rc;
 
 use queso_sim::fault::FaultCommand;
 use queso_sim::ids::{NodeId, TimerId};
-use queso_sim::node::{Node, NodeCtx};
+use queso_sim::node::{Ctx, Node};
 use queso_sim::scheduler::SchedulerKind;
 use queso_sim::trace::{Trace, TraceEvent};
 use queso_sim::Kernel;
@@ -83,7 +83,7 @@ impl<V: Ord + Clone> Node<ConcreteMsg<V>> for ReplicaNode<V> {
         &mut self,
         from: NodeId,
         payload: ConcreteMsg<V>,
-        ctx: &mut NodeCtx<'_, ConcreteMsg<V>>,
+        ctx: &mut dyn Ctx<ConcreteMsg<V>>,
     ) {
         match payload {
             ConcreteMsg::Request(req) => {
@@ -101,7 +101,7 @@ impl<V: Ord + Clone> Node<ConcreteMsg<V>> for ReplicaNode<V> {
         }
     }
 
-    fn on_timer(&mut self, timer_id: TimerId, ctx: &mut NodeCtx<'_, ConcreteMsg<V>>) {
+    fn on_timer(&mut self, timer_id: TimerId, ctx: &mut dyn Ctx<ConcreteMsg<V>>) {
         self.proposer.borrow_mut().on_timer(timer_id, ctx);
     }
 

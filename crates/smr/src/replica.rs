@@ -68,7 +68,7 @@ use queso_consensus::proposer::{Proposer, KICKOFF_TIMER, RETRY_DELAY_TICKS};
 use queso_consensus::recorder::Recorder;
 use queso_consensus::rpc::ConcreteMsg;
 use queso_sim::ids::{NodeId, TimerId};
-use queso_sim::node::{Node, NodeCtx};
+use queso_sim::node::{Ctx, Node};
 use queso_sim::time::LogicalTime;
 
 use crate::command::{ClientId, Command, Value};
@@ -415,11 +415,7 @@ impl SmrNode {
     /// targeting the current frontier slot. No-op otherwise (called
     /// defensively from several call sites; only one of them will ever find
     /// both conditions true at once).
-    fn begin_next_attempt(
-        &self,
-        st: &mut ReplicaState,
-        ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>,
-    ) {
+    fn begin_next_attempt(&self, st: &mut ReplicaState, ctx: &mut dyn Ctx<ConcreteMsg<Command>>) {
         if st.current_attempt.is_some() {
             return;
         }
@@ -460,7 +456,7 @@ impl SmrNode {
     ///
     /// No-op if an attempt is already in flight (defensive; `on_restart` is
     /// the only real caller and always starts from an idle state).
-    fn begin_catch_up(&self, st: &mut ReplicaState, ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>) {
+    fn begin_catch_up(&self, st: &mut ReplicaState, ctx: &mut dyn Ctx<ConcreteMsg<Command>>) {
         if st.current_attempt.is_some() {
             return;
         }
@@ -499,7 +495,7 @@ impl SmrNode {
     fn arm_catch_up_watchdog(
         &self,
         st: &mut ReplicaState,
-        ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>,
+        ctx: &mut dyn Ctx<ConcreteMsg<Command>>,
         slot: u64,
     ) {
         st.watchdog_generation += 1;
@@ -548,11 +544,7 @@ impl SmrNode {
     /// harmless, provenance-agnostic extra evidence the algorithm already
     /// tolerates by design. This never touches ISR/decision/quorum logic
     /// itself -- `Recorder`/`Proposer` are used completely unmodified.
-    fn on_catch_up_watchdog(
-        &self,
-        st: &mut ReplicaState,
-        ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>,
-    ) {
+    fn on_catch_up_watchdog(&self, st: &mut ReplicaState, ctx: &mut dyn Ctx<ConcreteMsg<Command>>) {
         let Some((watched_slot, watched_generation)) = st.watchdog_armed_for else {
             return;
         };
@@ -594,7 +586,7 @@ impl SmrNode {
         &self,
         st: &mut ReplicaState,
         decided: Command,
-        ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>,
+        ctx: &mut dyn Ctx<ConcreteMsg<Command>>,
     ) {
         let attempt = st
             .current_attempt
@@ -675,7 +667,7 @@ impl Node<ConcreteMsg<Command>> for SmrNode {
         &mut self,
         from: NodeId,
         payload: ConcreteMsg<Command>,
-        ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>,
+        ctx: &mut dyn Ctx<ConcreteMsg<Command>>,
     ) {
         match payload {
             ConcreteMsg::Request(req) => {
@@ -734,7 +726,7 @@ impl Node<ConcreteMsg<Command>> for SmrNode {
         }
     }
 
-    fn on_timer(&mut self, timer_id: TimerId, ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>) {
+    fn on_timer(&mut self, timer_id: TimerId, ctx: &mut dyn Ctx<ConcreteMsg<Command>>) {
         let mut st = self.state.borrow_mut();
         if timer_id == KICKOFF_TIMER {
             // Fired by `SmrCluster::submit` to kick off the very first
@@ -791,7 +783,7 @@ impl Node<ConcreteMsg<Command>> for SmrNode {
     /// `crate::cluster`'s module docs) -- restart catch-up is what keeps
     /// that "everything decided so far" bound tight, not what makes P10
     /// hold in the first place.
-    fn on_restart(&mut self, ctx: &mut NodeCtx<'_, ConcreteMsg<Command>>) {
+    fn on_restart(&mut self, ctx: &mut dyn Ctx<ConcreteMsg<Command>>) {
         let mut st = self.state.borrow_mut();
         st.queue.clear();
         st.current_attempt = None;

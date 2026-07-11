@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use queso_sim::fault::DropReason;
 use queso_sim::ids::{NodeId, TimerId};
-use queso_sim::node::{Node, NodeCtx};
+use queso_sim::node::{Ctx, Node};
 use queso_sim::scheduler::{Fifo, RandomScheduler, SchedulerKind};
 use queso_sim::trace::TraceEvent;
 use queso_sim::Kernel;
@@ -22,13 +22,13 @@ struct Sink {
 }
 
 impl Node<u64> for Sink {
-    fn on_message(&mut self, _from: NodeId, payload: u64, _ctx: &mut NodeCtx<'_, u64>) {
+    fn on_message(&mut self, _from: NodeId, payload: u64, _ctx: &mut dyn Ctx<u64>) {
         self.log.borrow_mut().push(payload);
     }
 
-    fn on_timer(&mut self, _timer_id: TimerId, _ctx: &mut NodeCtx<'_, u64>) {}
+    fn on_timer(&mut self, _timer_id: TimerId, _ctx: &mut dyn Ctx<u64>) {}
 
-    fn on_restart(&mut self, _ctx: &mut NodeCtx<'_, u64>) {
+    fn on_restart(&mut self, _ctx: &mut dyn Ctx<u64>) {
         *self.restarts.borrow_mut() += 1;
     }
 }
