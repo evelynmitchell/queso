@@ -85,4 +85,4 @@ pub mod transport;
 pub mod wire;
 
 pub use config::NodeConfig;
-pub use driver::run_node;
+pub use driver::{run_node, run_node_with_listeners};

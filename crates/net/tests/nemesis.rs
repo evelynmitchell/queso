@@ -251,6 +251,22 @@ async fn isolating_the_leader_lets_the_majority_keep_deciding() {
         assert_eq!(outcome, Outcome::Get(Some(i as i64)));
     }
 
+    // Anti-vacuous check: prove the leader was *actually* isolated, not that
+    // the writes happened to complete while the partition silently no-op'd.
+    // The only partition active in this test isolates node 0 (the leader),
+    // so every partition drop is a leader-crossing frame that was really cut
+    // off -- both the leader's own dialers (leader -> peers) and the two
+    // majority replicas' RecordRequests to the leader-as-recorder. Without
+    // this, the test would pass identically even if `Nemesis::isolate` were a
+    // no-op (a real weakness this assertion closes).
+    let stats = nemesis.stats();
+    assert!(
+        stats.partition_drops > 0,
+        "the leader-isolation partition must have actually dropped peer frames \
+         crossing the split -- otherwise this test proves nothing about \
+         leader-DoS tolerance; got {stats:?}"
+    );
+
     nemesis.heal();
 }
 
@@ -363,11 +379,15 @@ async fn adversarial_load_stays_safe_and_shows_measurable_degradation() {
     // -- but deliberately no partition, so the whole cluster stays
     // majority-connected throughout and every operation should eventually
     // land, just slower and with some retries.
+    // drop_prob high enough that `total_drops() > 0` below is effectively
+    // certain over the hundreds of peer frames a 16-write run generates
+    // (0.9^100 ~= 3e-5), while still leaving the cluster majority-connected
+    // and live (no partition) so every write eventually lands.
     let nemesis = Arc::new(Nemesis::new(
         FaultPlan::seeded(99)
             .with_latency(Duration::from_millis(5), Duration::from_millis(5))
-            .with_drop_prob(0.02)
-            .with_reset_prob(0.002),
+            .with_drop_prob(0.1)
+            .with_reset_prob(0.01),
     ));
     let degraded_addrs = spawn_cluster_with_nemesis(3, Some(NodeId(0)), Arc::clone(&nemesis));
     let degraded_client = Arc::new(Client::with_config(
@@ -401,34 +421,39 @@ async fn adversarial_load_stays_safe_and_shows_measurable_degradation() {
         concurrency * ops_per_worker
     );
 
-    // Measurable degradation: deliberately checked as an *absolute* floor
-    // on the degraded run, not a ratio against baseline. A ratio against a
-    // separately-run baseline cluster sounds more rigorous, but both
-    // clusters are real OS threads/processes sharing this machine with
-    // whatever else `cargo test` is running concurrently -- when this test
-    // binary's other multi-threaded tokio tests happen to be mid-cluster-
-    // boot at the same moment `baseline`'s window runs, baseline's own
-    // latency can spike enough to make a *relative* comparison flaky
-    // (observed in practice while developing this test). The absolute
-    // floor sidesteps that: every successfully delivered frame under the
-    // fault plan above waits at least `latency` (5ms) before being
-    // written, a Put needs at least one such delayed `RecordRequest` and
-    // one delayed `RecordResponse` to ever complete at all (see
-    // `crate::nemesis`'s docs -- `LinkAction::Drop`/`ResetConnection`
-    // frames skip the delay entirely, but then the op doesn't complete on
-    // that attempt either), so 15ms is a conservative structural lower
-    // bound given this plan's configured latency -- not a tuned-to-pass
-    // magic number. `baseline_summary` is still measured and printed above
-    // for a human comparing the two runs (the "measure ... vs baseline"
-    // ask), just not load-bearing for this assertion's pass/fail.
-    const DEGRADED_LATENCY_FLOOR_US: f64 = 15_000.0;
+    // The fault plan actually fired -- the crucial anti-vacuous check.
+    //
+    // An earlier version of this test asserted an absolute 15ms floor on the
+    // *degraded run's mean latency*. That was meaningless: per-RPC fsync (see
+    // this crate's README's "Honest limits") already makes baseline mean
+    // latency 80-260ms with zero faults, so the 15ms floor was satisfied
+    // unconditionally and would have passed even with the nemesis fully
+    // neutered -- it proved nothing about whether any fault occurred. Assert
+    // instead directly on the nemesis's own count of faults *applied to real
+    // frames*: `delays_applied` is deterministic (every peer frame in this
+    // degraded run waits the configured 5ms+jitter, so it is reliably
+    // nonzero), which alone defeats the "silently no-op'd nemesis still
+    // passes" failure mode; `total_drops` additionally confirms the drop
+    // path fired (near-certain given the drop probability over the hundreds
+    // of peer frames a 16-write run generates -- and if it ever didn't, the
+    // liveness/safety assertions below still hold, so this is a proof-of-fault
+    // signal, not a source of flakiness for the properties that matter).
+    let stats = nemesis.stats();
     assert!(
-        degraded_summary.overall.mean_us >= DEGRADED_LATENCY_FLOOR_US,
-        "expected fault-injected mean write latency to reflect the injected \
-         5ms+jitter per-frame delay (floor {DEGRADED_LATENCY_FLOOR_US}us): \
-         baseline mean={:.1}us degraded mean={:.1}us",
-        baseline_summary.overall.mean_us,
-        degraded_summary.overall.mean_us
+        stats.delays_applied > 0,
+        "the configured 5ms+jitter latency must have been applied to real \
+         peer frames -- otherwise the 'degraded' run was not actually \
+         degraded and this test proves nothing; got {stats:?}"
+    );
+    assert!(
+        stats.total_drops() > 0,
+        "the configured drop_prob must have dropped at least one real peer \
+         frame over the run; got {stats:?}"
+    );
+    eprintln!(
+        "faults applied: {stats:?}\n\
+         baseline mean={:.1}us  degraded mean={:.1}us",
+        baseline_summary.overall.mean_us, degraded_summary.overall.mean_us
     );
 
     // Safety, the whole point of this test: every write the cluster

@@ -99,6 +99,7 @@
 //! carries for workload shape (see `src/bin/queso-bench.rs`'s docs).
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -192,6 +193,54 @@ struct Inner {
     rng: StdRng,
 }
 
+/// Running tallies of faults this nemesis has *actually applied* to real
+/// outbound frames, kept as atomics outside the [`Inner`] mutex so a test
+/// can read them without contending on fault decisions. Snapshot via
+/// [`Nemesis::stats`].
+#[derive(Debug, Default)]
+struct FaultCounters {
+    partition_drops: AtomicU64,
+    prob_drops: AtomicU64,
+    resets: AtomicU64,
+    delays_applied: AtomicU64,
+}
+
+/// A point-in-time snapshot of how many faults a [`Nemesis`] has applied to
+/// outbound peer frames since it was built (see [`Nemesis::stats`]).
+///
+/// This exists so a fault-injection test can prove a fault *actually fired*
+/// rather than passing vacuously: a partition/drop/reset/latency plan that
+/// silently no-op'd (a bug in the nemesis, the transport hook, or the test's
+/// own wiring) would leave the relevant counter at zero, so asserting it is
+/// nonzero is what distinguishes "the cluster survived a real fault" from
+/// "the fault never happened and the test proved nothing".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FaultStats {
+    /// Frames dropped specifically because their `(from, to)` pair crossed
+    /// an active [`Nemesis::partition`]/[`Nemesis::isolate`] split.
+    pub partition_drops: u64,
+    /// Frames dropped by an ambient `drop_prob` roll (not a partition).
+    pub prob_drops: u64,
+    /// Frames that forced a connection reset via `reset_prob`.
+    pub resets: u64,
+    /// Frames that had a nonzero latency/jitter delay applied before send.
+    pub delays_applied: u64,
+}
+
+impl FaultStats {
+    /// Total frames dropped, whether by partition or by probability.
+    pub fn total_drops(&self) -> u64 {
+        self.partition_drops + self.prob_drops
+    }
+
+    /// True if this nemesis has applied *any* fault at all -- the basic
+    /// "the plan actually fired" check a fault-injection test needs before
+    /// its safety/liveness assertions mean anything.
+    pub fn any_fault_applied(&self) -> bool {
+        self.partition_drops + self.prob_drops + self.resets + self.delays_applied > 0
+    }
+}
+
 /// A shared, mutable fault-injection point for one cluster's peer traffic.
 /// Built once per test/bench scenario (typically wrapped in an `Arc`, since
 /// every replica's [`crate::transport::spawn_peer_dialer`] task holds a
@@ -201,6 +250,7 @@ struct Inner {
 /// full fault model and determinism caveats.
 pub struct Nemesis {
     inner: Mutex<Inner>,
+    counters: FaultCounters,
 }
 
 impl std::fmt::Debug for Nemesis {
@@ -225,6 +275,20 @@ impl Nemesis {
                 reset_prob: plan.reset_prob.clamp(0.0, 1.0),
                 rng: StdRng::seed_from_u64(plan.seed),
             }),
+            counters: FaultCounters::default(),
+        }
+    }
+
+    /// Snapshot how many faults this nemesis has actually applied to real
+    /// outbound frames so far (see [`FaultStats`]). Tests use this to assert
+    /// a fault genuinely fired, so a partition/drop/latency scenario can't
+    /// pass vacuously.
+    pub fn stats(&self) -> FaultStats {
+        FaultStats {
+            partition_drops: self.counters.partition_drops.load(Ordering::Relaxed),
+            prob_drops: self.counters.prob_drops.load(Ordering::Relaxed),
+            resets: self.counters.resets.load(Ordering::Relaxed),
+            delays_applied: self.counters.delays_applied.load(Ordering::Relaxed),
         }
     }
 
@@ -296,12 +360,17 @@ impl Nemesis {
     pub fn decide(&self, from: NodeId, to: NodeId) -> LinkAction {
         let mut inner = self.inner.lock().unwrap();
         if Self::partitioned_locked(&inner, from, to) {
+            self.counters
+                .partition_drops
+                .fetch_add(1, Ordering::Relaxed);
             return LinkAction::Drop;
         }
         if inner.reset_prob > 0.0 && inner.rng.gen::<f64>() < inner.reset_prob {
+            self.counters.resets.fetch_add(1, Ordering::Relaxed);
             return LinkAction::ResetConnection;
         }
         if inner.drop_prob > 0.0 && inner.rng.gen::<f64>() < inner.drop_prob {
+            self.counters.prob_drops.fetch_add(1, Ordering::Relaxed);
             return LinkAction::Drop;
         }
         LinkAction::Send
@@ -324,7 +393,11 @@ impl Nemesis {
             let millis = inner.rng.gen_range(0..=jitter_ms);
             Duration::from_millis(millis)
         };
-        inner.latency + jitter
+        let total = inner.latency + jitter;
+        if !total.is_zero() {
+            self.counters.delays_applied.fetch_add(1, Ordering::Relaxed);
+        }
+        total
     }
 }
 
@@ -465,6 +538,50 @@ mod tests {
             seq1.contains(&LinkAction::Send),
             "a 0.5 drop_prob run of 200 draws should have sent at least once"
         );
+    }
+
+    #[test]
+    fn stats_count_faults_actually_applied() {
+        let (a, b, c) = (NodeId(0), NodeId(1), NodeId(2));
+
+        // A clean nemesis applies nothing -- the vacuous-pass baseline every
+        // acceptance test's `stats()` assertion is guarding against.
+        let clean = Nemesis::new(FaultPlan::seeded(1));
+        for _ in 0..10 {
+            clean.decide(a, b);
+            clean.delay(a, b);
+        }
+        assert!(!clean.stats().any_fault_applied());
+        assert_eq!(clean.stats(), FaultStats::default());
+
+        // Partition drops are attributed to `partition_drops`, and only for
+        // pairs that actually cross the split.
+        let part = Nemesis::new(FaultPlan::seeded(1));
+        part.isolate(a, [a, b, c]);
+        part.decide(a, b); // crosses -> partition drop
+        part.decide(b, a); // crosses -> partition drop
+        part.decide(b, c); // same side -> Send, not counted
+        let s = part.stats();
+        assert_eq!(s.partition_drops, 2);
+        assert_eq!(s.prob_drops, 0);
+        assert_eq!(s.total_drops(), 2);
+        assert!(s.any_fault_applied());
+
+        // Probabilistic drop, reset, and latency each land in their own bucket.
+        let always_drop = Nemesis::new(FaultPlan::seeded(2).with_drop_prob(1.0));
+        always_drop.decide(a, b);
+        assert_eq!(always_drop.stats().prob_drops, 1);
+        assert_eq!(always_drop.stats().partition_drops, 0);
+
+        let always_reset = Nemesis::new(FaultPlan::seeded(3).with_reset_prob(1.0));
+        always_reset.decide(a, b);
+        assert_eq!(always_reset.stats().resets, 1);
+
+        let latent = Nemesis::new(
+            FaultPlan::seeded(4).with_latency(Duration::from_millis(5), Duration::ZERO),
+        );
+        latent.delay(a, b);
+        assert_eq!(latent.stats().delays_applied, 1);
     }
 
     #[test]

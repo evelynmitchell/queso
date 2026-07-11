@@ -105,6 +105,31 @@ pub enum Event {
 /// loop. Only returns on a fatal setup error (failing to bind a listen
 /// address); once the loop starts, it runs until the process is killed.
 pub async fn run_node(config: NodeConfig) -> anyhow::Result<()> {
+    // Bind both listeners up front, then hand them to the shared body. A
+    // caller that needs a *gap-free* bind (e.g. an in-process test cluster
+    // picking ephemeral ports without a probe-then-rebind TOCTOU) uses
+    // [`run_node_with_listeners`] directly instead.
+    let peer_listener = TcpListener::bind(config.listen_addr).await?;
+    info!(id = ?config.id, addr = %config.listen_addr, "listening for peers");
+    let client_listener = TcpListener::bind(config.client_listen_addr).await?;
+    info!(id = ?config.id, addr = %config.client_listen_addr, "listening for clients");
+    run_node_with_listeners(config, peer_listener, client_listener).await
+}
+
+/// Like [`run_node`], but drives the node over two already-bound listeners
+/// instead of binding `config.listen_addr`/`config.client_listen_addr`
+/// itself. This exists so an in-process cluster (tests/benches) can bind
+/// ephemeral ports and keep the listeners open continuously — no
+/// probe-a-free-port-then-drop-then-rebind window for another thread to
+/// steal the port in (the `free_addr` TOCTOU). The two listeners should be
+/// the ones bound to `config.listen_addr`/`config.client_listen_addr`
+/// respectively (peers still dial `config.peers`, so those addresses must
+/// match what the peer listener is actually bound to).
+pub async fn run_node_with_listeners(
+    config: NodeConfig,
+    peer_listener: TcpListener,
+    client_listener: TcpListener,
+) -> anyhow::Result<()> {
     let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<Event>();
 
     // One outbound queue per *other* replica -- a replica never *dials*
@@ -127,12 +152,7 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<()> {
         transport::spawn_peer_dialer(config.id, peer_id, addr.clone(), rx, config.nemesis.clone());
     }
 
-    let peer_listener = TcpListener::bind(config.listen_addr).await?;
-    info!(id = ?config.id, addr = %config.listen_addr, "listening for peers");
     tokio::spawn(transport::accept_peers(peer_listener, inbox_tx.clone()));
-
-    let client_listener = TcpListener::bind(config.client_listen_addr).await?;
-    info!(id = ?config.id, addr = %config.client_listen_addr, "listening for clients");
     tokio::spawn(client::accept_clients(client_listener, inbox_tx.clone()));
 
     // Durability across a real restart (issue #36, P9/P12) -- see this
