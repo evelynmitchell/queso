@@ -361,8 +361,11 @@ plus the `queso-bench` load generator with throughput/latency metrics
 
 - session/seq management beyond A6's one-in-flight-per-`ClientId` minimum,
   connection pooling/reuse, or pipelining in the client library;
-- comparisons against alternative systems — Phase 7.5 (this crate's
-  `--output json`/`csv` exist so those runs have something to diff against);
+- comparisons against alternative systems — this crate's `--output
+  json`/`csv` exist so those runs have something to diff against, but the
+  actual comparison harness (`queso-compare`) and methodology live in the
+  new `crates/compare` crate, kept separate so this crate's own build/lints
+  stay untouched by it — see `docs/compare-etcd.md` (Phase 7.5, issue #35);
 - TLS — Phase 7 (A3's content-oblivious-adversary assumption is not
   realized over the wire yet);
 - group-commit/batched fsync, incremental WAL + compaction (durability is

@@ -1,0 +1,47 @@
+[package]
+name = "queso-compare"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Phase 7.5: a common workload/metrics harness that drives Queso and an alternative (etcd/Raft) through the exact same request mix, so their behavior under normal load and leader-DoS can be compared apples-to-apples."
+
+# Like `queso-net` (its only path dependency), this crate is real-I/O
+# boundary code -- real wall-clock time, real sockets, real OS entropy is
+# exactly its job (driving/measuring live systems), not a determinism bug.
+# It deliberately does NOT import `[workspace.lints]`: that lint set (no
+# `Instant::now`, no ambient randomness, no `HashMap`) is a property of the
+# sim-verified core (`queso-sim`/`queso-consensus`/`queso-smr`) only. This
+# crate depends on `queso-net`/`queso-smr`/`queso-sim` (path deps, already
+# workspace members) but never on `queso-consensus` directly and never
+# touches sim/consensus/smr *logic* -- see `docs/compare-etcd.md`.
+#
+# Dependency footprint note (see that doc's "what got added" section): the
+# only dependency here that isn't already part of `queso-net`'s own tree is
+# `reqwest` (TLS features disabled -- this crate only ever speaks plain HTTP
+# to etcd's gRPC-gateway JSON API, see `src/etcd_target.rs`) and `base64`
+# (tiny, no transitive deps) for that same gateway's key/value encoding.
+# `etcd-client` (the "real" gRPC client) was evaluated and rejected: it
+# fetches fine from crates.io, but its build script shells out to `protoc`
+# (via `prost-build`/`tonic-build`), an external system binary this
+# workspace does not otherwise depend on and cannot assume CI/every
+# contributor's machine has -- see `docs/compare-etcd.md` for the full
+# writeup of that decision.
+
+[dependencies]
+queso-net = { path = "../net" }
+queso-smr = { path = "../smr", features = ["serde"] }
+queso-sim = { path = "../sim", features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+base64 = "0.22"
+serde = { workspace = true }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
