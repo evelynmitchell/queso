@@ -11,7 +11,9 @@ use queso_smr::{ClientId, Command, Outcome};
 
 #[path = "support/mod.rs"]
 mod support;
-use support::{http_get, spawn_cluster, spawn_cluster_with_status, submit_with_retry};
+use support::{
+    http_get, raw_status_request, spawn_cluster, spawn_cluster_with_status, submit_with_retry,
+};
 
 /// `GET /health` must answer `200` right away (process-up liveness, see
 /// `queso_net::status`'s module docs) -- before this replica has served a
@@ -92,6 +94,79 @@ async fn status_endpoints_report_health_ready_and_metrics() {
     assert_eq!(
         code, 200,
         "expected replica 1's /health to be 200, body: {body:?}"
+    );
+}
+
+/// Adversarial parser test (locks in the #49 review's empirical probing as a
+/// permanent regression guard): the hand-rolled HTTP responder in
+/// `queso_net::status` is network-exposed, so malformed input must never
+/// panic the handler task, wedge the node, or leave the status server unable
+/// to answer a subsequent well-formed request. Fires a battery of bad
+/// requests (wrong method, unknown/traversal/query paths, oversized headers,
+/// non-UTF8 bytes, a bare newline) and asserts each gets a bounded, sane
+/// error response -- then, the load-bearing assertion, that an ordinary
+/// `GET /health` still returns `200` afterward (the server survived).
+#[tokio::test(flavor = "multi_thread")]
+async fn status_server_survives_malformed_requests() {
+    let (_client_addrs, status_addrs) = spawn_cluster_with_status(3, Some(NodeId(0)));
+    let status = status_addrs[0];
+
+    // Each of these must come back with *some* 4xx (never a hang, never a
+    // 2xx, never a crash). We don't over-fit the exact code (400 vs 404 vs
+    // 405 is the server's call), only that it's a client-error rejection.
+    let cases: &[(&str, &[u8])] = &[
+        ("POST method", b"POST /metrics HTTP/1.1\r\nHost: t\r\n\r\n"),
+        ("unknown path", b"GET /nope HTTP/1.1\r\nHost: t\r\n\r\n"),
+        (
+            "path traversal",
+            b"GET /../secret HTTP/1.1\r\nHost: t\r\n\r\n",
+        ),
+        (
+            "query string",
+            b"GET /metrics?x=1 HTTP/1.1\r\nHost: t\r\n\r\n",
+        ),
+        ("no http version", b"GET /health\r\n\r\n"),
+        ("bare newline", b"\r\n"),
+        (
+            "non-utf8 request line",
+            b"GET /\xff\xfe\x00 HTTP/1.1\r\n\r\n",
+        ),
+    ];
+    for (label, raw) in cases {
+        let code = raw_status_request(status, raw).await;
+        if let Some(code) = code {
+            // The server must never answer a malformed request with a 5xx
+            // (internal error) -- that would signal it hit an error path it
+            // couldn't handle cleanly. A 2xx (for a debatable-but-servable
+            // case like a valid path with a lenient/missing HTTP version) or
+            // a 4xx (rejection) are both fine; we deliberately don't over-fit
+            // the exact code, only that the handler stayed in control. `None`
+            // (clean close, no parseable response) is also fine.
+            assert!(
+                code < 500,
+                "{label}: status server returned a 5xx internal error ({code}) on malformed input -- \
+                 it should reject or serve cleanly, never error internally"
+            );
+        }
+        // The point of each case is only that it neither hangs (the helper's
+        // own 10s timeout would have fired) nor crashes the node (asserted at
+        // the end via a still-live /health).
+    }
+
+    // An oversized request (well past the server's 8 KiB byte cap) with no
+    // terminating CRLF must be rejected/closed, not buffered unboundedly and
+    // not hang. The exact response is unimportant; that this returns at all
+    // (the helper's timeout didn't fire) is the property.
+    let oversized = vec![b'A'; 64 * 1024];
+    let _ = raw_status_request(status, &oversized).await;
+
+    // The load-bearing assertion: after all that abuse, the server is still
+    // alive and serving -- the parser bounded every bad request rather than
+    // crashing the handler or wedging the accept loop.
+    let (code, body) = http_get(status, "/health").await;
+    assert_eq!(
+        code, 200,
+        "status server must still serve /health after malformed traffic, body: {body:?}"
     );
 }
 

@@ -450,3 +450,34 @@ pub async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
 
     (status_code, body)
 }
+
+/// Send arbitrary (possibly malformed) bytes to the status server and return
+/// the HTTP status code it answered with, or `None` if it closed the
+/// connection without a parseable HTTP response (e.g. a request the server
+/// timed out waiting to terminate). Used by `tests/status.rs`'s adversarial
+/// parser test to confirm no malformed input crashes or wedges the node.
+/// Wrapped in a client-side timeout so a hung server surfaces as a test
+/// failure, not a hung test.
+pub async fn raw_status_request(addr: SocketAddr, raw: &[u8]) -> Option<u16> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let fut = async {
+        let mut stream = TcpStream::connect(addr).await.ok()?;
+        stream.write_all(raw).await.ok()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.ok()?;
+        let text = String::from_utf8_lossy(&response);
+        text.lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+    };
+    // 10s is well past the server's own 5s request timeout; if this fires the
+    // server hung, which is itself the failure the caller wants to catch.
+    tokio::time::timeout(Duration::from_secs(10), fut)
+        .await
+        .expect(
+            "status server did not respond to (or close) a raw request within 10s -- possible hang",
+        )
+}
