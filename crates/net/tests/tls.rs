@@ -397,10 +397,22 @@ async fn client_tls_refuses_a_server_cert_signed_by_the_wrong_ca() {
         key: 1,
     };
     let server_name = server_name_for("127.0.0.1", None);
-    let result = client::submit_with_tls(addr, &get, &client_tls, server_name).await;
+    // Bounded so a *regression* (the client wrongly accepting the server's
+    // cert, then the bare acceptor -- which never drains its inbox -- leaving
+    // the submit awaiting a response that never comes) fails fast and
+    // diagnostically here, rather than hanging until CI's global test timeout
+    // kills the whole binary. A correct refusal returns `Ok(Err(_))` (the
+    // handshake was rejected); a timeout (`Err(Elapsed)`) or a success
+    // (`Ok(Ok(_))`) are both the failure this test guards against.
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client::submit_with_tls(addr, &get, &client_tls, server_name),
+    )
+    .await;
     assert!(
-        result.is_err(),
+        matches!(result, Ok(Err(_))),
         "a client trusting only an unrelated CA must refuse to talk to a replica whose \
-         server cert was signed by a different CA, but the TLS handshake (and submit) succeeded"
+         server cert was signed by a different CA (expected a rejected handshake, i.e. \
+         Ok(Err(_))), got: {result:?}"
     );
 }
