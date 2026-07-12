@@ -48,7 +48,9 @@ use tokio::task::JoinSet;
 
 #[path = "support/mod.rs"]
 mod support;
-use support::{spawn_cluster_with_persist_hooks, submit_with_retry};
+use support::{
+    spawn_cluster_with_leader_persist_delay, spawn_cluster_with_persist_hooks, submit_with_retry,
+};
 
 fn put(client: u32, seq: u64, key: u32, value: i64) -> Command {
     Command::Put {
@@ -75,18 +77,26 @@ fn get(client: u32, seq: u64, key: u32) -> Command {
 /// a future refactor swapped `store.persist(...).await` and
 /// `ctx.flush_outbound()`.
 ///
-/// Mechanism: every replica's blocking snapshot write is made artificially
-/// slow by a fixed, generous `delay` (`NodeConfig::persist_delay`). If
-/// write-before-reply holds, a client cannot receive a durable-mutating
-/// op's `Outcome` any faster than that delay: the reply is buffered
-/// (`RealCtx::pending_outbound`, never sent synchronously from inside
-/// `Ctx::send`) and is only ever released by `flush_outbound`, which the
-/// driver's loop only reaches *after* `store.persist(...).await` resolves
-/// -- and `persist` cannot resolve before the sleep it injected into the
-/// write finishes. If a regression reordered those two calls (or otherwise
-/// let a reply race ahead of its durable write), the reply would leave at
-/// ordinary network-round-trip speed, completely independent of the
-/// artificial disk delay, and the lower-bound assertion below would fail.
+/// Mechanism: **only the leader's** blocking snapshot write is made
+/// artificially slow by a fixed, generous `delay`
+/// (`spawn_cluster_with_leader_persist_delay`). Delaying only the leader is
+/// what makes this assertion *isolating*: a client's durable-mutating
+/// `Outcome` is dispatched by the leader (`driver.rs`'s completed-ops loop,
+/// a direct `oneshot::Sender::send` -- NOT routed through `flush_outbound`)
+/// strictly after that batch's decisive `store.persist(...).await`, so a
+/// client cannot receive the `Outcome` any faster than the leader's own
+/// decisive persist takes -- i.e. `>= delay`. If every replica were delayed
+/// instead, an *unrelated* fsync on the reorder-independent recorder-request
+/// path would already floor a decision at `>= delay`, and the assertion
+/// would pass even against a genuine reply-before-persist reordering (a
+/// vacuous test); with only the leader delayed, the sole remaining source of
+/// a `>= delay` client-`Outcome` latency is exactly the ordering under test.
+/// If a regression released the `Outcome` (or the peer flush) before the
+/// decisive persist, it would leave at ordinary network-round-trip speed,
+/// independent of the artificial disk delay, and this lower bound would
+/// fail. (The `assert!(released_ok, ...)` guards in `driver.rs`'s loop are
+/// the primary, always-on defense of the same invariant -- this end-to-end
+/// test is the black-box corroboration.)
 ///
 /// A warm-up `Put` runs first (and is excluded from the timed measurement)
 /// so cluster-formation/connection-dialing latency -- unrelated to this
@@ -96,7 +106,7 @@ fn get(client: u32, seq: u64, key: u32) -> Command {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_before_reply_holds_even_when_the_fsync_is_slow() {
     let delay = Duration::from_millis(250);
-    let client_addrs = spawn_cluster_with_persist_hooks(3, Some(NodeId(0)), delay, None, None);
+    let client_addrs = spawn_cluster_with_leader_persist_delay(3, Some(NodeId(0)), delay);
     let timeout = Duration::from_secs(20);
 
     let warmup = submit_with_retry(client_addrs[0], &put(1, 0, 1, 1), timeout).await;
@@ -149,13 +159,28 @@ fn driver_source_persists_before_it_flushes_outbound_in_the_loop() {
     let flush_pos = loop_body
         .find("ctx.flush_outbound();")
         .expect("the event loop must call `ctx.flush_outbound()` somewhere in its body");
+    // The client `Outcome` dispatch travels a *different* path than the peer
+    // flush -- a direct `oneshot::Sender::send`, not `flush_outbound` -- so
+    // its position relative to the persist must be pinned separately (this is
+    // the path the #48 review found had no ordering guard at all).
+    let resp_send_pos = loop_body
+        .find("resp.send(outcome)")
+        .expect("the event loop must dispatch a completed op's Outcome via `resp.send(outcome)`");
     assert!(
         persist_pos < flush_pos,
         "queso_net::driver::run_node's event loop must call `store.persist(...)` (the \
          write-before-reply fsync) strictly before `ctx.flush_outbound()` -- found persist at \
          loop-relative byte {persist_pos}, flush at {flush_pos}. This is a purely textual \
          tripwire; see `write_before_reply_holds_even_when_the_fsync_is_slow` for the real \
-         behavioral proof of the same property."
+         behavioral proof, and the `assert!(released_ok, ...)` guards in driver.rs for the \
+         always-on runtime one."
+    );
+    assert!(
+        persist_pos < resp_send_pos,
+        "queso_net::driver::run_node's event loop must call `store.persist(...)` strictly before \
+         it dispatches a completed op's `Outcome` to its client via `resp.send(outcome)` -- found \
+         persist at loop-relative byte {persist_pos}, resp.send at {resp_send_pos}. A client must \
+         never learn its op succeeded before that success is durable (issue #36)."
     );
 }
 

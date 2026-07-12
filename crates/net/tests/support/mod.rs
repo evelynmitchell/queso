@@ -57,7 +57,7 @@ pub fn fresh_data_dir() -> PathBuf {
 /// Boot an `n`-node cluster, each replica on its own thread + tokio
 /// runtime, and return every replica's client-facing address.
 pub fn spawn_cluster(n: usize, leader: Option<NodeId>) -> Vec<SocketAddr> {
-    spawn_cluster_inner(n, leader, None, Duration::ZERO, None, None)
+    spawn_cluster_inner(n, leader, None, Duration::ZERO, false, None, None)
 }
 
 /// Like [`spawn_cluster`], but every replica shares `nemesis` (Phase 7.4,
@@ -71,7 +71,7 @@ pub fn spawn_cluster_with_nemesis(
     leader: Option<NodeId>,
     nemesis: Arc<Nemesis>,
 ) -> Vec<SocketAddr> {
-    spawn_cluster_inner(n, leader, Some(nemesis), Duration::ZERO, None, None)
+    spawn_cluster_inner(n, leader, Some(nemesis), Duration::ZERO, false, None, None)
 }
 
 /// Like [`spawn_cluster`], but every replica's [`queso_net::persist::Store`]
@@ -97,16 +97,38 @@ pub fn spawn_cluster_with_persist_hooks(
         leader,
         None,
         persist_delay,
+        false,
         save_counter,
         durable_event_counter,
     )
 }
 
+/// Like [`spawn_cluster_with_persist_hooks`], but the artificial
+/// `persist_delay` is injected into **only the leader's** `Store`, every
+/// other replica's staying at `Duration::ZERO`. This is what makes
+/// `tests/group_commit.rs`'s write-before-reply timing lower-bound
+/// *isolating*: with every replica delayed uniformly, the unavoidable
+/// recorder-round-trip fsync on the (reorder-independent) request path
+/// already floors a decision's latency at `>= delay`, so the assertion
+/// passes even against a genuine reply-before-persist reordering. Delaying
+/// only the leader removes that confound -- the sole remaining source of a
+/// `>= delay` client-`Outcome` latency is the leader's own *decisive*
+/// persist, exactly the ordering the test means to prove.
+pub fn spawn_cluster_with_leader_persist_delay(
+    n: usize,
+    leader: Option<NodeId>,
+    persist_delay: Duration,
+) -> Vec<SocketAddr> {
+    spawn_cluster_inner(n, leader, None, persist_delay, true, None, None)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_cluster_inner(
     n: usize,
     leader: Option<NodeId>,
     nemesis: Option<Arc<Nemesis>>,
     persist_delay: Duration,
+    persist_delay_leader_only: bool,
     save_counter: Option<Arc<AtomicU64>>,
     durable_event_counter: Option<Arc<AtomicU64>>,
 ) -> Vec<SocketAddr> {
@@ -139,6 +161,14 @@ fn spawn_cluster_inner(
     let data_dir = fresh_data_dir();
     let listeners = peer_listeners.into_iter().zip(client_listeners);
     for (i, (peer_listener, client_listener)) in listeners.enumerate() {
+        // When `persist_delay_leader_only`, only the leader replica gets the
+        // artificial delay (see `spawn_cluster_with_leader_persist_delay`);
+        // otherwise every replica gets it.
+        let this_persist_delay = if persist_delay_leader_only && leader != Some(NodeId(i as u32)) {
+            Duration::ZERO
+        } else {
+            persist_delay
+        };
         let config = NodeConfig {
             id: NodeId(i as u32),
             listen_addr: peer_addrs[i],
@@ -150,7 +180,7 @@ fn spawn_cluster_inner(
             seed: 1_000 + i as u64,
             data_dir: data_dir.clone(),
             nemesis: nemesis.clone(),
-            persist_delay,
+            persist_delay: this_persist_delay,
             save_counter: save_counter.clone(),
             durable_event_counter: durable_event_counter.clone(),
         };

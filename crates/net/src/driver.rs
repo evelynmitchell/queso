@@ -367,11 +367,31 @@ pub async fn run_node_with_listeners(
         // write itself running on a `spawn_blocking` thread -- see this
         // module's "Group commit"/"Async fsync offload" docs and
         // `crate::persist`'s.
+        // Write-before-reply invariant guard. `released_ok` is false for a
+        // batch that mutated durable state until that state has actually been
+        // persisted+fsync'd; it is asserted immediately before *every* point
+        // below that can release something this batch produced (the peer/
+        // self-loopback flush here, and each client `Outcome` in the
+        // completed-ops loop further down). This is a real runtime check of
+        // the safety-critical P12 ordering -- not a comment, not a textual
+        // source tripwire -- so a future refactor that moved a release ahead
+        // of the persist (either the flush, or the separately-dispatched
+        // client `Outcome`, which travels a *different* path: a direct
+        // `oneshot::Sender::send`, not `flush_outbound`) fails loudly here
+        // instead of silently reintroducing issue #36. Kept as `assert!`, not
+        // `debug_assert!`, deliberately: a durability-ordering breach is
+        // exactly the kind of thing that should fail-stop even in release.
+        let mut released_ok = !batch_mutated_durable;
         if batch_mutated_durable {
             let snapshot = node.durable_snapshot();
             let tick = batch_last_tick.expect("a batch that mutated durable state applied at least one event, which always sets batch_last_tick");
             store.persist(&snapshot, tick).await?;
+            released_ok = true;
         }
+        assert!(
+            released_ok,
+            "write-before-reply violated: flush_outbound reached before this batch's durable state was persisted"
+        );
         ctx.flush_outbound();
 
         // A submitted op usually completes several events later than the
@@ -401,6 +421,16 @@ pub async fn run_node_with_listeners(
                     ..
                 }) = node.result(op_id)
                 {
+                    // Same P12 guard as before `flush_outbound` above, on the
+                    // *client-ack* path specifically: a client must never be
+                    // told its op succeeded before that success is durable.
+                    // This dispatch is a direct `oneshot` send, not routed
+                    // through `flush_outbound`, so it needs its own explicit
+                    // check -- see `released_ok`'s definition above.
+                    assert!(
+                        released_ok,
+                        "write-before-reply violated: a client Outcome was about to be sent before this batch's durable state was persisted"
+                    );
                     let _ = resp.send(outcome);
                 }
             }
