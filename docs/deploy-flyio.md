@@ -13,10 +13,11 @@ private network, with durable state on a real persistent volume, reachable
 from the outside on a public TCP port for clients.
 
 **What this does NOT claim:** production-hardened operability. Everything
-in `crates/net/README.md`'s "Honest limits" section (per-RPC fsync not
-group-commit, whole-snapshot not incremental WAL, no reconfiguration, no
-log compaction, no TLS) is still true once this is running on fly --
-deploying it doesn't change what the binary itself guarantees. This
+in `crates/net/README.md`'s "Honest limits" section (whole-snapshot not
+incremental WAL, no reconfiguration, no log compaction, TLS opt-in and not
+enabled by default) is still true once this is running on fly -- deploying
+it doesn't change what the binary itself guarantees; see §12 below for
+TLS's status on this specific deployment target. This
 document is honest about what is and isn't verified below (see "What this
 runbook cannot verify" at the end) -- everything through `fly deploy`
 itself is concrete and was checked as far as this environment allows;
@@ -407,21 +408,44 @@ state afterward; this is intentionally destructive, matching "tear down").
 
 ## 12. TLS / A3 note
 
-`crates/net/README.md` documents that inter-replica and client traffic has
-no application-level TLS yet -- A3 (the content-oblivious-adversary
+`crates/net/README.md` documents A3 (the content-oblivious-adversary
 assumption the paper's randomized-liveness guarantees, P14/P15, depend on)
-is not realized over the wire *in this crate*. For **this specific
-deployment target**, that gap is closed a different way: all
-`.internal`/6PN traffic between fly machines in the same org is
-WireGuard-encrypted by fly's network layer itself, transparently, with no
-configuration on this crate's part -- satisfying A3's content-oblivious-link
-assumption for inter-replica traffic without needing this crate to add its
-own TLS. This does **not** cover the public client port (`8000`, exposed
-via `deploy/fly.toml`'s `[[services]]` block) -- a client connecting from
-outside fly's network still talks to a replica over plain TCP, unencrypted,
-exactly as `crates/net/README.md` describes. Adding client-side TLS
-(fly.io TLS-terminating proxy handlers, or app-level TLS in this crate)
-remains explicitly out of scope for this phase, per the issue.
+and Phase 8.2a's (issue #47) app-level TLS support for it -- read that
+section for the full design. For **this specific deployment target**,
+inter-replica traffic already has a different answer: all `.internal`/6PN
+traffic between fly machines in the same org is WireGuard-encrypted by
+fly's network layer itself, transparently, with no configuration on this
+crate's part -- satisfying A3's content-oblivious-link assumption for
+inter-replica traffic without needing this crate's own TLS. **TLS here is
+therefore optional, for defense-in-depth** (a second, independent layer
+against anyone who can see plaintext traffic *inside* fly's WireGuard mesh,
+e.g. a compromised sibling app in the same org) rather than required to
+close A3's gap on fly specifically.
+
+The public client port (`8000`, exposed via `deploy/fly.toml`'s
+`[[services]]` block) is the one traffic path fly's mesh never covers: a
+client connecting from outside fly's network still talks to a replica over
+plain TCP unless TLS is explicitly enabled. Two independent options here,
+not mutually exclusive: fly's own TLS-terminating proxy in front of the
+service (`[[services.ports]] handlers = ["tls"]` in `fly.toml` -- fly.io
+platform config, not this crate's concern) covers "traffic between the
+client and fly's edge, in the clear"; **this crate's own TLS**
+(`queso_net::tls`, see `crates/net/README.md`) covers "traffic all the way
+to the replica process," including the fly-edge-to-machine hop fly's proxy
+handler does not re-encrypt.
+
+To turn on this crate's TLS for a fly deployment: generate a cluster CA and
+one cert/key per replica (any TLS toolchain; `crates/net/README.md`'s TLS
+section has an `openssl` recipe), copy each replica's `cert.pem`/`key.pem`
+and the shared `ca.pem` onto its persistent volume (alongside `--data-dir`,
+or a second small volume) via `flyctl sftp`/a one-shot deploy step, and add
+`--tls-cert`/`--tls-key`/`--tls-ca` to that machine's `queso-node` command
+in `deploy/fly.toml`'s `[processes]`. Every replica's peer connections then
+run mTLS and its client port requires TLS, in addition to (not instead of)
+fly's own `.internal` WireGuard encryption. Not exercised end-to-end against
+a real fly account in this environment -- see §13's "what this runbook
+cannot verify" for the same caveat that already applies to the rest of this
+doc.
 
 ## 13. What this runbook cannot verify
 

@@ -30,21 +30,38 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use bytes::BytesMut;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use queso_smr::{Command, Outcome};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::warn;
 
 use crate::driver::Event;
+use crate::tls::{server_name_for, MaybeTlsStream};
 
 /// Accept client connections forever, spawning one task per connection
 /// (see [`serve_one_client`]).
-pub async fn accept_clients(listener: TcpListener, inbox: mpsc::UnboundedSender<Event>) {
+///
+/// `tls` (Phase 8.2a, `crate::tls`) is this replica's client-facing,
+/// server-authenticated-only TLS config (see
+/// `crate::tls::build_client_facing_server_tls`) -- `None` (every call site
+/// except a real `queso-node` run or test that opts in via
+/// `NodeConfig::tls`) skips the TLS handshake entirely. Unlike the peer
+/// acceptor (`crate::transport::accept_peers`), this never requires a
+/// client certificate -- end clients are not cluster members, see this
+/// module's docs.
+pub async fn accept_clients(
+    listener: TcpListener,
+    inbox: mpsc::UnboundedSender<Event>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+) {
     loop {
         let (stream, addr) = match listener.accept().await {
             Ok(x) => x,
@@ -55,8 +72,9 @@ pub async fn accept_clients(listener: TcpListener, inbox: mpsc::UnboundedSender<
         };
         let _ = stream.set_nodelay(true);
         let inbox = inbox.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve_one_client(stream, inbox).await {
+            if let Err(err) = serve_one_client(stream, inbox, tls).await {
                 warn!(%addr, %err, "client connection error");
             }
         });
@@ -66,7 +84,18 @@ pub async fn accept_clients(listener: TcpListener, inbox: mpsc::UnboundedSender<
 async fn serve_one_client(
     stream: TcpStream,
     inbox: mpsc::UnboundedSender<Event>,
+    tls: Option<Arc<rustls::ServerConfig>>,
 ) -> anyhow::Result<()> {
+    let stream: MaybeTlsStream = match tls {
+        None => MaybeTlsStream::Plain(stream),
+        Some(tls_config) => {
+            let tls_stream = TlsAcceptor::from(tls_config)
+                .accept(stream)
+                .await
+                .context("client-facing TLS handshake failed")?;
+            MaybeTlsStream::Tls(Box::new(tls_stream.into()))
+        }
+    };
     let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
     let Some(frame) = framed.next().await else {
         return Ok(()); // Client disconnected without sending anything.
@@ -98,9 +127,39 @@ async fn serve_one_client(
 /// enough to prove the real-TCP path end-to-end (see this crate's
 /// `tests/cluster.rs`); most real callers want [`Client::submit`] instead,
 /// which wraps exactly this call with a pool of addresses and
-/// retry-to-another-replica.
+/// retry-to-another-replica. Always plaintext -- see [`submit_with_tls`] for
+/// the Phase 8.2a TLS-capable equivalent.
 pub async fn submit(addr: SocketAddr, command: &Command) -> anyhow::Result<Outcome> {
     let stream = TcpStream::connect(addr).await?;
+    submit_over(MaybeTlsStream::Plain(stream), command).await
+}
+
+/// Like [`submit`], but establishes server-authenticated TLS (Phase 8.2a,
+/// `crate::tls`) over the connection before submitting `command` -- the
+/// handshake runs immediately after `TcpStream::connect`, before any
+/// application byte crosses the wire. `tls` should come from
+/// [`crate::tls::build_client_tls`]; `server_name` is the identity to
+/// present to the TLS handshake API (only actually checked against the
+/// presented cert when `tls` was built with
+/// [`crate::tls::ClientTlsConfig::expected_server_name`] set -- see that
+/// type's docs and [`crate::tls::server_name_for`]). A handshake failure
+/// (including the replica's cert not chaining to the configured CA) surfaces
+/// as an `Err` here, before `command` is ever sent.
+pub async fn submit_with_tls(
+    addr: SocketAddr,
+    command: &Command,
+    tls: &Arc<rustls::ClientConfig>,
+    server_name: rustls::pki_types::ServerName<'static>,
+) -> anyhow::Result<Outcome> {
+    let stream = TcpStream::connect(addr).await?;
+    let tls_stream = TlsConnector::from(tls.clone())
+        .connect(server_name, stream)
+        .await
+        .context("client TLS handshake failed")?;
+    submit_over(MaybeTlsStream::Tls(Box::new(tls_stream.into())), command).await
+}
+
+async fn submit_over(stream: MaybeTlsStream, command: &Command) -> anyhow::Result<Outcome> {
     let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
     let bytes = bincode::serialize(command)?;
     framed.send(bytes.into()).await?;
@@ -130,6 +189,23 @@ pub struct ClientConfig {
     /// outrun a cluster mid-election (say) doesn't spin-retry it into the
     /// ground.
     pub retry_backoff: Duration,
+    /// Phase 8.2a (issue #47): opt-in, server-authenticated TLS (see
+    /// `crate::tls`) for every dial this [`Client`] makes. `None` -- the
+    /// default -- is a true plaintext no-op, unchanged from before this
+    /// field existed: every attempt goes through [`submit`] exactly as
+    /// before. `Some` (built via [`crate::tls::build_client_tls`]) routes
+    /// every attempt through [`submit_with_tls`] instead, verifying each
+    /// replica's server cert against the CA that config was built with.
+    pub tls: Option<Arc<rustls::ClientConfig>>,
+    /// Only consulted when [`Self::tls`] is `Some`: the identity string to
+    /// present to the TLS handshake API for every dial (see
+    /// [`crate::tls::server_name_for`]/[`crate::tls::ClientTlsConfig::expected_server_name`]).
+    /// `None` derives it from each attempt's own `SocketAddr` (its IP,
+    /// stringified) -- fine for the default chain-only server-cert
+    /// verifier, which never actually checks it; set this when `tls` was
+    /// built with `expected_server_name` set, to the same name, so the
+    /// (now name-checking) verifier is checking the name you actually mean.
+    pub tls_server_name: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -138,6 +214,8 @@ impl Default for ClientConfig {
             attempt_timeout: Duration::from_secs(2),
             max_rounds: 5,
             retry_backoff: Duration::from_millis(50),
+            tls: None,
+            tls_server_name: None,
         }
     }
 }
@@ -198,8 +276,17 @@ impl Client {
         for round in 0..rounds {
             for offset in 0..self.addrs.len() {
                 let addr = self.addrs[(start + offset) % self.addrs.len()];
-                match tokio::time::timeout(self.config.attempt_timeout, submit(addr, command)).await
-                {
+                let attempt = match &self.config.tls {
+                    None => submit(addr, command).boxed(),
+                    Some(tls) => {
+                        let server_name = server_name_for(
+                            &addr.ip().to_string(),
+                            self.config.tls_server_name.as_deref(),
+                        );
+                        submit_with_tls(addr, command, tls, server_name).boxed()
+                    }
+                };
+                match tokio::time::timeout(self.config.attempt_timeout, attempt).await {
                     Ok(Ok(outcome)) => return Ok(outcome),
                     Ok(Err(err)) => {
                         warn!(%addr, %err, "queso-net client: attempt failed");
@@ -255,6 +342,7 @@ mod client_pool_tests {
                 attempt_timeout: Duration::from_millis(200),
                 max_rounds: 1,
                 retry_backoff: Duration::from_millis(1),
+                ..ClientConfig::default()
             },
         );
         let command = Command::Get {

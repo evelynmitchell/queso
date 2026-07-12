@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use queso_net::config::NodeConfig;
+use queso_net::tls::TlsConfig;
 use queso_sim::ids::NodeId;
 
 /// Boot one Queso replica over a real TCP network.
@@ -56,6 +57,53 @@ struct Args {
     /// `--id` -- but not across two instances of the *same* `--id`).
     #[arg(long, default_value = "data")]
     data_dir: PathBuf,
+
+    /// Phase 8.2a (issue #47): PEM file containing this replica's TLS
+    /// certificate chain (leaf first, then any intermediates). Enables
+    /// app-level TLS for both peer traffic (mutual TLS) and the
+    /// client-facing listener (server-authenticated TLS) -- see
+    /// `queso_net::tls`'s module docs and `crates/net/README.md`'s TLS
+    /// section. All-or-nothing with `--tls-key`/`--tls-ca`: set none of the
+    /// three for plaintext (the default, unchanged from before this flag
+    /// existed), or all three to enable TLS; setting only some is a
+    /// startup error.
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+
+    /// Phase 8.2a: PEM file containing this replica's TLS private key. See
+    /// `--tls-cert`.
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
+
+    /// Phase 8.2a: PEM file containing the CA certificate(s) trusted to
+    /// sign every cluster member's TLS certificate (and, implicitly, a
+    /// client's view of this replica's own cert). See `--tls-cert`.
+    #[arg(long)]
+    tls_ca: Option<PathBuf>,
+}
+
+/// All-or-nothing validation for `--tls-cert`/`--tls-key`/`--tls-ca`: `None`
+/// if none were passed (plaintext, unchanged default behavior), `Some` if
+/// all three were passed, or a clear startup error for any other
+/// combination -- silently ignoring a partially-specified TLS flag set
+/// would be exactly the kind of "looks configured but isn't" footgun this
+/// crate's security-sensitive TLS support cannot afford.
+fn resolve_tls_config(args: &Args) -> anyhow::Result<Option<TlsConfig>> {
+    match (&args.tls_cert, &args.tls_key, &args.tls_ca) {
+        (None, None, None) => Ok(None),
+        (Some(cert_chain_path), Some(key_path), Some(ca_path)) => Ok(Some(TlsConfig {
+            cert_chain_path: cert_chain_path.clone(),
+            key_path: key_path.clone(),
+            ca_path: ca_path.clone(),
+        })),
+        _ => anyhow::bail!(
+            "--tls-cert/--tls-key/--tls-ca must be set all together or not at all \
+             (got --tls-cert={:?} --tls-key={:?} --tls-ca={:?})",
+            args.tls_cert,
+            args.tls_key,
+            args.tls_ca
+        ),
+    }
 }
 
 /// Parse one `--peer id=host:port` flag. `host` may be a literal IP or a
@@ -93,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         peers.contains_key(&NodeId(args.id)),
         "--peer list must include an entry for this replica's own --id"
     );
+    let tls = resolve_tls_config(&args)?;
 
     let config = NodeConfig {
         id: NodeId(args.id),
@@ -114,6 +163,9 @@ async fn main() -> anyhow::Result<()> {
         persist_delay: Duration::ZERO,
         save_counter: None,
         durable_event_counter: None,
+        // Phase 8.2a (issue #47): opt in only if all three --tls-* flags
+        // were passed -- see `resolve_tls_config`.
+        tls,
     };
 
     queso_net::run_node(config).await
@@ -153,5 +205,57 @@ mod tests {
     #[test]
     fn parse_peer_rejects_a_missing_equals() {
         assert!(parse_peer("0-127.0.0.1:7000").is_err());
+    }
+
+    /// Minimal, otherwise-valid `Args` for exercising `resolve_tls_config`
+    /// in isolation -- every field but the three `--tls-*` ones is
+    /// irrelevant to it.
+    fn base_args() -> Args {
+        Args::parse_from([
+            "queso-node",
+            "--id",
+            "0",
+            "--listen",
+            "127.0.0.1:7000",
+            "--client-listen",
+            "127.0.0.1:8000",
+            "--peer",
+            "0=127.0.0.1:7000",
+            "--seed",
+            "1",
+        ])
+    }
+
+    #[test]
+    fn resolve_tls_config_is_none_when_no_tls_flag_is_set() {
+        assert!(resolve_tls_config(&base_args()).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_tls_config_is_some_when_all_three_tls_flags_are_set() {
+        let mut args = base_args();
+        args.tls_cert = Some(PathBuf::from("cert.pem"));
+        args.tls_key = Some(PathBuf::from("key.pem"));
+        args.tls_ca = Some(PathBuf::from("ca.pem"));
+        let tls = resolve_tls_config(&args).unwrap().unwrap();
+        assert_eq!(tls.cert_chain_path, PathBuf::from("cert.pem"));
+        assert_eq!(tls.key_path, PathBuf::from("key.pem"));
+        assert_eq!(tls.ca_path, PathBuf::from("ca.pem"));
+    }
+
+    #[test]
+    fn resolve_tls_config_rejects_a_partial_tls_flag_set() {
+        let mut only_cert = base_args();
+        only_cert.tls_cert = Some(PathBuf::from("cert.pem"));
+        assert!(resolve_tls_config(&only_cert).is_err());
+
+        let mut cert_and_key = base_args();
+        cert_and_key.tls_cert = Some(PathBuf::from("cert.pem"));
+        cert_and_key.tls_key = Some(PathBuf::from("key.pem"));
+        assert!(resolve_tls_config(&cert_and_key).is_err());
+
+        let mut only_ca = base_args();
+        only_ca.tls_ca = Some(PathBuf::from("ca.pem"));
+        assert!(resolve_tls_config(&only_ca).is_err());
     }
 }

@@ -73,6 +73,14 @@
 //!   so it never affects an ordinary `queso-node` run. See that module's
 //!   docs for the fault model and this crate's README for how to run the
 //!   adversarial perf harness (`tests/nemesis.rs`).
+//! - [`tls`] -- Phase 8.2a (issue #47): opt-in app-level TLS
+//!   (`tokio-rustls`/`rustls`, pure-Rust, no OpenSSL) for both peer<->peer
+//!   traffic (mutual TLS: `NodeConfig::tls: Option<tls::TlsConfig>`) and
+//!   client->replica traffic (server-authenticated TLS only:
+//!   `client::ClientConfig::tls: Option<tls::ClientTlsConfig>`), off by
+//!   default (`None` is a strict plaintext no-op) -- see that module's docs
+//!   for exactly what is/isn't verified and this crate's README for how to
+//!   enable it.
 
 pub mod client;
 pub mod config;
@@ -81,6 +89,7 @@ pub mod driver;
 pub mod metrics;
 pub mod nemesis;
 pub mod persist;
+pub mod tls;
 pub mod transport;
 pub mod wire;
 

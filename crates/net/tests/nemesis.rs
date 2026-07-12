@@ -207,6 +207,8 @@ async fn isolating_the_leader_lets_the_majority_keep_deciding() {
             attempt_timeout: Duration::from_secs(3),
             max_rounds: 10,
             retry_backoff: Duration::from_millis(50),
+            tls: None,
+            tls_server_name: None,
         },
     ));
 
@@ -360,6 +362,8 @@ async fn adversarial_load_stays_safe_and_shows_measurable_degradation() {
             attempt_timeout: Duration::from_secs(5),
             max_rounds: 10,
             retry_backoff: Duration::from_millis(20),
+            tls: None,
+            tls_server_name: None,
         },
     ));
     let (baseline_writes, baseline_summary) = tokio::time::timeout(
@@ -396,6 +400,8 @@ async fn adversarial_load_stays_safe_and_shows_measurable_degradation() {
             attempt_timeout: Duration::from_secs(3),
             max_rounds: 10,
             retry_backoff: Duration::from_millis(50),
+            tls: None,
+            tls_server_name: None,
         },
     ));
     let (degraded_writes, degraded_summary) = tokio::time::timeout(
@@ -467,6 +473,8 @@ async fn adversarial_load_stays_safe_and_shows_measurable_degradation() {
             attempt_timeout: Duration::from_secs(5),
             max_rounds: 20,
             retry_backoff: Duration::from_millis(50),
+            tls: None,
+            tls_server_name: None,
         },
     ));
     let verified = Arc::new(AtomicU64::new(0));

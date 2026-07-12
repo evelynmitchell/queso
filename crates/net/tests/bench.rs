@@ -115,6 +115,7 @@ async fn queso_bench_style_load_against_a_real_cluster_produces_sane_metrics() {
             attempt_timeout: Duration::from_secs(5),
             max_rounds: 20,
             retry_backoff: Duration::from_millis(50),
+            ..queso_net::client::ClientConfig::default()
         },
     ));
 

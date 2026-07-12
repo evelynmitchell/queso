@@ -24,11 +24,13 @@ use queso_sim::ids::NodeId;
 use queso_smr::Command;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
 
 use crate::driver::Event;
 use crate::nemesis::{LinkAction, Nemesis};
+use crate::tls::{server_name_for, MaybeTlsStream};
 use crate::wire::{decode, encode, WireMsg};
 
 /// How long to wait between reconnect attempts (dial failure, or an
@@ -121,12 +123,23 @@ pub async fn resolve_peer_addr(addr: &str) -> std::io::Result<SocketAddr> {
 /// and [`Nemesis::delay`]'s latency/jitter). It faults on the `(self_id,
 /// peer_id)` pair, so it is checked against the *logical* peer identity,
 /// independent of whatever address `resolve_peer_addr` produced this dial.
+///
+/// `tls` (Phase 8.2a, `crate::tls`) is this replica's peer-dialing mTLS
+/// client config -- `None` (every call site except a real `queso-node` run
+/// or test that opts in via `NodeConfig::tls`) skips the TLS handshake
+/// entirely, keeping this connection exactly the plain `TcpStream` it was
+/// before this parameter existed. When `Some`, the TLS handshake (this
+/// replica presenting its own client cert, verifying the acceptor's server
+/// cert -- see `crate::tls::build_peer_tls`) runs immediately after
+/// `TcpStream::connect` succeeds and *before* the `Hello` handshake below --
+/// see `crate::tls`'s module docs for why that ordering is right.
 pub fn spawn_peer_dialer(
     self_id: NodeId,
     peer_id: NodeId,
     peer_addr: String,
     mut rx: mpsc::Receiver<ConcreteMsg<Command>>,
     nemesis: Option<Arc<Nemesis>>,
+    tls: Option<Arc<rustls::ClientConfig>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -147,6 +160,31 @@ pub fn spawn_peer_dialer(
                 }
             };
             let _ = stream.set_nodelay(true);
+            let stream: MaybeTlsStream = match &tls {
+                None => MaybeTlsStream::Plain(stream),
+                Some(tls_config) => {
+                    // Host, not `resolved`'s IP: `server_name_for` only
+                    // needs a syntactically valid name (see its docs) --
+                    // the default peer verifier
+                    // (`crate::tls::ChainOnlyServerCertVerifier`) never
+                    // actually checks it against the presented cert.
+                    let host = peer_addr
+                        .rsplit_once(':')
+                        .map_or(peer_addr.as_str(), |(h, _)| h);
+                    let server_name = server_name_for(host, None);
+                    match TlsConnector::from(tls_config.clone())
+                        .connect(server_name, stream)
+                        .await
+                    {
+                        Ok(s) => MaybeTlsStream::Tls(Box::new(s.into())),
+                        Err(err) => {
+                            warn!(%peer_addr, %err, "peer TLS handshake failed, retrying");
+                            tokio::time::sleep(RECONNECT_DELAY).await;
+                            continue;
+                        }
+                    }
+                }
+            };
             let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
             if framed.send(encode(&WireMsg::Hello(self_id))).await.is_err() {
                 tokio::time::sleep(RECONNECT_DELAY).await;
@@ -190,7 +228,22 @@ pub fn spawn_peer_dialer(
 /// connection. Each connection's first frame must be a [`WireMsg::Hello`]
 /// identifying the dialer; every frame after that is decoded and forwarded
 /// to `inbox` as [`Event::Message`].
-pub async fn accept_peers(listener: TcpListener, inbox: mpsc::UnboundedSender<Event>) {
+///
+/// `tls` (Phase 8.2a, `crate::tls`) is this replica's peer-accepting mTLS
+/// server config -- `None` (every call site except a real `queso-node` run
+/// or test that opts in via `NodeConfig::tls`) skips the TLS handshake
+/// entirely. When `Some`, every accepted connection must complete a TLS
+/// handshake -- including presenting a client certificate that verifies
+/// against the configured CA (see `crate::tls::build_peer_tls`; client-auth
+/// is *required*, not merely offered) -- *before* the `Hello` handshake
+/// below; a connection that fails the TLS handshake (no cert, or a cert
+/// from an untrusted CA) never reaches `Hello` at all, and is dropped by
+/// [`handle_peer_connection`] without ever touching `inbox`.
+pub async fn accept_peers(
+    listener: TcpListener,
+    inbox: mpsc::UnboundedSender<Event>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+) {
     loop {
         let (stream, addr) = match listener.accept().await {
             Ok(x) => x,
@@ -201,8 +254,9 @@ pub async fn accept_peers(listener: TcpListener, inbox: mpsc::UnboundedSender<Ev
         };
         let _ = stream.set_nodelay(true);
         let inbox = inbox.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
-            handle_peer_connection(stream, addr, inbox).await;
+            handle_peer_connection(stream, addr, inbox, tls).await;
         });
     }
 }
@@ -211,7 +265,23 @@ async fn handle_peer_connection(
     stream: TcpStream,
     addr: SocketAddr,
     inbox: mpsc::UnboundedSender<Event>,
+    tls: Option<Arc<rustls::ServerConfig>>,
 ) {
+    let stream: MaybeTlsStream = match tls {
+        None => MaybeTlsStream::Plain(stream),
+        Some(tls_config) => match TlsAcceptor::from(tls_config).accept(stream).await {
+            Ok(s) => MaybeTlsStream::Tls(Box::new(s.into())),
+            Err(err) => {
+                // Includes the case this crate's mTLS security property
+                // depends on: a dialer with no client cert, or a cert from
+                // a CA `tls_config`'s client verifier does not trust, fails
+                // the TLS handshake itself -- rejected right here, before
+                // any `WireMsg` (in particular `Hello`) is ever read.
+                warn!(%addr, %err, "peer TLS handshake failed, closing");
+                return;
+            }
+        },
+    };
     let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
     let from = match framed.next().await {
         Some(Ok(bytes)) => match decode(&bytes) {

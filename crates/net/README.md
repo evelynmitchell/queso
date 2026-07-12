@@ -42,12 +42,16 @@ determinism lints (see `src/lib.rs`'s `#![allow(clippy::disallowed_methods)]`)
 > spawned-and-killed `queso-node` processes). Phase 8.1a (issue #46) then
 > hardened *how* that durable state is written — group-commit coalescing,
 > an async fsync offload, and an on-disk schema-version header — without
-> touching the write-before-reply guarantee itself; see below. It is still
-> **not** a production-grade durability story: see "Honest limits" below
-> before deploying this for real. No TLS (A3's content-oblivious-adversary
-> assumption is not realized over the wire yet), no reconfiguration, no log
-> compaction. (Phase 7.2 does add a client library with
-> retry-to-another-replica — see below.)
+> touching the write-before-reply guarantee itself; see below. Phase 8.2a
+> (issue #47) adds opt-in, app-level TLS (mutual TLS on every peer
+> connection, server-authenticated TLS on every client connection) so A3's
+> content-oblivious-adversary assumption *can* be realized over the wire —
+> see "TLS (Phase 8.2a)" below for how to enable it and exactly what it
+> does and doesn't cover; it remains **off by default** (plaintext,
+> unchanged, unless explicitly configured). It is still **not** a
+> production-grade durability story: see "Honest limits" below before
+> deploying this for real. No reconfiguration, no log compaction. (Phase
+> 7.2 does add a client library with retry-to-another-replica — see below.)
 
 **Honest limits of the current durability implementation (Phase 7
 hardening plus Phase 8.1a, not Phase 8's full operability story):**
@@ -105,8 +109,9 @@ hardening plus Phase 8.1a, not Phase 8's full operability story):**
   that replica's durable state — recoverable only via the ordinary
   catch-up-from-a-live-majority path, not via any backup/replication of
   the on-disk file itself.
-- **No reconfiguration, no compaction, no TLS** — unchanged from before
-  this fix; see "Scope" below.
+- **No reconfiguration, no compaction** — unchanged from before this fix;
+  see "Scope" below. TLS is now available (Phase 8.2a, opt-in, off by
+  default) — see "TLS (Phase 8.2a)" below.
 
 See `src/persist.rs`'s module docs for the exact on-disk format and the
 write-before-reply ordering, and `src/driver.rs`'s module docs for how
@@ -169,6 +174,7 @@ cargo test -p queso-net --test bench
 cargo test -p queso-net --test restart_recovery
 cargo test -p queso-net --test nemesis
 cargo test -p queso-net --test group_commit
+cargo test -p queso-net --test tls
 ```
 
 `tests/cluster.rs` boots a 3-node cluster entirely in-process (each
@@ -212,6 +218,12 @@ is a fast, textual companion tripwire for the same property.
 real by comparing two counters from the same run (durable-mutating events
 applied vs. real fsync'd writes performed); `a_single_op_at_a_time_still_works_and_is_still_persisted`
 is the batch-size-1 correctness counterpart.
+
+`tests/tls.rs` is issue #47's (Phase 8.2a) acceptance test -- see "TLS
+(Phase 8.2a)" below for what it covers (handshake success against a real
+mTLS+server-TLS 3-node cluster, plus the negative tests proving both mTLS
+on the peer acceptor and server-cert verification on the client side are
+actually enforced, not decorative).
 
 ## `queso-bench`: load generator + throughput/latency metrics (Phase 7.2)
 
@@ -398,13 +410,127 @@ throughput/latency summaries (`Summary::to_text`) printed for comparison.
   multi-second deadlines rather than tight timing windows for the same
   reason.
 
-## Scope (Phase 7.1 + 7.2 + 7.4 — see the crate docs)
+## TLS (Phase 8.2a, issue #47)
+
+Opt-in, **off by default**, app-level TLS via `rustls`/`tokio-rustls`
+(pure-Rust — no OpenSSL, no system TLS library, keeps `deploy/Dockerfile`'s
+glibc-only, no-dynamically-linked-libssl builder image unchanged). See
+`src/tls.rs`'s module docs for the full design and exactly what is/isn't
+verified; this section is the how-to-enable-it summary.
+
+- **Peer↔peer traffic is mutual TLS (mTLS).** Every replica presents its
+  own certificate both when it dials another peer and when it accepts one;
+  both ends verify the other's chain against a shared, operator-supplied CA.
+  The peer acceptor's client-cert requirement is enforced by
+  `rustls::server::WebPkiClientVerifier`'s default (client auth
+  *required*, anonymous connections denied) — an un-cert'd dialer is
+  rejected at the TLS handshake, before a single `WireMsg` byte is read.
+  The existing `WireMsg::Hello(NodeId)` handshake still runs *inside* the
+  now-encrypted session, unchanged, to identify which replica dialed in.
+- **Client→replica traffic is server-authenticated TLS only.** A client
+  (`queso_net::client::Client`/`submit_with_tls`, or `queso-bench`) verifies
+  the replica's server cert against the configured CA but never presents a
+  client certificate of its own — end clients are not cluster members, so
+  client-cert auth for them is out of scope.
+- **No verification is ever disabled.** There is no "accept any cert"
+  verifier anywhere in this crate. The one deliberate relaxation
+  (`crate::tls::ChainOnlyServerCertVerifier`, used by default for the peer
+  dialer's view of the acceptor's cert, and for the client's view of a
+  replica's cert) still performs full chain-to-trust-anchor + signature +
+  validity-period verification — it only skips matching the presented
+  cert's Subject Alternative Names against the dialed address, since this
+  crate's peers/replicas are addressed by an arbitrary `--peer`/`--addr`
+  string (a literal IP, a Docker/fly-internal hostname, ...) that need not
+  be baked into that node's cert as a SAN. `ClientTlsConfig::expected_server_name`
+  opts a caller back into full, unrelaxed name verification when wanted.
+  See `src/tls.rs`'s module docs for the complete argument.
+
+### Enabling it
+
+Generate a CA and one cert/key per replica (any TLS toolchain works; here's
+a quick `openssl` recipe for a local test cluster — `crates/net/tests/tls.rs`
+does the equivalent with `rcgen` at test-run time instead):
+
+```sh
+# One CA, trusted by every replica and every client.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout ca.key.pem -out ca.pem -days 3650 -subj "/CN=queso-test-ca"
+
+# One cert/key per replica (repeat with -subj "/CN=node-1" etc, and a SAN
+# matching the address peers/clients will actually dial, e.g. via
+# -addext "subjectAltName=IP:127.0.0.1"; irrelevant for the default
+# chain-only peer verifier, but required if you set
+# `expected_server_name`/want strict verification).
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout node-0.key.pem -out node-0.csr.pem -subj "/CN=node-0"
+openssl x509 -req -in node-0.csr.pem -CA ca.pem -CAkey ca.key.pem \
+  -CAcreateserial -out node-0.cert.pem -days 825 \
+  -extfile <(printf "extendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=IP:127.0.0.1")
+```
+
+Then pass all three PEM files to `queso-node`:
+
+```sh
+./target/debug/queso-node \
+  --id 0 --seed 1 --listen 127.0.0.1:7000 --client-listen 127.0.0.1:8000 \
+  --peer 0=127.0.0.1:7000 --peer 1=127.0.0.1:7001 --peer 2=127.0.0.1:7002 \
+  --leader 0 \
+  --tls-cert node-0.cert.pem --tls-key node-0.key.pem --tls-ca ca.pem
+```
+
+`--tls-cert`/`--tls-key`/`--tls-ca` are all-or-nothing: passing only some
+of the three is a startup error (`resolve_tls_config` in
+`src/bin/queso-node.rs`), not a silent partial-plaintext fallback. Every
+replica in the cluster needs the same `--tls-ca` (or at least a CA bundle
+that verifies every other replica's cert); each gets its own
+`--tls-cert`/`--tls-key`.
+
+For a client, `queso-bench` takes a matching `--tls-ca` (and optional
+`--tls-server-name` to pin strict name verification instead of the default
+chain-only mode):
+
+```sh
+./target/release/queso-bench \
+  --addr 127.0.0.1:8000 --addr 127.0.0.1:8001 --addr 127.0.0.1:8002 \
+  --concurrency 64 --duration-secs 8 --tls-ca ca.pem
+```
+
+Programmatically, `queso_net::client::Client`/`ClientConfig::tls` (built via
+`queso_net::tls::build_client_tls`) and `queso_net::client::submit_with_tls`
+are the TLS-capable equivalents of `Client`/`client::submit`.
+
+### Honest limitations
+
+- **No cert rotation.** Every cert/key/CA PEM is loaded once at boot
+  (`crate::tls::build_peer_tls`/`build_client_facing_server_tls`); rotating
+  a cert requires restarting the replica. No hot-reload, no SIGHUP handler.
+- **`queso-bench` is TLS-capable; other client tooling may not be.** The
+  `queso_net::client` library (`Client`/`submit_with_tls`) and
+  `queso-bench`'s `--tls-ca` flag are wired end to end. A hand-rolled
+  caller using the bare `client::submit` helper (not `submit_with_tls`)
+  gets plaintext regardless of a replica's TLS configuration — that helper
+  intentionally stayed a minimal, non-TLS building block (see its docs);
+  reach for `submit_with_tls`/`Client` for a real TLS-capable caller.
+- **Name-matching is relaxed by default** (see `crate::tls::ChainOnlyServerCertVerifier`'s
+  docs above) — chain-to-CA trust is the real security boundary here, not
+  hostname pinning, unless `expected_server_name` is explicitly set.
+- **No client-cert auth for end clients** — deliberately out of scope; a
+  client's own compromise/loss is not a cluster-membership event the way a
+  replica's would be.
+- **Not exercised against fly.io's real `.internal` DNS/6PN mesh** in this
+  environment — see `docs/deploy-flyio.md` §12 for how TLS interacts with
+  fly's own already-encrypted `.internal` traffic and the honest "not
+  verified here" caveat that applies to the rest of that runbook too.
+
+## Scope (Phase 7.1 + 7.2 + 7.4 + 8.2a — see the crate docs)
 
 Transport + node binary + client-facing wire protocol (Phase 7.1), a
 client library with a replica-address pool and retry-to-another-replica
 plus the `queso-bench` load generator with throughput/latency metrics
-(Phase 7.2), and an in-transport fault injector plus adversarial perf tests
-(Phase 7.4, above). Explicitly **not** in this crate yet:
+(Phase 7.2), an in-transport fault injector plus adversarial perf tests
+(Phase 7.4), and opt-in app-level TLS for both peer mTLS and
+server-authenticated client TLS (Phase 8.2a, above). Explicitly **not** in
+this crate yet:
 
 - session/seq management beyond A6's one-in-flight-per-`ClientId` minimum,
   connection pooling/reuse, or pipelining in the client library;
@@ -413,8 +539,9 @@ plus the `queso-bench` load generator with throughput/latency metrics
   actual comparison harness (`queso-compare`) and methodology live in the
   new `crates/compare` crate, kept separate so this crate's own build/lints
   stay untouched by it — see `docs/compare-etcd.md` (Phase 7.5, issue #35);
-- TLS — Phase 7 (A3's content-oblivious-adversary assumption is not
-  realized over the wire yet);
+- TLS cert rotation, and client-cert auth for end clients (deliberately
+  out of scope) — see "TLS (Phase 8.2a)"'s "Honest limitations" above for
+  the full list of what TLS itself doesn't cover;
 - incremental WAL + compaction (durability is real, group-commit-batched
   as of Phase 8.1a, but still whole-snapshot, not byte-incremental — see
   "Honest limits" above) — Phase 8.1b/8.1c;

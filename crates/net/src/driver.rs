@@ -148,6 +148,7 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::Context;
 use queso_consensus::rpc::ConcreteMsg;
 use queso_sim::ids::{NodeId, TimerId};
 use queso_sim::node::{Ctx, Node};
@@ -226,6 +227,27 @@ pub async fn run_node_with_listeners(
 ) -> anyhow::Result<()> {
     let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<Event>();
 
+    // Phase 8.2a (issue #47): build this replica's TLS material exactly
+    // once, up front, from `config.tls` -- `None` (every real `queso-node`
+    // run and every existing test, see `NodeConfig::tls`'s docs) skips this
+    // entirely, leaving `peer_tls`/`client_facing_tls` both `None` and
+    // every socket below exactly the plain `TcpStream` this crate spoke
+    // before this field existed.
+    let (peer_server_tls, peer_client_tls, client_facing_tls) = match &config.tls {
+        None => (None, None, None),
+        Some(tls_config) => {
+            let peer_tls = crate::tls::build_peer_tls(tls_config)
+                .context("building this replica's peer mTLS configuration")?;
+            let client_facing = crate::tls::build_client_facing_server_tls(tls_config)
+                .context("building this replica's client-facing TLS configuration")?;
+            (
+                Some(peer_tls.server_config),
+                Some(peer_tls.client_config),
+                Some(client_facing),
+            )
+        }
+    };
+
     // One outbound queue per *other* replica -- a replica never *dials*
     // itself. It can still be sent to by its own `Node` impl (a proposer's
     // `RecordRequest` fan-out deliberately includes its own recorder, see
@@ -243,11 +265,26 @@ pub async fn run_node_with_listeners(
         // run (see `NodeConfig::nemesis`'s docs) -- only test/bench
         // harnesses that build one explicitly reach the fault-injection
         // path inside `spawn_peer_dialer`.
-        transport::spawn_peer_dialer(config.id, peer_id, addr.clone(), rx, config.nemesis.clone());
+        transport::spawn_peer_dialer(
+            config.id,
+            peer_id,
+            addr.clone(),
+            rx,
+            config.nemesis.clone(),
+            peer_client_tls.clone(),
+        );
     }
 
-    tokio::spawn(transport::accept_peers(peer_listener, inbox_tx.clone()));
-    tokio::spawn(client::accept_clients(client_listener, inbox_tx.clone()));
+    tokio::spawn(transport::accept_peers(
+        peer_listener,
+        inbox_tx.clone(),
+        peer_server_tls,
+    ));
+    tokio::spawn(client::accept_clients(
+        client_listener,
+        inbox_tx.clone(),
+        client_facing_tls,
+    ));
 
     // Durability across a real restart (issue #36, P9/P12) -- see this
     // module's docs. `store` is this replica's on-disk snapshot handle;

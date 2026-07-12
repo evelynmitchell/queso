@@ -62,6 +62,8 @@ async fn leader_isolation_keeps_the_majority_available_with_no_election_style_st
             attempt_timeout: Duration::from_secs(3),
             max_rounds: 10,
             retry_backoff: Duration::from_millis(20),
+            tls: None,
+            tls_server_name: None,
         },
     );
     let baseline_target = Arc::new(QuesoTarget::new(baseline_client));
@@ -93,6 +95,8 @@ async fn leader_isolation_keeps_the_majority_available_with_no_election_style_st
             attempt_timeout: Duration::from_secs(3),
             max_rounds: 10,
             retry_backoff: Duration::from_millis(50),
+            tls: None,
+            tls_server_name: None,
         },
     );
     let degraded_target = Arc::new(QuesoTarget::new(degraded_client));
@@ -155,6 +159,8 @@ async fn leader_isolation_keeps_the_majority_available_with_no_election_style_st
             attempt_timeout: Duration::from_secs(3),
             max_rounds: 10,
             retry_backoff: Duration::from_millis(20),
+            tls: None,
+            tls_server_name: None,
         },
     );
     let recovered_target = Arc::new(QuesoTarget::new(recovered_client));
