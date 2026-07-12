@@ -354,6 +354,22 @@ real Put decided by (at least) a majority and observed, with the correct
 value, from a *different* replica than the one it was submitted to, over
 the internet, across two different fly regions.
 
+**Fly health checks (Phase 8.2, issue #47).** `queso-node`'s optional
+`--status-listen <addr>` flag (off by default -- see `crates/net/README.md`)
+serves `GET /health`/`GET /ready`/`GET /metrics`. A fly
+`[[services.http_checks]]` block in `fly.toml` (alongside the
+`[[services.tcp_checks]]` blocks already in `deploy/fly*.toml`) can point
+its liveness probe at `/health` and its readiness probe at `/ready` once
+that flag is added to each app's start command -- `/ready`'s precise,
+honest meaning ("not currently known to be running its own restart
+catch-up probe", not a linearizable-read guarantee) is documented in
+`crates/net/README.md` and `crates/net/src/status.rs`; read that before
+wiring a fly check to it. This runbook's `deploy/fly*.toml` files do not
+enable `--status-listen` by default -- adding the flag and a matching
+`[[services.http_checks]]` block is left to an operator who wants
+fly-managed health checks, not required for the manual verification steps
+above.
+
 ## 9. Run a queso-bench workload against the live cluster
 
 With the same three `fly proxy` tunnels from step 8 still running:

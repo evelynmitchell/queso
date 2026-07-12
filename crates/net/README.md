@@ -166,12 +166,63 @@ below), or drive `queso_net::client::Client`/`queso_net::client::submit`
 from a scratch program, or just run this crate's own integration tests
 (below), which exercise the exact same path end-to-end automatically.
 
+## Phase 8.2: status/metrics HTTP endpoints (issue #47)
+
+Pass `--status-listen <addr>` to bind a small, opt-in HTTP status/metrics
+server on that replica (omit it -- the default -- and nothing is bound, no
+task is spawned, zero overhead: see `NodeConfig::status_listen_addr`'s
+docs). It's a hand-rolled HTTP/1.1 `GET` responder (`src/status.rs`), not
+`hyper`/`axum`/`warp` -- dependency-light, in the same spirit as this
+crate's other hand-rolled wire protocols (`src/client.rs`, `src/wire.rs`):
+
+```sh
+./target/debug/queso-node \
+  --id 0 --seed 1 \
+  --listen 127.0.0.1:7000 --client-listen 127.0.0.1:8000 --status-listen 127.0.0.1:9000 \
+  --peer 0=127.0.0.1:7000 --peer 1=127.0.0.1:7001 --peer 2=127.0.0.1:7002 \
+  --leader 0
+```
+
+Three endpoints, `GET` only:
+
+- **`GET /health`** -- liveness: `200 OK` iff the process/runtime is up at
+  all. A process-up check only, deliberately blind to consensus progress
+  (so an orchestrator's liveness probe never kills a replica that is merely
+  catching up).
+- **`GET /ready`** -- readiness: `200 OK` iff this replica is not currently
+  known to be running its own internal restart catch-up probe
+  (`queso_smr::SmrNode::is_catching_up()`), `503 Service Unavailable`
+  otherwise. **Honest limits**: this is *not* a proof this replica is fully
+  caught up with the cluster's current frontier or that a linearizable read
+  against it right now would see the latest value -- catch-up only proves
+  progress up to whatever frontier a majority could show it at the moment
+  it asked, and this endpoint performs no extra round trip to check whether
+  the cluster has moved on since. It is also not sticky -- the catch-up
+  quiescence watchdog re-issuing catch-up (e.g. after a transient
+  partition) can flip this back to `false` after having been `true`. Good
+  enough for "don't route to a replica that just rebooted and is still
+  learning" (a load balancer's readiness probe -- see
+  `docs/deploy-flyio.md`), not a linearizability guarantee. See
+  `src/status.rs`'s module docs for the full reasoning.
+- **`GET /metrics`** -- a small pretty-printed JSON document of counters
+  this replica actually tracks: `events_processed` (total dispatched
+  events since boot), `next_slot` (current log frontier), `save_count` (the
+  real, always-on fsync count from `queso_net::persist::Store::save_count`
+  -- not the test-only `NodeConfig::save_counter`), `ready` (same bool
+  `/ready` reports), and `uptime_secs`.
+
+Anything else (wrong method, unknown path) is a `404`/`405`; a malformed or
+slow-loris-style request gets a bounded-size, bounded-time read and a `400`
+or a dropped connection, never a panic. See `cargo test -p queso-net --test
+status` (below) for the acceptance test against a real cluster.
+
 ## Automated end-to-end tests
 
 ```sh
 cargo test -p queso-net --test cluster
 cargo test -p queso-net --test bench
 cargo test -p queso-net --test restart_recovery
+cargo test -p queso-net --test status
 cargo test -p queso-net --test nemesis
 cargo test -p queso-net --test group_commit
 cargo test -p queso-net --test tls
@@ -205,6 +256,18 @@ actual `queso-node` binary as independent OS processes, `SIGKILL`s a
 same `--data-dir`, and asserts every replica (including the two that just
 rebooted) still agrees on the write — the exact scenario the audit found
 broken. A second test does the easier minority-reboot case as a contrast.
+
+`tests/status.rs` is issue #47's (Phase 8.2) acceptance test for the
+status/metrics HTTP server: against a real 3-node cluster with
+`--status-listen`-equivalent addresses bound up front (see
+`spawn_cluster_with_status` in `tests/support/mod.rs`), it asserts `/health`
+answers `200` before any operation is submitted, `/ready` answers `200`
+once an operation has been driven through, `/metrics`' JSON counters
+(`save_count`, `next_slot`, `events_processed`) actually move after a
+decided `Put`, and `/unknown` is a `404`. A second test reuses the ordinary
+(status-disabled) `spawn_cluster` every other test in this file uses and
+drives a full `Put`/`Get` round trip, proving the feature costs nothing
+observable when `status_listen_addr` is left `None`.
 
 `tests/group_commit.rs` is issue #46's (Phase 8.1a) acceptance test:
 group-commit coalescing, the async fsync offload, and — the property that

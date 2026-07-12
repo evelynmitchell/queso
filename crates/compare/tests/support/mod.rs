@@ -86,6 +86,9 @@ pub fn spawn_cluster(
             // Phase 8.2a (issue #47): this harness doesn't opt into TLS --
             // see `queso_net::config::NodeConfig::tls`'s docs.
             tls: None,
+            // Phase 8.2's status/metrics server (`NodeConfig::status_listen_addr`)
+            // is opt-in and this harness doesn't need it.
+            status_listen_addr: None,
         };
         thread::Builder::new()
             .name(format!("queso-compare-node-{i}"))

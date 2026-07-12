@@ -81,6 +81,13 @@
 //!   default (`None` is a strict plaintext no-op) -- see that module's docs
 //!   for exactly what is/isn't verified and this crate's README for how to
 //!   enable it.
+//! - [`status`] -- Phase 8.2's opt-in, off-by-default status/metrics HTTP
+//!   server (`GET /health`/`/ready`/`/metrics`,
+//!   `NodeConfig::status_listen_addr: Option<SocketAddr>`): a hand-rolled,
+//!   dependency-light HTTP/1.1 GET responder the driver's event loop feeds
+//!   via a `Send + Sync` [`status::StatusShared`] atomics snapshot -- see
+//!   that module's docs for the endpoints' precise semantics and this
+//!   crate's README for the CLI flag.
 
 pub mod client;
 pub mod config;
@@ -89,9 +96,10 @@ pub mod driver;
 pub mod metrics;
 pub mod nemesis;
 pub mod persist;
+pub mod status;
 pub mod tls;
 pub mod transport;
 pub mod wire;
 
 pub use config::NodeConfig;
-pub use driver::{run_node, run_node_with_listeners};
+pub use driver::{run_node, run_node_with_listeners, run_node_with_status_listener};

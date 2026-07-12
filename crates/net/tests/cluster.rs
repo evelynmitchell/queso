@@ -106,6 +106,7 @@ fn spawn_cluster_with_only(leader: Option<NodeId>, live: &[usize]) -> Vec<Socket
             save_counter: None,
             durable_event_counter: None,
             tls: None,
+            status_listen_addr: None,
         };
         thread::Builder::new()
             .name(format!("queso-node-{i}"))
