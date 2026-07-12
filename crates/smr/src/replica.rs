@@ -490,6 +490,46 @@ impl SmrNode {
         self.state.borrow().durable.clone()
     }
 
+    /// This replica's current `next_slot`: the first slot index it has not
+    /// yet applied (see [`Durable::next_slot`]'s docs and this module's
+    /// docs on the reads-through-log/catch-up design). A pure, cheap read
+    /// of already-tracked state -- no logic change -- added (Phase 8.2,
+    /// issue #47) so a real driver (`queso-net`'s status/metrics endpoint)
+    /// can report this replica's log frontier without reaching into
+    /// [`Durable`]'s otherwise-`pub(crate)` fields itself.
+    pub fn next_slot(&self) -> u64 {
+        self.state.borrow().durable.next_slot
+    }
+
+    /// Whether this replica's current in-flight attempt (if any) is its own
+    /// internal restart catch-up probe (see [`Self::begin_catch_up`]) rather
+    /// than a real client-visible operation. `true` exactly while a catch-up
+    /// [`Proposer`] is live -- immediately after [`Self::on_restart`] starts
+    /// one, until it decides (or a fresh one replaces it, e.g. the
+    /// quiescence watchdog re-issuing at the same frontier slot); `false`
+    /// once this replica is idle or working an ordinary op.
+    ///
+    /// This is a pure, cheap read of already-tracked state (no logic
+    /// change), added (Phase 8.2, issue #47) so a real driver can report an
+    /// honest readiness signal: "is this replica known to be in its
+    /// boot/rejoin catch-up phase right now" -- deliberately *not* a claim
+    /// about linearizable-read readiness or being fully caught up with the
+    /// rest of the cluster (this replica cannot cheaply know that; catch-up
+    /// only proves progress up to whatever frontier a majority could show it
+    /// at the time it asked -- see [`Self::begin_catch_up`]'s docs). A
+    /// replica that was never restarted (a fresh boot, no on-disk snapshot)
+    /// never calls `on_restart` at all, so this is `false` for it from the
+    /// very first callback.
+    pub fn is_catching_up(&self) -> bool {
+        matches!(
+            self.state.borrow().current_attempt,
+            Some(CurrentAttempt {
+                origin: AttemptOrigin::CatchUp,
+                ..
+            })
+        )
+    }
+
     /// Submit `command`, tagged `op_id`, as a fresh client-visible
     /// operation this replica should propose -- mirrors
     /// [`crate::cluster::SmrCluster::submit`]'s enqueue-then-kick logic

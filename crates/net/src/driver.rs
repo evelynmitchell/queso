@@ -147,6 +147,7 @@
 //! `RealCtx`) to cross a `tokio::spawn` boundary.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use anyhow::Context;
 use queso_consensus::rpc::ConcreteMsg;
@@ -162,6 +163,7 @@ use crate::client;
 use crate::config::NodeConfig;
 use crate::ctx::RealCtx;
 use crate::persist;
+use crate::status::{self, StatusShared};
 use crate::transport;
 
 /// Everything that can happen to one replica: a message arrived, a timer
@@ -203,12 +205,26 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<()> {
     // Bind both listeners up front, then hand them to the shared body. A
     // caller that needs a *gap-free* bind (e.g. an in-process test cluster
     // picking ephemeral ports without a probe-then-rebind TOCTOU) uses
-    // [`run_node_with_listeners`] directly instead.
+    // [`run_node_with_listeners`]/[`run_node_with_status_listener`]
+    // directly instead.
     let peer_listener = TcpListener::bind(config.listen_addr).await?;
     info!(id = ?config.id, addr = %config.listen_addr, "listening for peers");
     let client_listener = TcpListener::bind(config.client_listen_addr).await?;
     info!(id = ?config.id, addr = %config.client_listen_addr, "listening for clients");
-    run_node_with_listeners(config, peer_listener, client_listener).await
+    // Phase 8.2 (issue #47): `config.status_listen_addr` is `None` for
+    // every real `queso-node` run unless its `--status-listen` flag was
+    // passed -- see `NodeConfig::status_listen_addr`'s docs -- so this bind
+    // is skipped entirely in the common case, exactly like the peer/client
+    // binds above are unconditional because those two are never optional.
+    let status_listener = match config.status_listen_addr {
+        Some(addr) => {
+            let listener = TcpListener::bind(addr).await?;
+            info!(id = ?config.id, %addr, "listening for status/metrics requests");
+            Some(listener)
+        }
+        None => None,
+    };
+    run_node_inner(config, peer_listener, client_listener, status_listener).await
 }
 
 /// Like [`run_node`], but drives the node over two already-bound listeners
@@ -220,11 +236,74 @@ pub async fn run_node(config: NodeConfig) -> anyhow::Result<()> {
 /// the ones bound to `config.listen_addr`/`config.client_listen_addr`
 /// respectively (peers still dial `config.peers`, so those addresses must
 /// match what the peer listener is actually bound to).
+///
+/// If `config.status_listen_addr` is `Some`, this binds it the ordinary
+/// (non-gap-free) way, same as [`run_node`] -- fine for any caller that
+/// doesn't specifically need a pre-bound status port; one that does (e.g. a
+/// test picking an ephemeral status port without the `free_addr` TOCTOU)
+/// should call [`run_node_with_status_listener`] instead, which takes an
+/// already-bound status listener the same way this function already does
+/// for `peer_listener`/`client_listener`.
 pub async fn run_node_with_listeners(
     config: NodeConfig,
     peer_listener: TcpListener,
     client_listener: TcpListener,
 ) -> anyhow::Result<()> {
+    let status_listener = match config.status_listen_addr {
+        Some(addr) => Some(TcpListener::bind(addr).await?),
+        None => None,
+    };
+    run_node_inner(config, peer_listener, client_listener, status_listener).await
+}
+
+/// Like [`run_node_with_listeners`], but additionally takes an
+/// already-bound status/metrics listener (see [`crate::status`]) instead of
+/// binding `config.status_listen_addr` itself -- the same gap-free-bind
+/// rationale as `peer_listener`/`client_listener`. `config.status_listen_addr`
+/// is not consulted at all here; `status_listener` is authoritative (and
+/// the status server always runs, since a caller of this function
+/// specifically wants one -- there is no `Option` here, unlike the config
+/// field, precisely because a caller with nothing to serve status on
+/// should just call [`run_node_with_listeners`] instead).
+pub async fn run_node_with_status_listener(
+    config: NodeConfig,
+    peer_listener: TcpListener,
+    client_listener: TcpListener,
+    status_listener: TcpListener,
+) -> anyhow::Result<()> {
+    run_node_inner(
+        config,
+        peer_listener,
+        client_listener,
+        Some(status_listener),
+    )
+    .await
+}
+
+/// The shared body every `run_node*` entry point above bottoms out in: dial
+/// every peer, accept inbound peer/client (and, if `status_listener` is
+/// `Some`, status/metrics) connections, then drive
+/// [`queso_smr::SmrNode`] forever from a single loop.
+async fn run_node_inner(
+    config: NodeConfig,
+    peer_listener: TcpListener,
+    client_listener: TcpListener,
+    status_listener: Option<TcpListener>,
+) -> anyhow::Result<()> {
+    // Phase 8.2 (issue #47): `Some` only when a status listener was
+    // actually bound above -- i.e. only when `config.status_listen_addr`
+    // (or an explicit `run_node_with_status_listener` caller) opted in. The
+    // `StatusShared` this loop publishes into below, and the
+    // `status::serve_status` task reading it, simply don't exist otherwise
+    // -- not merely idle, genuinely absent, so an ordinary `queso-node` run
+    // (or any existing test, none of which ever set
+    // `status_listen_addr`) is byte-for-byte unaffected by any of this.
+    let status: Option<Arc<StatusShared>> = status_listener.map(|listener| {
+        let shared = StatusShared::new();
+        tokio::spawn(status::serve_status(listener, Arc::clone(&shared)));
+        shared
+    });
+
     let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<Event>();
 
     // Phase 8.2a (issue #47): build this replica's TLS material exactly
@@ -330,6 +409,22 @@ pub async fn run_node_with_listeners(
         // itself mutate `Durable`, so there is nothing new to persist yet.
         node.on_restart(&mut ctx);
         ctx.flush_outbound();
+    }
+
+    // Phase 8.2: publish this boot's initial status before the loop below
+    // ever runs, so `GET /ready` reflects a genuine restart's catch-up
+    // kickoff (see `queso_smr::SmrNode::is_catching_up`'s docs) immediately
+    // -- not just "not ready" by default until the first event happens to
+    // arrive, which could be an arbitrarily long time on an idle cluster. A
+    // fresh boot (never restarted, `on_restart` never called above) is
+    // reported ready right away: there is nothing to catch up on.
+    if let Some(shared) = &status {
+        shared.publish(
+            0,
+            node.next_slot(),
+            store.save_count(),
+            !node.is_catching_up(),
+        );
     }
 
     let mut pending: BTreeMap<OpId, oneshot::Sender<Outcome>> = BTreeMap::new();
@@ -471,6 +566,21 @@ pub async fn run_node_with_listeners(
                     let _ = resp.send(outcome);
                 }
             }
+        }
+
+        // Phase 8.2: publish this iteration's fresh status *after*
+        // everything above -- persist, flush, and client acks are all done,
+        // so `node.next_slot()`/`store.save_count()`/`node.is_catching_up()`
+        // below reflect this batch's full effect, not a partial one. Cheap
+        // (a handful of atomic stores) and skipped entirely when no status
+        // listener was configured.
+        if let Some(shared) = &status {
+            shared.publish(
+                batch_len as u64,
+                node.next_slot(),
+                store.save_count(),
+                !node.is_catching_up(),
+            );
         }
     }
 

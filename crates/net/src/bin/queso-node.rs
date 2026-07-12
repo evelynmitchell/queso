@@ -80,6 +80,13 @@ struct Args {
     /// client's view of this replica's own cert). See `--tls-cert`.
     #[arg(long)]
     tls_ca: Option<PathBuf>,
+
+    /// Address to listen on for status/metrics HTTP requests (`GET
+    /// /health`, `GET /ready`, `GET /metrics` -- see `queso_net::status`'s
+    /// module docs). Omit to leave the status server off entirely (the
+    /// default): no listener is bound, nothing is spawned, zero overhead.
+    #[arg(long)]
+    status_listen: Option<SocketAddr>,
 }
 
 /// All-or-nothing validation for `--tls-cert`/`--tls-key`/`--tls-ca`: `None`
@@ -166,6 +173,9 @@ async fn main() -> anyhow::Result<()> {
         // Phase 8.2a (issue #47): opt in only if all three --tls-* flags
         // were passed -- see `resolve_tls_config`.
         tls,
+        // Phase 8.2 (issue #47): opt in only if `--status-listen` was
+        // passed -- see `NodeConfig::status_listen_addr`'s docs.
+        status_listen_addr: args.status_listen,
     };
 
     queso_net::run_node(config).await

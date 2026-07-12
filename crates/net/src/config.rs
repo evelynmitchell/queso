@@ -127,4 +127,21 @@ pub struct NodeConfig {
     /// module docs for exactly what TLS mode each connection kind gets and
     /// this crate's README for how to enable it end to end.
     pub tls: Option<TlsConfig>,
+    /// Phase 8.2 (issue #47): address to bind this replica's status/metrics
+    /// HTTP listener (`GET /health`, `GET /ready`, `GET /metrics` -- see
+    /// `crate::status`'s module docs) to. `None` -- the default for every
+    /// existing test and for `queso-node` unless its new `--status-listen`
+    /// flag is passed -- means exactly what [`Self::nemesis`]'s docs
+    /// describe for that field: the status server is never bound, never
+    /// spawned, and costs nothing; a real driver
+    /// (`crate::driver::run_node`) that never observes `Some` here behaves
+    /// identically to the crate before this field existed. `Some(addr)`
+    /// makes [`crate::driver::run_node`] (or
+    /// [`crate::driver::run_node_with_listeners`]) bind `addr` itself; a
+    /// caller that needs a gap-free bind (e.g. a test picking an ephemeral
+    /// port without a probe-then-rebind TOCTOU, mirroring
+    /// [`Self::listen_addr`]/[`Self::client_listen_addr`]'s own pattern) can
+    /// instead pre-bind a listener and call
+    /// [`crate::driver::run_node_with_status_listener`] directly.
+    pub status_listen_addr: Option<SocketAddr>,
 }

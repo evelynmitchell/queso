@@ -28,7 +28,7 @@ use std::time::Duration;
 use queso_net::config::NodeConfig;
 use queso_net::nemesis::Nemesis;
 use queso_net::tls::TlsConfig;
-use queso_net::{client, run_node_with_listeners};
+use queso_net::{client, run_node_with_listeners, run_node_with_status_listener};
 use queso_sim::ids::NodeId;
 use queso_smr::{Command, Outcome};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -224,6 +224,12 @@ fn spawn_cluster_inner(
             save_counter: save_counter.clone(),
             durable_event_counter: durable_event_counter.clone(),
             tls: tls_configs.as_ref().map(|configs| configs[i].clone()),
+            // Phase 8.2's status/metrics server is opt-in (see
+            // `NodeConfig::status_listen_addr`'s docs) -- `None` here means
+            // every `spawn_cluster*` variant above behaves exactly as it
+            // did before that field existed. `spawn_cluster_with_status`
+            // below is the one helper that opts in.
+            status_listen_addr: None,
         };
         thread::Builder::new()
             .name(format!("queso-node-{i}"))
@@ -298,4 +304,149 @@ pub async fn submit_with_retry_tls(
             }
         }
     }
+}
+
+/// Like [`spawn_cluster`], but each replica additionally binds and serves a
+/// status/metrics HTTP listener (Phase 8.2, issue #47 --
+/// `queso_net::status`, `NodeConfig::status_listen_addr`). Returns
+/// `(client_addrs, status_addrs)`, both in replica index order. A
+/// self-contained near-duplicate of `spawn_cluster_inner` above (see this
+/// crate's `crates/compare/tests/support/mod.rs` for the same kind of
+/// deliberate near-duplication across a crate boundary) rather than
+/// threading a fourth listener kind through every existing `spawn_cluster*`
+/// variant above, none of which need one -- `tests/status.rs` is the only
+/// caller.
+pub fn spawn_cluster_with_status(
+    n: usize,
+    leader: Option<NodeId>,
+) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+    // Gap-free bind of all three listener kinds up front, exactly like
+    // `spawn_cluster_inner` already does for peer/client -- see that
+    // function's docs for why (the `free_addr` TOCTOU).
+    let mut peer_listeners: Vec<StdTcpListener> = Vec::with_capacity(n);
+    let mut client_listeners: Vec<StdTcpListener> = Vec::with_capacity(n);
+    let mut status_listeners: Vec<StdTcpListener> = Vec::with_capacity(n);
+    let mut peer_addrs: Vec<SocketAddr> = Vec::with_capacity(n);
+    let mut client_addrs: Vec<SocketAddr> = Vec::with_capacity(n);
+    let mut status_addrs: Vec<SocketAddr> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let pl = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind a peer listener");
+        let cl = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind a client listener");
+        let sl = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind a status listener");
+        peer_addrs.push(pl.local_addr().expect("read peer listener addr"));
+        client_addrs.push(cl.local_addr().expect("read client listener addr"));
+        status_addrs.push(sl.local_addr().expect("read status listener addr"));
+        peer_listeners.push(pl);
+        client_listeners.push(cl);
+        status_listeners.push(sl);
+    }
+
+    let peers: BTreeMap<NodeId, String> = (0..n)
+        .map(|i| (NodeId(i as u32), peer_addrs[i].to_string()))
+        .collect();
+
+    let data_dir = fresh_data_dir();
+    let listeners = peer_listeners
+        .into_iter()
+        .zip(client_listeners)
+        .zip(status_listeners)
+        .map(|((p, c), s)| (p, c, s));
+    for (i, (peer_listener, client_listener, status_listener)) in listeners.enumerate() {
+        let config = NodeConfig {
+            id: NodeId(i as u32),
+            listen_addr: peer_addrs[i],
+            client_listen_addr: client_addrs[i],
+            peers: peers.clone(),
+            total_replicas: n,
+            leader,
+            tick: Duration::from_millis(5),
+            seed: 4_000 + i as u64,
+            data_dir: data_dir.clone(),
+            nemesis: None,
+            persist_delay: Duration::ZERO,
+            save_counter: None,
+            durable_event_counter: None,
+            // This status-server harness doesn't opt into TLS (Phase 8.2a);
+            // plaintext client/peer connections, exactly like the other
+            // `spawn_cluster*` variants.
+            tls: None,
+            // Informational only here: `run_node_with_status_listener`
+            // below ignores this field entirely (the pre-bound listener it
+            // takes is authoritative -- see that function's docs) and
+            // always serves status. Set to the real address anyway so the
+            // config, if ever logged/inspected, isn't misleadingly `None`.
+            status_listen_addr: Some(status_addrs[i]),
+        };
+        thread::Builder::new()
+            .name(format!("queso-node-status-{i}"))
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build a per-node tokio runtime");
+                let result = rt.block_on(async move {
+                    peer_listener.set_nonblocking(true)?;
+                    client_listener.set_nonblocking(true)?;
+                    status_listener.set_nonblocking(true)?;
+                    let peer_listener = TokioTcpListener::from_std(peer_listener)?;
+                    let client_listener = TokioTcpListener::from_std(client_listener)?;
+                    let status_listener = TokioTcpListener::from_std(status_listener)?;
+                    run_node_with_status_listener(
+                        config,
+                        peer_listener,
+                        client_listener,
+                        status_listener,
+                    )
+                    .await
+                });
+                if let Err(err) = result {
+                    panic!("node {i} exited: {err:?}");
+                }
+            })
+            .expect("spawn node thread");
+    }
+
+    (client_addrs, status_addrs)
+}
+
+/// Issue one plain-HTTP `GET <path>` against `addr` over a bare
+/// `tokio::net::TcpStream` -- no `reqwest`, matching this crate's own
+/// dependency-light philosophy (see `queso_net::status`'s module docs).
+/// Returns `(status_code, body)`; `status_code` is parsed from the response
+/// line's three-digit code, `body` is everything after the blank line
+/// separating headers from the body (every response here is small enough,
+/// and the server sends `Connection: close`, so reading to EOF is safe and
+/// simple).
+pub async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .unwrap_or_else(|err| panic!("connect to status server at {addr}: {err}"));
+    let request = format!("GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write GET request");
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read status server response");
+    let response = String::from_utf8(response).expect("status server response is valid UTF-8");
+
+    let mut parts = response.splitn(2, "\r\n\r\n");
+    let head = parts.next().unwrap_or_default();
+    let body = parts.next().unwrap_or_default().to_string();
+
+    let status_code = head
+        .lines()
+        .next()
+        .and_then(|status_line| status_line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("could not parse a status code out of response head: {head:?}"));
+
+    (status_code, body)
 }
