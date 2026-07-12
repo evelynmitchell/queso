@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,4 +75,41 @@ pub struct NodeConfig {
     /// every replica in a scenario at once (a partition needs both sides to
     /// agree on which pairs are cut off).
     pub nemesis: Option<Arc<Nemesis>>,
+    /// Phase 8.1a (issue #46) test-only instrumentation: an artificial
+    /// extra delay this replica's [`crate::persist::Store`] sleeps before
+    /// every blocking snapshot write it performs (see
+    /// `crate::persist::Store::with_artificial_delay`'s docs). Always
+    /// `Duration::ZERO` (a strict no-op) for every real `queso-node` run
+    /// and every other test -- only `tests/group_commit.rs`'s
+    /// write-before-reply ordering-regression guard sets this to something
+    /// non-zero, deliberately making a real disk artificially slow so the
+    /// P12 guarantee becomes observable in wall-clock time from outside the
+    /// process. See that test's docs for why this is the only way to make
+    /// "did a reply leave before its fsync completed" black-box-observable
+    /// at all.
+    pub persist_delay: Duration,
+    /// Phase 8.1a (issue #46) test-only instrumentation: if set, this
+    /// replica's [`crate::persist::Store`] uses `counter` as its shared
+    /// save-count instead of its own private one (see
+    /// `crate::persist::Store::with_save_counter`/`Store::save_count`'s
+    /// docs), so a test can observe how many real fsync'd writes a live
+    /// replica actually performed -- e.g. `tests/group_commit.rs`'s
+    /// group-commit-coalescing test, which asserts that count stays far
+    /// below the number of mutating events applied under concurrent load.
+    /// `None` (each replica gets its own private, unobserved counter) for
+    /// every real `queso-node` run and every other test.
+    pub save_counter: Option<Arc<AtomicU64>>,
+    /// Phase 8.1a (issue #46) test-only instrumentation: if set,
+    /// `crate::driver::run_node`'s event loop increments this counter once
+    /// for every dispatched [`crate::driver::Event::Message`] it applies --
+    /// i.e. once per durable-mutating event, *regardless* of whether that
+    /// event ended up sharing a batch (and therefore a single fsync/
+    /// [`Self::save_counter`] increment) with others. Together the two
+    /// counters directly prove group-commit coalescing: whenever
+    /// `save_counter`'s final value is strictly less than this one, at
+    /// least one batch must have coalesced more than one mutating event
+    /// into a single persist -- see `tests/group_commit.rs`'s
+    /// `group_commit_coalesces_fsyncs_under_concurrent_load`. `None` for
+    /// every real `queso-node` run and every other test.
+    pub durable_event_counter: Option<Arc<AtomicU64>>,
 }
