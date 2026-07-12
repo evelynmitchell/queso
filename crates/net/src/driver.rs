@@ -28,25 +28,108 @@
 //!    `Request` mutates its recorder's ISR; a `Response` that completes a
 //!    quorum mutates `next_slot`/`applied_log`/`kv` via
 //!    `SmrNode::finish_attempt`) -- see `queso_smr::replica`'s module docs.
-//!    After dispatching such an event, this loop snapshots the replica's
-//!    current `Durable` ([`SmrNode::durable_snapshot`]) and durably
-//!    persists it ([`crate::persist::Store::save`], fsync'd, atomic-rename)
-//!    *before* calling [`RealCtx::flush_outbound`] -- i.e. before anything
-//!    that event's processing produced (a `RecordResponse` reply, a
-//!    proposer's own requests, a self-loopback vote) actually reaches the
-//!    network or this replica's own inbox, and before any client `Outcome`
-//!    reply for an operation that just completed is sent. A crash between
+//!    After dispatching a *batch* of such events (see "Group commit"
+//!    below), this loop snapshots the replica's current `Durable`
+//!    ([`SmrNode::durable_snapshot`]) exactly once and durably persists it
+//!    ([`crate::persist::Store::persist`], fsync'd, atomic-rename, offloaded
+//!    -- see "Async fsync offload" below) *before* calling
+//!    [`RealCtx::flush_outbound`] -- i.e. before anything any event in that
+//!    batch's processing produced (a `RecordResponse` reply, a proposer's
+//!    own requests, a self-loopback vote) actually reaches the network or
+//!    this replica's own inbox, and before any client `Outcome` reply for
+//!    an operation that just completed is sent. A crash between
 //!    "decided/recorded in memory" and "fsync'd" can therefore never be
 //!    observed by any peer or client -- exactly the guarantee
 //!    `queso_smr::replica::SmrNode::on_message`'s doc comment already
 //!    promised for a "real deployment", now made real. `Event::Timer` and
 //!    `Event::ClientSubmit` never mutate `Durable` (see the call sites in
-//!    `queso_smr::replica`), so this loop skips the fsync for those --
-//!    their `flush_outbound` runs immediately, with nothing to protect.
+//!    `queso_smr::replica`), so a batch containing only those skips the
+//!    fsync entirely -- its `flush_outbound` runs immediately, with nothing
+//!    to protect.
 //!
 //! See `crate::persist`'s module docs for the on-disk format/write scheme,
 //! and `crate::ctx::RealCtx`'s docs for the outbound-buffering and
 //! logical-time-baseline mechanisms this depends on.
+//!
+//! # Group commit (Phase 8.1a, issue #46)
+//!
+//! Because every persist is a **whole-state snapshot** of `Durable` (see
+//! `crate::persist`'s docs), not a per-op delta, one snapshot taken *after*
+//! applying several mutating events already captures every one of their
+//! effects -- there is nothing incremental to merge, no format change
+//! needed, and no risk of reconstructing the wrong state from a partial
+//! replay. That makes coalescing multiple events into one fsync trivially
+//! correct here in a way a from-scratch WAL would not be (see issue #46's
+//! design-decision comment for the full argument, in particular why a
+//! command/event-replay WAL is *not* obviously correct for this protocol: a
+//! `Response` that completes a quorum mutates `Durable` based on *volatile*
+//! proposer attempt state, so replaying logged messages through a fresh
+//! node would not reconstruct the same state).
+//!
+//! Concretely, each iteration of the loop below:
+//!
+//! 1. `.await`s the *next* event from the inbox (blocking exactly like
+//!    before if none is ready).
+//! 2. Applies it, then -- **without awaiting anything** -- drains any
+//!    *already-queued* events with a non-blocking `try_recv`, applying each
+//!    in turn, up to [`GROUP_COMMIT_BATCH_LIMIT`] events total. This never
+//!    waits for more events to arrive: it only coalesces work that was
+//!    already sitting in the channel the instant this batch started
+//!    forming, so a low-traffic replica (at most one event ready at a time)
+//!    always ends up with a batch of exactly one -- identical behavior,
+//!    and identical latency, to the pre-8.1a per-event loop. Under
+//!    concurrent load, many events routinely accumulate while this
+//!    replica's *previous* batch's fsync was in flight (see "Async fsync
+//!    offload" below), so this reliably coalesces in practice, not just in
+//!    principle.
+//! 3. If **any** event in the batch was an [`Event::Message`] (the only
+//!    kind that can mutate `Durable`), takes exactly **one**
+//!    [`SmrNode::durable_snapshot`] of the state after every event in the
+//!    batch has been applied and persists it with **one**
+//!    [`crate::persist::Store::persist`] call/fsync -- collapsing what would
+//!    have been `N` snapshots/fsyncs into 1. The tick persisted alongside it
+//!    is the batch's *last* applied event's [`RealCtx::now`] (`ctx.now().0`
+//!    right after that event's [`RealCtx::tick_now`] call), matching
+//!    exactly what a batch of size 1 would have persisted before this
+//!    change.
+//! 4. Calls [`RealCtx::flush_outbound`] exactly **once** for the whole
+//!    batch -- every event's buffered sends (see [`RealCtx::send`]'s docs)
+//!    are still queued in [`RealCtx::pending_outbound`] at this point
+//!    (`flush_outbound` is the only thing that ever drains it), so this
+//!    single call releases everything the whole batch produced, all at
+//!    once, only after step 3's fsync (if any) has completed -- preserving
+//!    write-before-reply for every event in the batch, not just the last
+//!    one.
+//!
+//! [`GROUP_COMMIT_BATCH_LIMIT`] bounds how many events one batch (and
+//! therefore one fsync-latency's worth of buffered replies) can hold, so a
+//! sustained flood of ready events can't indefinitely delay the *earliest*
+//! reply in a batch behind an ever-growing one -- see its own docs.
+//!
+//! # Async fsync offload (Phase 8.1a, issue #46 / issue #39)
+//!
+//! [`queso_smr::SmrNode`]/[`Durable`] are `Rc<RefCell<_>>`-based (see
+//! "Single-threaded ownership" below) and therefore not `Send` -- they can
+//! never cross a `tokio::spawn`/`spawn_blocking` boundary. What *can* cross
+//! one is the serialized bytes: [`crate::persist::Store::persist`]
+//! serializes the snapshot to a `Vec<u8>` on *this* (the driver) thread --
+//! cheap and CPU-only -- then hands those bytes to
+//! [`tokio::task::spawn_blocking`] to perform the actual blocking write/
+//! `fsync`/rename/directory-`fsync` on a dedicated blocking-pool thread,
+//! and `.await`s that task's completion before this loop does anything
+//! else. `SmrNode` itself never leaves this task; only plain, `Send` bytes
+//! do. This does not weaken write-before-reply at all -- `persist(...)
+//! .await` returning is still a full durability barrier, exactly like the
+//! synchronous [`crate::persist::Store::save`] it replaces here -- what it
+//! changes is that *other* tokio tasks on this runtime (the peer/client
+//! accept loops, outbound dialers, timer futures) keep making progress
+//! while this replica's fsync is in flight on the blocking pool, instead of
+//! a synchronous syscall stalling everything visible to this task. In
+//! particular, more events can (and, under load, reliably do) accumulate in
+//! the inbox *during* one batch's `persist().await`, ready for the next
+//! batch's non-blocking drain the moment this loop iteration finishes --
+//! which is exactly what makes group-commit coalesce under real load rather
+//! than only in theory.
 //!
 //! # Single-threaded ownership (why `SmrNode` needs no `Send`/`Sync`/locks)
 //!
@@ -99,6 +182,17 @@ pub enum Event {
         resp: oneshot::Sender<Outcome>,
     },
 }
+
+/// Max number of already-queued inbox events one iteration of the loop
+/// below will coalesce into a single group-commit batch (see this module's
+/// "Group commit" docs). Bounded, rather than draining without limit, so a
+/// sustained flood of ready events (e.g. many concurrent clients under
+/// heavy load) can't indefinitely grow one batch and delay its *earliest*
+/// event's reply behind an ever-larger one -- 64 is a generous
+/// amortization window (real disk fsync latency is typically orders of
+/// magnitude more than the cost of applying a few dozen more in-memory
+/// events) without letting one batch's worst-case latency run away.
+const GROUP_COMMIT_BATCH_LIMIT: usize = 64;
 
 /// Boot one replica: dial every peer, accept inbound peer and client
 /// connections, then drive [`queso_smr::SmrNode`] forever from a single
@@ -159,7 +253,16 @@ pub async fn run_node_with_listeners(
     // module's docs. `store` is this replica's on-disk snapshot handle;
     // `load()` tells us whether this is a genuine restart (a snapshot
     // already exists for this node id) or a still-cold first boot.
-    let store = persist::Store::new(&config.data_dir, config.id)?;
+    // `.with_artificial_delay`/`.with_save_counter` are Phase 8.1a test-only
+    // instrumentation (see `NodeConfig::persist_delay`/`save_counter`'s
+    // docs) -- a strict no-op (`Duration::ZERO`, this store's own private
+    // counter) for every real `queso-node` run.
+    let store = persist::Store::new(&config.data_dir, config.id)?
+        .with_artificial_delay(config.persist_delay);
+    let store = match &config.save_counter {
+        Some(counter) => store.with_save_counter(counter.clone()),
+        None => store,
+    };
     let loaded = store.load()?;
     let is_restart = loaded.is_some();
     let (mut node, baseline) = match loaded {
@@ -195,51 +298,89 @@ pub async fn run_node_with_listeners(
     let mut pending: BTreeMap<OpId, oneshot::Sender<Outcome>> = BTreeMap::new();
     let mut next_op_id: u64 = 0;
 
-    while let Some(event) = inbox_rx.recv().await {
-        // Fixed for the whole dispatch below, exactly like
-        // `queso_sim::kernel::Kernel::run_until` fixing `KernelCore::now`
-        // before invoking a `Node` callback -- see `RealCtx::tick_now`'s
-        // docs.
-        ctx.tick_now();
-        // Only an incoming `Message` can mutate this replica's `Durable`
-        // half (a `Request` mutates its recorder's ISR; a `Response` that
-        // completes a quorum mutates `next_slot`/`applied_log`/`kv` via
-        // `SmrNode::finish_attempt`) -- see this module's docs. `Timer` and
-        // `ClientSubmit` never do (a timer only re-drives an already-live
-        // `Proposer`/starts a fresh one; `submit` only touches the volatile
-        // op queue), so there is nothing to fsync before releasing their
-        // effects.
-        let may_mutate_durable = matches!(event, Event::Message { .. });
-        match event {
-            Event::Message { from, payload } => node.on_message(from, payload, &mut ctx),
-            Event::Timer(timer_id) => node.on_timer(timer_id, &mut ctx),
-            Event::ClientSubmit { command, resp } => {
-                let op_id = OpId(next_op_id);
-                next_op_id += 1;
-                pending.insert(op_id, resp);
-                node.submit(op_id, config.id, command, &mut ctx);
+    while let Some(first_event) = inbox_rx.recv().await {
+        let mut batch_mutated_durable = false;
+        let mut batch_last_tick: Option<u64> = None;
+        let mut batch_len: usize = 0;
+        let mut next_event = Some(first_event);
+
+        // Apply the event that woke this iteration, then greedily drain any
+        // events *already* sitting in the inbox with a non-blocking
+        // `try_recv` -- never waiting for more to arrive -- up to
+        // `GROUP_COMMIT_BATCH_LIMIT`. See this module's "Group commit" docs.
+        // `next_event` is `Some` at least once (`first_event`), so this loop
+        // always runs at least one iteration.
+        while let Some(event) = next_event.take() {
+            // Fixed for this one event's dispatch, exactly like
+            // `queso_sim::kernel::Kernel::run_until` fixing `KernelCore::now`
+            // before invoking a `Node` callback -- see `RealCtx::tick_now`'s
+            // docs. Recomputed per-event, not once per batch: each event
+            // still gets its own accurate dispatch-time `now`, exactly as it
+            // would have as a batch of one.
+            ctx.tick_now();
+            // Only an incoming `Message` can mutate this replica's `Durable`
+            // half (a `Request` mutates its recorder's ISR; a `Response`
+            // that completes a quorum mutates `next_slot`/`applied_log`/`kv`
+            // via `SmrNode::finish_attempt`) -- see this module's docs.
+            // `Timer` and `ClientSubmit` never do (a timer only re-drives an
+            // already-live `Proposer`/starts a fresh one; `submit` only
+            // touches the volatile op queue).
+            let may_mutate_durable = matches!(event, Event::Message { .. });
+            match event {
+                Event::Message { from, payload } => node.on_message(from, payload, &mut ctx),
+                Event::Timer(timer_id) => node.on_timer(timer_id, &mut ctx),
+                Event::ClientSubmit { command, resp } => {
+                    let op_id = OpId(next_op_id);
+                    next_op_id += 1;
+                    pending.insert(op_id, resp);
+                    node.submit(op_id, config.id, command, &mut ctx);
+                }
+            }
+            if may_mutate_durable {
+                // Phase 8.1a test-only instrumentation (see
+                // `NodeConfig::durable_event_counter`'s docs) -- counts every
+                // dispatched mutating event, regardless of batching, so a
+                // test can directly compare it against `store.save_count()`
+                // to prove coalescing happened. `None` (a no-op) for every
+                // real `queso-node` run and every other test.
+                if let Some(counter) = &config.durable_event_counter {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            batch_mutated_durable |= may_mutate_durable;
+            batch_last_tick = Some(ctx.now().0);
+            batch_len += 1;
+
+            if batch_len < GROUP_COMMIT_BATCH_LIMIT {
+                next_event = inbox_rx.try_recv().ok();
             }
         }
 
-        // Write-before-reply (P12, on real disk): persist this event's
-        // durable mutations, if any, before anything it produced -- a
-        // recorder's `RecordResponse`, a proposer's own requests, a
-        // self-loopback vote, or (via the completed-ops check just below)
-        // a client's `Outcome` -- is allowed to actually leave this
-        // replica. See this module's docs and `crate::persist`'s.
-        if may_mutate_durable {
+        // Write-before-reply (P12, on real disk): persist this *batch's*
+        // durable mutations, if any, as a single snapshot/fsync covering
+        // every event just applied, before anything any of them produced --
+        // a recorder's `RecordResponse`, a proposer's own requests, a
+        // self-loopback vote, or (via the completed-ops check just below) a
+        // client's `Outcome` -- is allowed to actually leave this replica.
+        // `.await`ing `persist` here (rather than `flush_outbound` below)
+        // is exactly what makes this a real durability barrier despite the
+        // write itself running on a `spawn_blocking` thread -- see this
+        // module's "Group commit"/"Async fsync offload" docs and
+        // `crate::persist`'s.
+        if batch_mutated_durable {
             let snapshot = node.durable_snapshot();
-            store.save(&snapshot, ctx.now().0)?;
+            let tick = batch_last_tick.expect("a batch that mutated durable state applied at least one event, which always sets batch_last_tick");
+            store.persist(&snapshot, tick).await?;
         }
         ctx.flush_outbound();
 
         // A submitted op usually completes several events later than the
         // one that submitted it (whichever message/timer finally drives
-        // its slot to a decision) -- so every dispatch, not just
-        // `ClientSubmit`, must check whether any pending op just finished
-        // and, if so, answer its waiting client. Only reached after the
-        // write-before-reply persist above, so a client can never be told
-        // an operation succeeded before that success is durable.
+        // its slot to a decision) -- so every batch, not just one
+        // containing a `ClientSubmit`, must check whether any pending op
+        // just finished and, if so, answer its waiting client. Only reached
+        // after the write-before-reply persist above, so a client can never
+        // be told an operation succeeded before that success is durable.
         let completed: Vec<OpId> = pending
             .keys()
             .copied()

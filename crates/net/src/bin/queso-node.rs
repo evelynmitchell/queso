@@ -108,6 +108,12 @@ async fn main() -> anyhow::Result<()> {
         // test/bench-harness knob, not a CLI flag here -- always off for a
         // real `queso-node` run. See `NodeConfig::nemesis`'s docs.
         nemesis: None,
+        // Phase 8.1a's test-only durability instrumentation (see
+        // `NodeConfig::persist_delay`/`NodeConfig::save_counter`'s docs) --
+        // never set for a real `queso-node` run.
+        persist_delay: Duration::ZERO,
+        save_counter: None,
+        durable_event_counter: None,
     };
 
     queso_net::run_node(config).await

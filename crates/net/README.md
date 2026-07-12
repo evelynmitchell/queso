@@ -39,30 +39,63 @@ determinism lints (see `src/lib.rs`'s `#![allow(clippy::disallowed_methods)]`)
 > **majority** of replicas no longer loses an acknowledged write or
 > diverges (see `tests/restart_recovery.rs`, which reproduces the exact
 > scenario the audit found and asserts it no longer happens, against real
-> spawned-and-killed `queso-node` processes). It is still **not** a
-> production-grade durability story: see "Honest limits" below before
-> deploying this for real. No TLS (A3's content-oblivious-adversary
+> spawned-and-killed `queso-node` processes). Phase 8.1a (issue #46) then
+> hardened *how* that durable state is written — group-commit coalescing,
+> an async fsync offload, and an on-disk schema-version header — without
+> touching the write-before-reply guarantee itself; see below. It is still
+> **not** a production-grade durability story: see "Honest limits" below
+> before deploying this for real. No TLS (A3's content-oblivious-adversary
 > assumption is not realized over the wire yet), no reconfiguration, no log
 > compaction. (Phase 7.2 does add a client library with
 > retry-to-another-replica — see below.)
 
 **Honest limits of the current durability implementation (Phase 7
-hardening, not Phase 8's full operability story):**
+hardening plus Phase 8.1a, not Phase 8's full operability story):**
 
-- **Per-RPC fsync, not group commit.** Every inbound message that can
-  mutate durable state triggers its own synchronous `fsync(2)` on the
-  replica's single event loop thread — correct, but each `fsync` is a
-  real disk round trip, so single-replica throughput is bounded by disk
-  fsync latency (typically low hundreds to low thousands of ops/sec on
-  common cloud block storage, much higher on NVMe with a battery-backed
-  write cache). Group-commit/batching multiple decisions into one `fsync`
-  is a natural follow-up, deliberately not built here — see
-  `src/persist.rs`'s module docs.
-- **Whole-state snapshot, not an append-only log.** Each persist rewrites
-  the replica's *entire* durable state (every slot's recorder, the whole
-  applied log), not just the delta — `O(log length)` per write. Fine for
-  short-lived clusters/tests; a long-running deployment needs an
-  incremental WAL plus periodic snapshot/compaction (Phase 8 territory).
+- **Group commit, not per-op group-commit-of-one.** As of Phase 8.1a
+  (issue #46), the event loop no longer `fsync`s once per inbound message
+  unconditionally: it applies one event, then drains any *already-queued*
+  events (non-blocking, up to a capped batch size — see
+  `src/driver.rs`'s "Group commit" docs) before taking a single
+  `Durable` snapshot and persisting it once for the whole batch. Under
+  low/serialized load (never more than one event ready at a time) a batch
+  is always exactly size 1 — identical `fsync`-per-op behavior and latency
+  to before this change. Under concurrent load, multiple mutating events
+  can share one `fsync`, amortizing its cost — see
+  `tests/group_commit.rs`'s `group_commit_coalesces_fsyncs_under_concurrent_load`,
+  which measures this directly (fewer real fsync'd writes than
+  durable-mutating events applied). This crate's real bottleneck is still
+  disk fsync latency (typically low hundreds to low thousands of ops/sec
+  on common cloud block storage, much higher on NVMe with a battery-backed
+  write cache) — group commit amortizes that cost across whatever is
+  genuinely ready together, it does not eliminate it, and this
+  implementation's protocol has no pipelining (one decision in flight at a
+  time per replica — Stage 4a scope), which caps how much cross-op
+  batching is actually available to exploit.
+- **The blocking write itself is offloaded, not eliminated.** The
+  write+`fsync`+rename+directory-`fsync` sequence now runs on
+  `tokio::task::spawn_blocking`'s dedicated thread pool rather than the
+  driver's own async task (`Store::persist`, see `src/persist.rs`'s
+  docs) — the driver still `.await`s its completion before releasing any
+  reply that depends on it (write-before-reply, P12, unchanged), but other
+  tokio tasks on the same runtime (peer/client accept loops, dialers,
+  timers) keep making progress while one replica's fsync is in flight,
+  and more events can accumulate for the *next* batch to coalesce meanwhile.
+- **On-disk schema-version header (issue #39).** Every snapshot file now
+  starts with a small magic-bytes + version header; `Store::load` rejects
+  (a clear error, never a silent mis-parse) a file whose header doesn't
+  match what the running build understands — see `src/persist.rs`'s docs.
+  This is v1: the payload's own layout hasn't changed in this PR, only the
+  header wrapping it.
+- **Whole-state snapshot, not an append-only log.** Each persist still
+  rewrites the replica's *entire* durable state (every slot's recorder,
+  the whole applied log), not just the delta — `O(log length)` per write,
+  now amortized across a batch's worth of decisions rather than
+  eliminated. Fine for short-lived clusters/tests; a long-running
+  deployment needs an incremental WAL plus periodic snapshot/compaction
+  (Phase 8.1c territory, deliberately deferred — see issue #46's
+  design-decision comment for why a byte-incremental delta-WAL is not an
+  obviously-safe next step for this protocol).
 - **fsync is trusted, not independently verified.** Ordinary POSIX
   `fsync`/atomic-rename semantics are assumed; this does not defend
   against a lying disk/filesystem, nor does it `fsync` the data
@@ -135,6 +168,7 @@ cargo test -p queso-net --test cluster
 cargo test -p queso-net --test bench
 cargo test -p queso-net --test restart_recovery
 cargo test -p queso-net --test nemesis
+cargo test -p queso-net --test group_commit
 ```
 
 `tests/cluster.rs` boots a 3-node cluster entirely in-process (each
@@ -165,6 +199,19 @@ actual `queso-node` binary as independent OS processes, `SIGKILL`s a
 same `--data-dir`, and asserts every replica (including the two that just
 rebooted) still agrees on the write — the exact scenario the audit found
 broken. A second test does the easier minority-reboot case as a contrast.
+
+`tests/group_commit.rs` is issue #46's (Phase 8.1a) acceptance test:
+group-commit coalescing, the async fsync offload, and — the property that
+actually matters — that write-before-reply (P12) survives both changes
+intact. `write_before_reply_holds_even_when_the_fsync_is_slow` proves the
+ordering behaviorally (an artificially slow fsync, injected via
+`NodeConfig::persist_delay`, makes a client-observable lower bound on reply
+latency); `driver_source_persists_before_it_flushes_outbound_in_the_loop`
+is a fast, textual companion tripwire for the same property.
+`group_commit_coalesces_fsyncs_under_concurrent_load` proves batching is
+real by comparing two counters from the same run (durable-mutating events
+applied vs. real fsync'd writes performed); `a_single_op_at_a_time_still_works_and_is_still_persisted`
+is the batch-size-1 correctness counterpart.
 
 ## `queso-bench`: load generator + throughput/latency metrics (Phase 7.2)
 
@@ -368,9 +415,9 @@ plus the `queso-bench` load generator with throughput/latency metrics
   stay untouched by it — see `docs/compare-etcd.md` (Phase 7.5, issue #35);
 - TLS — Phase 7 (A3's content-oblivious-adversary assumption is not
   realized over the wire yet);
-- group-commit/batched fsync, incremental WAL + compaction (durability is
-  real but per-RPC-fsync/whole-snapshot — see "Honest limits" above) —
-  Phase 8;
+- incremental WAL + compaction (durability is real, group-commit-batched
+  as of Phase 8.1a, but still whole-snapshot, not byte-incremental — see
+  "Honest limits" above) — Phase 8.1b/8.1c;
 - cluster reconfiguration;
 - the Phase 6 auto-tuned leader policy wired to a real, cross-process
   network (`queso_smr::tuning::EpochTuner` assumes a single shared

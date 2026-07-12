@@ -57,7 +57,7 @@ pub fn fresh_data_dir() -> PathBuf {
 /// Boot an `n`-node cluster, each replica on its own thread + tokio
 /// runtime, and return every replica's client-facing address.
 pub fn spawn_cluster(n: usize, leader: Option<NodeId>) -> Vec<SocketAddr> {
-    spawn_cluster_inner(n, leader, None)
+    spawn_cluster_inner(n, leader, None, Duration::ZERO, None, None)
 }
 
 /// Like [`spawn_cluster`], but every replica shares `nemesis` (Phase 7.4,
@@ -71,13 +71,44 @@ pub fn spawn_cluster_with_nemesis(
     leader: Option<NodeId>,
     nemesis: Arc<Nemesis>,
 ) -> Vec<SocketAddr> {
-    spawn_cluster_inner(n, leader, Some(nemesis))
+    spawn_cluster_inner(n, leader, Some(nemesis), Duration::ZERO, None, None)
+}
+
+/// Like [`spawn_cluster`], but every replica's [`queso_net::persist::Store`]
+/// is built with `persist_delay` (Phase 8.1a's
+/// `NodeConfig::persist_delay`) injected as an artificial extra sleep
+/// before every blocking snapshot write, and -- if `save_counter`/
+/// `durable_event_counter` are `Some` -- shares those counters as every
+/// replica's save count / durable-mutating-event count (Phase 8.1a's
+/// `NodeConfig::save_counter`/`NodeConfig::durable_event_counter`) instead
+/// of each replica getting its own private, unobserved ones. Exists purely
+/// for `tests/group_commit.rs`'s write-before-reply ordering guard and
+/// group-commit-coalescing tests; no other test or `queso-node` itself ever
+/// sets any of these.
+pub fn spawn_cluster_with_persist_hooks(
+    n: usize,
+    leader: Option<NodeId>,
+    persist_delay: Duration,
+    save_counter: Option<Arc<AtomicU64>>,
+    durable_event_counter: Option<Arc<AtomicU64>>,
+) -> Vec<SocketAddr> {
+    spawn_cluster_inner(
+        n,
+        leader,
+        None,
+        persist_delay,
+        save_counter,
+        durable_event_counter,
+    )
 }
 
 fn spawn_cluster_inner(
     n: usize,
     leader: Option<NodeId>,
     nemesis: Option<Arc<Nemesis>>,
+    persist_delay: Duration,
+    save_counter: Option<Arc<AtomicU64>>,
+    durable_event_counter: Option<Arc<AtomicU64>>,
 ) -> Vec<SocketAddr> {
     // Bind every listener up front and keep it open until the node that owns
     // it adopts it via `run_node_with_listeners`. This closes the `free_addr`
@@ -119,6 +150,9 @@ fn spawn_cluster_inner(
             seed: 1_000 + i as u64,
             data_dir: data_dir.clone(),
             nemesis: nemesis.clone(),
+            persist_delay,
+            save_counter: save_counter.clone(),
+            durable_event_counter: durable_event_counter.clone(),
         };
         thread::Builder::new()
             .name(format!("queso-node-{i}"))

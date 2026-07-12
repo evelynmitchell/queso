@@ -75,6 +75,14 @@ pub fn spawn_cluster(
             seed: 1_000 + i as u64,
             data_dir: data_dir.clone(),
             nemesis: nemesis.clone(),
+            // Phase 8.1a's test-only durability instrumentation (see
+            // `NodeConfig::persist_delay`/`NodeConfig::save_counter`/
+            // `NodeConfig::durable_event_counter`'s docs) -- this harness
+            // doesn't need any of it, unlike `queso-net`'s own
+            // `tests/group_commit.rs`.
+            persist_delay: Duration::ZERO,
+            save_counter: None,
+            durable_event_counter: None,
         };
         thread::Builder::new()
             .name(format!("queso-compare-node-{i}"))
