@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use queso_net::config::NodeConfig;
 use queso_net::nemesis::Nemesis;
+use queso_net::tls::TlsConfig;
 use queso_net::{client, run_node_with_listeners};
 use queso_sim::ids::NodeId;
 use queso_smr::{Command, Outcome};
@@ -57,7 +58,35 @@ pub fn fresh_data_dir() -> PathBuf {
 /// Boot an `n`-node cluster, each replica on its own thread + tokio
 /// runtime, and return every replica's client-facing address.
 pub fn spawn_cluster(n: usize, leader: Option<NodeId>) -> Vec<SocketAddr> {
-    spawn_cluster_inner(n, leader, None, Duration::ZERO, false, None, None)
+    spawn_cluster_inner(n, leader, None, Duration::ZERO, false, None, None, None)
+}
+
+/// Like [`spawn_cluster`], but every replica boots with Phase 8.2a
+/// (issue #47) app-level TLS enabled -- `tls_configs[i]` is passed as
+/// replica `i`'s `NodeConfig::tls` (see `crate::tls`'s module docs).
+/// `tls_configs.len()` must equal `n`. Exists purely for `tests/tls.rs`; no
+/// other test sets `NodeConfig::tls` at all (every one of them is the
+/// crate's existing, still-unchanged plaintext behavior).
+pub fn spawn_cluster_with_tls(
+    n: usize,
+    leader: Option<NodeId>,
+    tls_configs: Vec<TlsConfig>,
+) -> Vec<SocketAddr> {
+    assert_eq!(
+        tls_configs.len(),
+        n,
+        "spawn_cluster_with_tls needs exactly one TlsConfig per replica"
+    );
+    spawn_cluster_inner(
+        n,
+        leader,
+        None,
+        Duration::ZERO,
+        false,
+        None,
+        None,
+        Some(tls_configs),
+    )
 }
 
 /// Like [`spawn_cluster`], but every replica shares `nemesis` (Phase 7.4,
@@ -71,7 +100,16 @@ pub fn spawn_cluster_with_nemesis(
     leader: Option<NodeId>,
     nemesis: Arc<Nemesis>,
 ) -> Vec<SocketAddr> {
-    spawn_cluster_inner(n, leader, Some(nemesis), Duration::ZERO, false, None, None)
+    spawn_cluster_inner(
+        n,
+        leader,
+        Some(nemesis),
+        Duration::ZERO,
+        false,
+        None,
+        None,
+        None,
+    )
 }
 
 /// Like [`spawn_cluster`], but every replica's [`queso_net::persist::Store`]
@@ -100,6 +138,7 @@ pub fn spawn_cluster_with_persist_hooks(
         false,
         save_counter,
         durable_event_counter,
+        None,
     )
 }
 
@@ -119,7 +158,7 @@ pub fn spawn_cluster_with_leader_persist_delay(
     leader: Option<NodeId>,
     persist_delay: Duration,
 ) -> Vec<SocketAddr> {
-    spawn_cluster_inner(n, leader, None, persist_delay, true, None, None)
+    spawn_cluster_inner(n, leader, None, persist_delay, true, None, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -131,6 +170,7 @@ fn spawn_cluster_inner(
     persist_delay_leader_only: bool,
     save_counter: Option<Arc<AtomicU64>>,
     durable_event_counter: Option<Arc<AtomicU64>>,
+    tls_configs: Option<Vec<TlsConfig>>,
 ) -> Vec<SocketAddr> {
     // Bind every listener up front and keep it open until the node that owns
     // it adopts it via `run_node_with_listeners`. This closes the `free_addr`
@@ -183,6 +223,7 @@ fn spawn_cluster_inner(
             persist_delay: this_persist_delay,
             save_counter: save_counter.clone(),
             durable_event_counter: durable_event_counter.clone(),
+            tls: tls_configs.as_ref().map(|configs| configs[i].clone()),
         };
         thread::Builder::new()
             .name(format!("queso-node-{i}"))
@@ -227,6 +268,31 @@ pub async fn submit_with_retry(addr: SocketAddr, command: &Command, timeout: Dur
             Err(err) => {
                 if tokio::time::Instant::now() >= deadline {
                     panic!("submit to {addr} never succeeded (last error: {err:?})");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// Like [`submit_with_retry`], but over Phase 8.2a TLS
+/// (`client::submit_with_tls`) instead of plaintext -- for
+/// `tests/tls.rs`'s TLS-enabled cluster, whose client listeners no longer
+/// speak plaintext at all once `NodeConfig::tls` is `Some`.
+pub async fn submit_with_retry_tls(
+    addr: SocketAddr,
+    command: &Command,
+    tls: &Arc<rustls::ClientConfig>,
+    timeout: Duration,
+) -> Outcome {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let server_name = queso_net::tls::server_name_for(&addr.ip().to_string(), None);
+        match client::submit_with_tls(addr, command, tls, server_name).await {
+            Ok(outcome) => return outcome,
+            Err(err) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("TLS submit to {addr} never succeeded (last error: {err:?})");
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }

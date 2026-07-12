@@ -14,6 +14,7 @@ use std::time::Duration;
 use queso_sim::ids::NodeId;
 
 use crate::nemesis::Nemesis;
+use crate::tls::TlsConfig;
 
 /// One replica's full real-network configuration.
 #[derive(Debug, Clone)]
@@ -112,4 +113,18 @@ pub struct NodeConfig {
     /// `group_commit_coalesces_fsyncs_under_concurrent_load`. `None` for
     /// every real `queso-node` run and every other test.
     pub durable_event_counter: Option<Arc<AtomicU64>>,
+    /// Phase 8.2a (issue #47): opt-in app-level TLS for both this
+    /// replica's peer-to-peer connections (mutual TLS -- see
+    /// `crate::tls::build_peer_tls`) and its client-facing listener
+    /// (server-authenticated TLS -- see
+    /// `crate::tls::build_client_facing_server_tls`), using the same
+    /// cert/key/CA. `None` -- the default for every existing test and for
+    /// `queso-node` unless its `--tls-cert`/`--tls-key`/`--tls-ca` flags
+    /// are all passed -- is a true no-op: `crate::driver::run_node`/
+    /// `run_node_with_listeners` never build a `rustls` config, never run a
+    /// TLS handshake, and every socket is exactly the plain `TcpStream`
+    /// this crate spoke before this field existed. See `crate::tls`'s
+    /// module docs for exactly what TLS mode each connection kind gets and
+    /// this crate's README for how to enable it end to end.
+    pub tls: Option<TlsConfig>,
 }

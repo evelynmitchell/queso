@@ -33,6 +33,7 @@ async fn queso_target_produces_a_sane_summary_against_a_real_cluster() {
             attempt_timeout: Duration::from_secs(3),
             max_rounds: 10,
             retry_backoff: Duration::from_millis(20),
+            ..ClientConfig::default()
         },
     );
     let target = Arc::new(QuesoTarget::new(client));

@@ -37,6 +37,7 @@
 //! design here).
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,6 +45,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use queso_net::client::{Client, ClientConfig};
 use queso_net::metrics::{OpKind, Recorder, Sample};
+use queso_net::tls::ClientTlsConfig;
 use queso_smr::{ClientId, Command};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -133,6 +135,22 @@ struct Args {
     /// one address before retrying against another.
     #[arg(long, default_value_t = 2000)]
     attempt_timeout_ms: u64,
+
+    /// Phase 8.2a (issue #47): PEM file containing the CA certificate(s)
+    /// trusted to sign a replica's TLS server certificate. Setting this
+    /// enables server-authenticated TLS (see `queso_net::tls`'s module
+    /// docs) for every connection this run makes; omit for plaintext (the
+    /// default, unchanged from before this flag existed). Client-cert auth
+    /// is out of scope for `queso-bench` -- it is not a cluster member.
+    #[arg(long)]
+    tls_ca: Option<PathBuf>,
+
+    /// Only consulted when `--tls-ca` is set: pin full server-name
+    /// verification to this exact name instead of the default chain-only
+    /// verification (see `queso_net::tls::ClientTlsConfig::expected_server_name`'s
+    /// docs for when you would want this).
+    #[arg(long)]
+    tls_server_name: Option<String>,
 }
 
 /// One virtual client session: a stable `ClientId` plus the monotonic
@@ -390,10 +408,24 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Phase 8.2a (issue #47): `--tls-ca` opts every connection this run
+    // makes into server-authenticated TLS (see `queso_net::tls`'s module
+    // docs); omitted, `tls` stays `None` and `Client` behaves exactly as
+    // before this flag existed.
+    let tls = match &args.tls_ca {
+        None => None,
+        Some(ca_path) => Some(queso_net::tls::build_client_tls(&ClientTlsConfig {
+            ca_path: ca_path.clone(),
+            expected_server_name: args.tls_server_name.clone(),
+        })?),
+    };
+
     let client = Arc::new(Client::with_config(
         args.addrs.clone(),
         ClientConfig {
             attempt_timeout: Duration::from_millis(args.attempt_timeout_ms),
+            tls,
+            tls_server_name: args.tls_server_name.clone(),
             ..ClientConfig::default()
         },
     ));

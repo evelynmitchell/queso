@@ -30,7 +30,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 hdrhistogram = { version = "7", default-features = false, features = ["sync"] }
 serde_json = "1"
+# Phase 8.2a (issue #47): app-level TLS -- see `src/tls.rs`. Pure-Rust (no
+# OpenSSL, no system TLS library): `default-features = false` plus the
+# explicit `ring` feature opts out of rustls 0.23's *default* `aws-lc-rs`
+# crypto provider (whose `aws-lc-sys` build needs `cmake` plus a C
+# compiler for AWS-LC's C/assembly sources) in favor of `ring` (just a C
+# compiler for its small assembly core, no `cmake`) -- keeping
+# `deploy/Dockerfile`'s builder image's requirements unchanged and
+# preserving the glibc-only, no-dynamically-linked-libssl linkage that
+# image relies on.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tempfile = "3"
+# Phase 8.2a: generates throwaway CA + node/client certs at test-run time
+# (see `tests/tls.rs`) so no PEM fixtures are checked into the repo.
+rcgen = "0.13"
