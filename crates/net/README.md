@@ -307,10 +307,13 @@ internally for its own restart catch-up probes and asserts no real
 submission ever uses (a build that picked `u32::MAX` panics every replica it
 talks to). This is only a *convention*, not an enforced reservation --
 override it with `--client-id` if your application also happens to use it.
-**The admin `seq`** defaults to the current wall-clock time in milliseconds
+**The admin `seq`** defaults to the current wall-clock time in nanoseconds
 (`queso_net::admin::default_seq`) since `queso-admin` is a fresh process per
-invocation with no persisted counter to draw a guaranteed-fresh `seq` from;
-pass `--seq` explicitly for guaranteed-fresh values in scripted/rapid-fire
+invocation with no persisted counter to draw a guaranteed-fresh `seq` from.
+Two admin writes that share a `seq` collide in the server-side A6 dedup
+(which is keyed by `ClientId` alone, not per-key), and the second is silently
+dropped while still reporting `Put` — so pass `--seq` explicitly for
+guaranteed-fresh, correctly-ordered values in scripted/rapid-fire or parallel
 usage. See `queso_net::admin`'s module docs for the full reasoning on both.
 
 ### Tests (`tests/admin.rs`)

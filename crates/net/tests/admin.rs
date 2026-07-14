@@ -225,7 +225,7 @@ async fn admin_put_then_get_round_trips_a_value() {
     assert_eq!(get_after_overwrite, Outcome::Get(Some(1000)));
 }
 
-/// The admin `ClientId` (`DEFAULT_ADMIN_CLIENT_ID`, `u32::MAX`) must not
+/// The admin `ClientId` (`DEFAULT_ADMIN_CLIENT_ID`, `u32::MAX - 1`) must not
 /// interfere with an ordinary application client's own `(ClientId, seq)`
 /// dedup space (A6) -- both submit against the same cluster, on different
 /// keys, and both must see exactly what they wrote, unaffected by the

@@ -57,17 +57,28 @@
 //! `queso-bench`'s long-lived `Session` (`src/bin/queso-bench.rs`), it has
 //! no persisted, monotonically-advancing counter to draw a guaranteed-fresh
 //! `seq` from across separate invocations. [`default_seq`] falls back to
-//! the current wall-clock time in milliseconds since the Unix epoch: real
+//! the current wall-clock time in **nanoseconds** since the Unix epoch: real
 //! time only moves forward, so consecutive manual invocations get strictly
 //! increasing `seq`s in practice (this crate is already the workspace's
 //! real-I/O boundary -- see `src/lib.rs`'s docs -- so this is not a
 //! determinism-lint violation the way it would be in `queso-sim`/
-//! `queso-consensus`/`queso-smr`). This is a *best-effort* default, not a
-//! guarantee: two invocations within the same millisecond, or a system
-//! clock that jumps backward, could in principle collide or go backwards.
-//! A caller that needs guaranteed-fresh `seq`s (e.g. a script issuing many
-//! admin `Put`s in a tight loop) should pass `--seq` explicitly rather than
-//! rely on the default.
+//! `queso-consensus`/`queso-smr`).
+//!
+//! **Why a collision matters, and why it's still only a best-effort
+//! default.** The server-side A6 dedup (`queso_smr::kv`) is keyed by
+//! `ClientId` *alone*, not `(ClientId, key)`: if two admin writes ever share
+//! a `seq`, the second is treated as a duplicate of the first and silently
+//! dropped -- *even if it targets a different key*. And because the protocol
+//! collapses a genuinely-new `Put` and a deduplicated one into the identical
+//! `Outcome::Put` on the wire, `queso-admin` cannot tell the operator which
+//! happened: a dropped write still prints `Put`. Nanosecond resolution makes
+//! an accidental collision between two separate CLI invocations vanishingly
+//! unlikely (they'd have to be issued within the same nanosecond), but it is
+//! not a hard guarantee -- a backward system-clock jump could still collide
+//! or regress. A caller that needs guaranteed-fresh, correctly-ordered
+//! `seq`s (e.g. a script issuing many admin `Put`s in a tight loop, or
+//! parallel invocations) should pass `--seq` explicitly rather than rely on
+//! the default.
 
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -152,6 +163,37 @@ impl ReplicaStatus {
 /// and, by extension, [`fetch_cluster_status`] -- forever. Shared by
 /// [`fetch_metrics`] (`/metrics`) and `queso-admin health`'s
 /// `/health`/`/ready` probes.
+/// Upper bound on how many bytes [`http_get`] will read from a status
+/// endpoint. Generous relative to a real `/metrics`/`/health` response (a
+/// few hundred bytes) but small enough that a hostile or buggy endpoint
+/// streaming an unbounded body can't exhaust this client's memory or flood
+/// the operator's terminal. A response at or above this size is truncated
+/// and then fails the parse with a clear per-replica error.
+const MAX_STATUS_RESPONSE_BYTES: u64 = 64 * 1024;
+
+/// How much of a response body to include verbatim in an error message.
+/// Bounds the terminal output from a misbehaving endpoint (which could
+/// still send up to [`MAX_STATUS_RESPONSE_BYTES`] of junk) while keeping
+/// enough to diagnose a genuine misconfiguration.
+const MAX_ERROR_BODY_CHARS: usize = 256;
+
+/// Truncate a response body for inclusion in an error message, so a
+/// (bounded but still large, or binary) body doesn't dominate the output.
+fn body_for_error(body: &str) -> String {
+    if body.len() <= MAX_ERROR_BODY_CHARS {
+        return body.to_string();
+    }
+    let mut end = MAX_ERROR_BODY_CHARS;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}... ({} bytes total, truncated)",
+        &body[..end],
+        body.len()
+    )
+}
+
 pub async fn http_get(
     addr: SocketAddr,
     path: &str,
@@ -168,8 +210,19 @@ pub async fn http_get(
             .await
             .with_context(|| format!("write GET {path} request"))?;
 
+        // Bound the read: a well-behaved status server's response is a few
+        // hundred bytes (the status listener itself caps *requests* at
+        // `status::MAX_REQUEST_BYTES`), but this is a hand-rolled client
+        // pointed at an arbitrary address an operator supplied -- a hostile
+        // or buggy endpoint that streams gigabytes must not make this call
+        // buffer them into memory (or, via the error contexts below, dump
+        // them to the operator's terminal). `take` caps the read; a response
+        // that would exceed the cap is simply truncated, which then fails
+        // the HTTP/JSON parse below with a clear per-replica error rather
+        // than an unbounded allocation.
         let mut response = Vec::new();
-        stream
+        (&mut stream)
+            .take(MAX_STATUS_RESPONSE_BYTES)
             .read_to_end(&mut response)
             .await
             .context("read status server response")?;
@@ -205,10 +258,15 @@ pub async fn fetch_metrics(addr: SocketAddr, timeout: Duration) -> anyhow::Resul
     let (status_code, body) = http_get(addr, "/metrics", timeout).await?;
     anyhow::ensure!(
         status_code == 200,
-        "GET /metrics against {addr} returned HTTP {status_code} (expected 200): {body:?}"
+        "GET /metrics against {addr} returned HTTP {status_code} (expected 200): {}",
+        body_for_error(&body)
     );
-    serde_json::from_str(&body)
-        .with_context(|| format!("parsing /metrics JSON from {addr}: {body:?}"))
+    serde_json::from_str(&body).with_context(|| {
+        format!(
+            "parsing /metrics JSON from {addr}: {}",
+            body_for_error(&body)
+        )
+    })
 }
 
 /// Like [`fetch_metrics`], but never returns an `Err` -- any failure
@@ -364,11 +422,18 @@ pub fn render_status_table(statuses: &[ReplicaStatus], summary: &ClusterSummary)
 
 /// Best-effort default `seq` for an admin `put`/`get` -- see the module
 /// docs' "The admin `seq`" section for why this is wall-clock-derived and
-/// what its limits are.
+/// what its limits are. Uses **nanosecond** resolution deliberately: the
+/// server-side A6 dedup is keyed by `ClientId` alone (not `(ClientId,
+/// key)`), so two admin writes that happen to share a `seq` collide and the
+/// second is silently deduped -- nanosecond granularity shrinks that
+/// collision window by ~10^6 versus milliseconds, making an accidental
+/// collision between two separate CLI invocations vanishingly unlikely
+/// short of them being issued within the same nanosecond. `--seq` remains
+/// the explicit escape hatch for scripts that need a guaranteed ordering.
 pub fn default_seq() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
 }
 
@@ -540,5 +605,23 @@ mod tests {
             b >= a,
             "wall-clock time must not appear to go backwards within one test"
         );
+    }
+
+    #[test]
+    fn body_for_error_truncates_a_large_body_and_passes_a_small_one_through() {
+        let small = "not json";
+        assert_eq!(body_for_error(small), small);
+
+        let big = "x".repeat(MAX_ERROR_BODY_CHARS + 5_000);
+        let out = body_for_error(&big);
+        assert!(out.len() < big.len(), "a large body must be truncated");
+        assert!(out.contains("truncated"));
+        assert!(out.contains(&big.len().to_string()));
+
+        // A multi-byte char straddling the cut point must not panic / must
+        // stay on a char boundary.
+        let multibyte = "é".repeat(MAX_ERROR_BODY_CHARS);
+        let out = body_for_error(&multibyte);
+        assert!(out.contains("truncated"));
     }
 }
