@@ -370,6 +370,20 @@ enable `--status-listen` by default -- adding the flag and a matching
 fly-managed health checks, not required for the manual verification steps
 above.
 
+**Manual cluster-health checks (Phase 8.2d, issue #47).** With
+`--status-listen` enabled on each replica, `queso-admin status` (see
+`crates/net/README.md`'s `queso-admin` section) gives a human-readable
+reachable/ready/log-frontier table across the whole cluster from an
+operator's machine -- point it at each app's `.internal` status port
+through the same `fly proxy` tunnels used in step 8 (or run it from inside
+the 6PN mesh), e.g. `queso-admin status --status-addr 127.0.0.1:9000
+--status-addr 127.0.0.1:9001 --status-addr 127.0.0.1:9002` against three
+locally-forwarded tunnels. It tolerates a down replica (reports it
+unreachable, still summarizes the rest) rather than failing the whole
+command, and flags any replica whose log frontier (`next_slot`) is behind
+the others' -- useful as a quick "did that last write actually land
+everywhere yet?" check without reaching for `queso-bench`.
+
 ## 9. Run a queso-bench workload against the live cluster
 
 With the same three `fly proxy` tunnels from step 8 still running:

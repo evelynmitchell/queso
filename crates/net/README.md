@@ -17,7 +17,9 @@ cluster on fly.io -- see `docs/deploy-flyio.md` for the runbook and
 `deploy/Dockerfile`/`deploy/fly.toml` for the config; that phase is also
 where `--peer`'s `host:port` addresses gained hostname resolution (see
 `resolve_peer_addr` in `src/transport.rs`) so peers can dial each other by
-DNS name, not just literal IP.
+DNS name, not just literal IP. Phase 8.2d (issue #47) adds `queso-admin`, an
+out-of-cluster operator CLI (`status`/`health`/`put`/`get`) built on
+`queso_net::admin` -- see "`queso-admin`: out-of-cluster operator CLI" below.
 
 This crate is the deliberate real-I/O boundary: real sockets, real
 wall-clock time, real OS entropy. It is exempt from the workspace's
@@ -216,6 +218,120 @@ slow-loris-style request gets a bounded-size, bounded-time read and a `400`
 or a dropped connection, never a panic. See `cargo test -p queso-net --test
 status` (below) for the acceptance test against a real cluster.
 
+## `queso-admin`: out-of-cluster operator CLI (Phase 8.2d, issue #47)
+
+`queso-admin` is a small operator tool that talks to a running cluster from
+*outside* it -- unlike `queso-node` (a replica) or `queso-bench` (a load
+generator), it exists purely for "is my cluster healthy?" and "let me poke
+one key" during manual operation. Its reusable logic lives in
+`queso_net::admin` (unit/integration-testable in-process, see
+`tests/admin.rs`); `src/bin/queso-admin.rs` is a thin `clap` wrapper over it.
+Dependency-light like the rest of this crate: `status`'s `GET /metrics` fetch
+is a hand-rolled request over a bare `tokio::net::TcpStream` (same style as
+`tests/support/mod.rs::http_get`), not `reqwest`/`hyper`.
+
+Build it alongside the other binaries:
+
+```sh
+cargo build -p queso-net --bin queso-admin
+```
+
+### `queso-admin status` -- the flagship subcommand
+
+Polls every replica's status-server address (`GET /metrics`, plaintext --
+the status port never speaks TLS, see "Phase 8.2" above) and renders a
+cluster-health table: reachability, `ready`, log frontier (`next_slot`),
+`save_count`, and `uptime_secs`, plus a rollup of how many replicas answered
+and whether their frontiers agree.
+
+```sh
+./target/debug/queso-admin status \
+  --status-addr 127.0.0.1:9000 --status-addr 127.0.0.1:9001 --status-addr 127.0.0.1:9002
+```
+
+```
+index address                      reachable  ready   next_slot  save_cnt   uptime_s
+0     127.0.0.1:9000               yes        true    2          6          11.3
+1     127.0.0.1:9001               yes        true    0          2          11.3       (lagging)
+2     127.0.0.1:9002               yes        true    0          2          11.3       (lagging)
+
+cluster: 3/3 replicas reachable, all_ready=true
+frontier: max next_slot=2; lagging replica indices (behind max): [1, 2]
+```
+
+A replica that is down (connection refused/timed out) or answers something
+unparseable is reported **unreachable**, never a crash or a hang for the
+rest of the command -- each replica's `GET /metrics` is fetched concurrently
+and bounded by `--timeout-ms` (default 3000ms), so one dead address costs
+this command roughly one timeout, not `timeout * replica count`.
+`queso-admin status` exits non-zero only if **no** replica at all was
+reachable; a degraded-but-partially-healthy cluster (some down, or some
+lagging) is still reported in full and exits `0` -- still useful output,
+not a failure of the command itself.
+
+**"Lagging" is a real, expected condition, not a bug**: per
+`queso_smr::replica`'s module docs, a replica only advances its own
+`next_slot` when it actively attempts (or catches up on) a slot itself, so a
+write that went through only one replica can legitimately leave the other
+two behind until something asks them to do more work -- `status` surfaces
+that honestly (`next_slot` behind the cluster's max) rather than hiding it.
+There is deliberately **no "trigger catch-up" subcommand**: the node has no
+such admin RPC, and doesn't need one -- a replica that fell behind
+self-heals via its own restart/quiescence catch-up watchdog. `queso-admin
+health --status-addr <addr>` is a cheap convenience alongside `status` for
+checking one replica's `GET /health`/`GET /ready` directly.
+
+### `queso-admin put`/`get`
+
+Submit a real `Put`/`Get` against the cluster's *client* ports (not the
+status ports) via `queso_net::client::Client` -- the same pooled-addresses,
+retry-to-another-replica path `queso-bench` uses, with the same optional
+TLS flags (`--tls-ca`/`--tls-server-name`, see "TLS" below):
+
+```sh
+./target/debug/queso-admin put 42 777 \
+  --addr 127.0.0.1:8000 --addr 127.0.0.1:8001 --addr 127.0.0.1:8002
+# Put
+
+./target/debug/queso-admin get 42 \
+  --addr 127.0.0.1:8000 --addr 127.0.0.1:8001 --addr 127.0.0.1:8002
+# Get(Some(777))
+```
+
+**The admin `ClientId`.** Every `Command` is tagged `(ClientId, seq)` for
+idempotent dedup (A6) -- a real application's clients own that dedup space,
+so `queso-admin` must not collide with it. It defaults to
+`queso_net::admin::DEFAULT_ADMIN_CLIENT_ID` (`ClientId(u32::MAX - 1)`) --
+deliberately **not** `u32::MAX` itself, which `queso_smr::replica` reserves
+internally for its own restart catch-up probes and asserts no real
+submission ever uses (a build that picked `u32::MAX` panics every replica it
+talks to). This is only a *convention*, not an enforced reservation --
+override it with `--client-id` if your application also happens to use it.
+**The admin `seq`** defaults to the current wall-clock time in nanoseconds
+(`queso_net::admin::default_seq`) since `queso-admin` is a fresh process per
+invocation with no persisted counter to draw a guaranteed-fresh `seq` from.
+Two admin writes that share a `seq` collide in the server-side A6 dedup
+(which is keyed by `ClientId` alone, not per-key), and the second is silently
+dropped while still reporting `Put` — so pass `--seq` explicitly for
+guaranteed-fresh, correctly-ordered values in scripted/rapid-fire or parallel
+usage. See `queso_net::admin`'s module docs for the full reasoning on both.
+
+### Tests (`tests/admin.rs`)
+
+```sh
+cargo test -p queso-net --test admin
+```
+
+Against real, in-process, real-TCP clusters (`tests/support/mod.rs`'s
+`spawn_cluster`/`spawn_cluster_with_status`): `status` against a healthy
+3-node cluster reports every replica reachable/ready and, once each replica
+has been touched, agreeing frontiers; a second test swaps one replica's
+status address for one nothing is listening on and asserts it's reported
+unreachable (not a crash or a hang) while the other two are still reported
+healthy; a third round-trips a `Put`/`Get` through `queso_net::admin`'s
+`Client`-backed path; a fourth proves the admin `ClientId` doesn't interfere
+with an ordinary application client's own ops on the same cluster.
+
 ## Automated end-to-end tests
 
 ```sh
@@ -223,6 +339,7 @@ cargo test -p queso-net --test cluster
 cargo test -p queso-net --test bench
 cargo test -p queso-net --test restart_recovery
 cargo test -p queso-net --test status
+cargo test -p queso-net --test admin
 cargo test -p queso-net --test nemesis
 cargo test -p queso-net --test group_commit
 cargo test -p queso-net --test tls
@@ -567,13 +684,17 @@ are the TLS-capable equivalents of `Client`/`client::submit`.
 - **No cert rotation.** Every cert/key/CA PEM is loaded once at boot
   (`crate::tls::build_peer_tls`/`build_client_facing_server_tls`); rotating
   a cert requires restarting the replica. No hot-reload, no SIGHUP handler.
-- **`queso-bench` is TLS-capable; other client tooling may not be.** The
-  `queso_net::client` library (`Client`/`submit_with_tls`) and
-  `queso-bench`'s `--tls-ca` flag are wired end to end. A hand-rolled
-  caller using the bare `client::submit` helper (not `submit_with_tls`)
-  gets plaintext regardless of a replica's TLS configuration — that helper
-  intentionally stayed a minimal, non-TLS building block (see its docs);
-  reach for `submit_with_tls`/`Client` for a real TLS-capable caller.
+- **`queso-bench`/`queso-admin` are TLS-capable; other client tooling may
+  not be.** The `queso_net::client` library (`Client`/`submit_with_tls`) and
+  `queso-bench`'s/`queso-admin put`'s/`queso-admin get`'s `--tls-ca` flag
+  are wired end to end. A hand-rolled caller using the bare `client::submit`
+  helper (not `submit_with_tls`) gets plaintext regardless of a replica's
+  TLS configuration — that helper intentionally stayed a minimal, non-TLS
+  building block (see its docs); reach for `submit_with_tls`/`Client` for a
+  real TLS-capable caller. `queso-admin status`/`health` never use TLS at
+  all — the status port is always plaintext HTTP (see `src/status.rs`'s
+  module docs), regardless of whether the cluster's client/peer traffic is
+  TLS-enabled.
 - **Name-matching is relaxed by default** (see `crate::tls::ChainOnlyServerCertVerifier`'s
   docs above) — chain-to-CA trust is the real security boundary here, not
   hostname pinning, unless `expected_server_name` is explicitly set.
@@ -585,18 +706,22 @@ are the TLS-capable equivalents of `Client`/`client::submit`.
   fly's own already-encrypted `.internal` traffic and the honest "not
   verified here" caveat that applies to the rest of that runbook too.
 
-## Scope (Phase 7.1 + 7.2 + 7.4 + 8.2a — see the crate docs)
+## Scope (Phase 7.1 + 7.2 + 7.4 + 8.2a + 8.2d — see the crate docs)
 
 Transport + node binary + client-facing wire protocol (Phase 7.1), a
 client library with a replica-address pool and retry-to-another-replica
 plus the `queso-bench` load generator with throughput/latency metrics
 (Phase 7.2), an in-transport fault injector plus adversarial perf tests
-(Phase 7.4), and opt-in app-level TLS for both peer mTLS and
-server-authenticated client TLS (Phase 8.2a, above). Explicitly **not** in
-this crate yet:
+(Phase 7.4), opt-in app-level TLS for both peer mTLS and
+server-authenticated client TLS (Phase 8.2a), and `queso-admin`, an
+out-of-cluster operator CLI for cluster-health polling and one-off
+`Put`/`Get`s (Phase 8.2d, above). Explicitly **not** in this crate yet:
 
 - session/seq management beyond A6's one-in-flight-per-`ClientId` minimum,
   connection pooling/reuse, or pipelining in the client library;
+- any admin RPC to force a lagging replica to catch up -- `queso-admin
+  status` only *observes* a lagging frontier (see above); the node itself
+  has no such endpoint, by design (see `queso_net::admin`'s module docs);
 - comparisons against alternative systems — this crate's `--output
   json`/`csv` exist so those runs have something to diff against, but the
   actual comparison harness (`queso-compare`) and methodology live in the
