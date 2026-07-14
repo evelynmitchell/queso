@@ -88,7 +88,16 @@
 //!   via a `Send + Sync` [`status::StatusShared`] atomics snapshot -- see
 //!   that module's docs for the endpoints' precise semantics and this
 //!   crate's README for the CLI flag.
+//! - [`admin`] -- Phase 8.2d (issue #47): the reusable logic behind
+//!   `queso-admin`, an out-of-cluster operator CLI (`src/bin/queso-admin.rs`):
+//!   polling every replica's [`status`] `/metrics` into a cluster-health
+//!   table ([`admin::fetch_cluster_status`]/[`admin::summarize`]/
+//!   [`admin::render_status_table`]), and one-off `Put`/`Get`s against the
+//!   cluster's client ports via [`client::Client`] (`admin::put`/
+//!   `admin::get`) -- see that module's docs for the admin `ClientId`/`seq`
+//!   conventions.
 
+pub mod admin;
 pub mod client;
 pub mod config;
 pub mod ctx;
