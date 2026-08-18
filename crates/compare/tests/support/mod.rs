@@ -89,6 +89,8 @@ pub fn spawn_cluster(
             // Phase 8.2's status/metrics server (`NodeConfig::status_listen_addr`)
             // is opt-in and this harness doesn't need it.
             status_listen_addr: None,
+            // Phase 9.2 (issue #56): chain-checkpoint hook off.
+            chain_checkpoints: None,
         };
         thread::Builder::new()
             .name(format!("queso-compare-node-{i}"))

@@ -501,6 +501,33 @@ impl SmrNode {
         self.state.borrow().durable.next_slot
     }
 
+    /// The commands this replica has applied at slots `from_slot..`, in slot
+    /// order -- i.e. everything it has applied that a caller tracking
+    /// `from_slot` has not seen yet. Empty if `from_slot` is at or past this
+    /// replica's frontier.
+    ///
+    /// A pure, cheap read of already-tracked state -- no logic change --
+    /// added (Phase 9.2, issue #56) so a real driver can fold the
+    /// Chain-of-Blocks hash over what it just applied
+    /// (`queso_chain::ChainState`) without reaching into [`Durable`]'s
+    /// otherwise-`pub(crate)` fields itself.
+    ///
+    /// Deliberately a *range* read rather than a whole-log one:
+    /// [`Self::durable_snapshot`] already exposes everything, but it clones
+    /// every recorder, the entire applied log, and the KV, so a driver
+    /// calling it once per batch would pay `O(log length)` on every write.
+    /// Callers here keep their own cursor and pay only for what is new,
+    /// which is one command in the common case.
+    ///
+    /// Slots are gap-free (P7), so the returned slice is exactly
+    /// `[from_slot, next_slot)` with no holes -- a caller may fold it
+    /// straight into a running hash without checking for gaps.
+    pub fn applied_from(&self, from_slot: u64) -> Vec<Command> {
+        let st = self.state.borrow();
+        let from = from_slot.min(st.durable.applied_log.len() as u64) as usize;
+        st.durable.applied_log[from..].to_vec()
+    }
+
     /// Whether this replica's current in-flight attempt (if any) is its own
     /// internal restart catch-up probe (see [`Self::begin_catch_up`]) rather
     /// than a real client-visible operation. `true` exactly while a catch-up

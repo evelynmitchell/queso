@@ -144,4 +144,18 @@ pub struct NodeConfig {
     /// instead pre-bind a listener and call
     /// [`crate::driver::run_node_with_status_listener`] directly.
     pub status_listen_addr: Option<SocketAddr>,
+    /// Phase 9.2 (issue #56): when `Some(k)`, this replica folds the
+    /// Chain-of-Blocks hash over the commands it applies and publishes its
+    /// hash at every multiple of `k` slots, served by `GET /chain` (see
+    /// [`crate::chain`]). `None` -- every real `queso-node` run, and every
+    /// existing test -- means no fold work and no `/chain` endpoint at all.
+    ///
+    /// Requires [`Self::status_listen_addr`]: with no status listener there
+    /// is nothing to serve the table over, so this is inert on its own.
+    ///
+    /// **Must be identical on every replica in the cluster.** Replicas
+    /// configured with different spacings publish at disjoint `n` values and
+    /// can never be compared against each other -- see [`crate::chain`]'s
+    /// module docs.
+    pub chain_checkpoints: Option<u64>,
 }

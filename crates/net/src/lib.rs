@@ -98,6 +98,7 @@
 //!   conventions.
 
 pub mod admin;
+pub mod chain;
 pub mod client;
 pub mod config;
 pub mod ctx;

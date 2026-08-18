@@ -42,7 +42,7 @@ the chain is folded in the harness, not in the cluster.
 
 | Module | What it holds |
 |--------|---------------|
-| `chain` | The `(n, h)` state machine, the command encoding, and the hash |
+| `chain` | The `(n, h)` state machine, the command encoding, and the hash — re-exported from the [`queso-chain`](../chain) crate, which `queso-net` also depends on so node-side and harness-side hashes come from the same code |
 | `observer` | `Observer`: ingests `(replica, n, h)` samples, reports `Divergence` and `Stall`, keeps a per-transition log for root-causing |
 | `source` | `CobTarget`, the seam a cluster implements; `SimCluster` implements it in-process; `Observability` chooses sampling density |
 | `workload` | The stateless CoB client and the run/settle/converge drivers |
@@ -69,6 +69,11 @@ hash at every multiple of `k` slots it crosses, and expose that small table.
 Every replica then reports at the *same* `n` values, so comparisons align by
 construction. `Observability::Checkpoints` models exactly this, and the
 tests show it catches divergence that frontier-only sampling misses.
+
+**Status: implemented node-side.** `queso-net` now folds this chain and
+serves it at `GET /chain` behind `--chain-checkpoints N` (see that crate's
+README). What remains for [#56] is the `CobTarget` implementation that polls
+it, the out-of-process nemesis, and the soak itself.
 
 ### 2. A Queso replica does not catch up unless it is given work
 

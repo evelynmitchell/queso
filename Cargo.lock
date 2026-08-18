@@ -696,6 +696,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "queso-chain"
+version = "0.1.0"
+dependencies = [
+ "queso-smr",
+]
+
+[[package]]
 name = "queso-compare"
 version = "0.1.0"
 dependencies = [
@@ -719,6 +726,7 @@ dependencies = [
 name = "queso-conformance"
 version = "0.1.0"
 dependencies = [
+ "queso-chain",
  "queso-sim",
  "queso-smr",
  "rand",
@@ -743,6 +751,7 @@ dependencies = [
  "clap",
  "futures-util",
  "hdrhistogram",
+ "queso-chain",
  "queso-consensus",
  "queso-sim",
  "queso-smr",

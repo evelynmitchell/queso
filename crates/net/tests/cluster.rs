@@ -107,6 +107,9 @@ fn spawn_cluster_with_only(leader: Option<NodeId>, live: &[usize]) -> Vec<Socket
             durable_event_counter: None,
             tls: None,
             status_listen_addr: None,
+            // Phase 9.2 (issue #56): chain-checkpoint hook off, as for any
+            // ordinary run.
+            chain_checkpoints: None,
         };
         thread::Builder::new()
             .name(format!("queso-node-{i}"))

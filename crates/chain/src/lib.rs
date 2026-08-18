@@ -1,4 +1,20 @@
-//! The Chain-of-Blocks state machine: `(n, h)`.
+//! `queso-chain`: the Chain-of-Blocks state machine, `(n, h)`.
+//!
+//! # Why this is its own crate
+//!
+//! Two very different things must compute *byte-identical* chain hashes:
+//! the **node** (`queso-net`, folding the chain as it applies commands and
+//! exposing checkpoints over `GET /chain`) and the **harness**
+//! (`queso-conformance`, folding the same chain to check replicas against
+//! each other). If they ever disagree on the encoding, every comparison
+//! silently fails to line up and a conformance run reports nothing while
+//! looking healthy.
+//!
+//! `queso-net` cannot depend on `queso-conformance` -- that would put test
+//! harness code inside the production binary -- so the shared definition
+//! lives here, in a leaf crate that depends only on `queso-smr` for
+//! [`Command`]. Phase 9.1 (#55) originally defined this inside
+//! `queso-conformance`; Phase 9.2 (#56) moved it out unchanged.
 //!
 //! Antithesis's [Chain-of-Blocks][cob] workload is the simplest
 //! state-machine-replication conformance test that makes a total-order
@@ -14,9 +30,9 @@
 //! every `n` after. That is what makes the property checkable under
 //! **imperfect observability** -- an observer that never manages to sample
 //! both replicas at `n = 6` still catches them at any later `n` they happen
-//! to share. See [`crate::observer`] for the detection side of that, and
-//! [`crate::source::Observability`] for how the sampling density is varied
-//! deliberately in tests.
+//! to share. See `queso_conformance::observer` for the detection side of
+//! that, and `queso_conformance::source::Observability` for how the
+//! sampling density is varied deliberately in tests.
 //!
 //! # How a CoB command maps onto Queso
 //!
@@ -26,8 +42,9 @@
 //! That is what this module does -- **nothing in `queso-consensus` or
 //! `queso-smr` changes**. A CoB "random byte-array command" becomes a
 //! `Command::Put` whose value is a 64-bit digest of the payload
-//! ([`crate::workload`]), and the chain is folded here, outside the
-//! cluster, from the command sequence a replica actually applied.
+//! (`queso_conformance::workload`), and the chain is folded outside the
+//! consensus core, from the command sequence a replica actually applied --
+//! by the harness in 9.1, and additionally by the node itself in 9.2.
 //!
 //! A consequence worth stating plainly: the chain hashes the *decided
 //! command sequence*, not the replicas' KV state. That is the stronger of
@@ -173,7 +190,8 @@ impl ChainState {
     /// including the state after the last command -- i.e. `commands.len() +
     /// 1` states.
     ///
-    /// This is what a fully-observable source ([`crate::source`]) emits: the
+    /// This is what a fully-observable source
+    /// (`queso_conformance::source`) emits: the
     /// entire `n -> h` table for a replica, so two replicas can be compared
     /// at every `n` they share rather than only at whatever frontier they
     /// happened to be sampled at.
