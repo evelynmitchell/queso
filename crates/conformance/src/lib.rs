@@ -24,6 +24,9 @@
 //! # Layout
 //!
 //! - [`chain`] -- the `(n, h)` state machine: `n += 1; h = hash(h ‖ C)`.
+//!   Re-exported from the `queso-chain` crate, which the node also depends
+//!   on so that node-side and harness-side hashes are computed by the same
+//!   code (see that crate's "Why this is its own crate").
 //! - [`observer`] -- [`observer::Observer`], which ingests `(replica, n, h)`
 //!   samples and reports [`observer::Divergence`] (safety) and
 //!   [`observer::Stall`] (liveness), with a per-transition log for
@@ -58,7 +61,14 @@
 //!
 //! [cob]: https://antithesis.com/docs/resources/chain-of-blocks/
 
-pub mod chain;
+/// The `(n, h)` Chain-of-Blocks state machine.
+///
+/// Re-exported from [`queso_chain`], which lives outside this crate so
+/// `queso-net` can fold the identical chain without depending on the test
+/// harness. Kept under this path so existing `queso_conformance::chain::*`
+/// users are unaffected by that move.
+pub use queso_chain as chain;
+
 pub mod observer;
 pub mod source;
 pub mod workload;

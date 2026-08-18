@@ -159,6 +159,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
+use crate::chain::ChainFolder;
 use crate::client;
 use crate::config::NodeConfig;
 use crate::ctx::RealCtx;
@@ -299,10 +300,24 @@ async fn run_node_inner(
     // (or any existing test, none of which ever set
     // `status_listen_addr`) is byte-for-byte unaffected by any of this.
     let status: Option<Arc<StatusShared>> = status_listener.map(|listener| {
-        let shared = StatusShared::new();
+        // Phase 9.2 (issue #56): `config.chain_checkpoints` is `None` for
+        // every ordinary run, in which case this is exactly the Phase 8.2
+        // `StatusShared::new()` -- no chain state, no `/chain`, and the
+        // fold below never runs.
+        let shared = StatusShared::with_chain(config.chain_checkpoints);
         tokio::spawn(status::serve_status(listener, Arc::clone(&shared)));
         shared
     });
+
+    // Phase 9.2 (issue #56): the driver-side half of the chain hook. `Some`
+    // only when the status listener exists *and* checkpoints were
+    // configured -- a chain nobody can read would be pure cost. Starts at
+    // genesis, so its first fold replays whatever this process already
+    // applied (a restart recovering its durable log); see
+    // `crate::chain`'s "Restart".
+    let mut chain_folder: Option<ChainFolder> = status
+        .as_ref()
+        .and_then(|shared| shared.chain().map(|chain| ChainFolder::new(chain.every())));
 
     let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<Event>();
 
@@ -425,6 +440,18 @@ async fn run_node_inner(
             store.save_count(),
             !node.is_catching_up(),
         );
+
+        // Phase 9.2 (issue #56): fold the chain over whatever this boot
+        // reloaded from disk, for the same reason the publish above exists
+        // -- so `GET /chain` is truthful from the moment the node is up,
+        // rather than reporting an empty table (which reads as "this
+        // replica has applied nothing") until some event happens to arrive.
+        // On a fresh boot the applied log is empty and this is a no-op; on
+        // a restart it replays the durable log, which is exactly the
+        // refold `crate::chain`'s "Restart" describes.
+        if let (Some(folder), Some(chain)) = (chain_folder.as_mut(), shared.chain()) {
+            folder.fold(&node, chain);
+        }
     }
 
     let mut pending: BTreeMap<OpId, oneshot::Sender<Outcome>> = BTreeMap::new();
@@ -581,6 +608,18 @@ async fn run_node_inner(
                 store.save_count(),
                 !node.is_catching_up(),
             );
+
+            // Phase 9.2 (issue #56): fold whatever this batch applied into
+            // the Chain-of-Blocks hash and publish any checkpoint it
+            // crossed. Deliberately *after* the persist above, so a
+            // checkpoint is only ever visible for state this replica has
+            // already made durable -- an observer must never see a hash
+            // covering a write that a crash a microsecond later would
+            // erase. Costs one hash per applied command; skipped entirely
+            // when the hook is off.
+            if let (Some(folder), Some(chain)) = (chain_folder.as_mut(), shared.chain()) {
+                folder.fold(&node, chain);
+            }
         }
     }
 

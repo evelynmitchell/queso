@@ -87,6 +87,17 @@ struct Args {
     /// default): no listener is bound, nothing is spawned, zero overhead.
     #[arg(long)]
     status_listen: Option<SocketAddr>,
+
+    /// Phase 9.2 (issue #56): publish Chain-of-Blocks checkpoint hashes
+    /// every N applied slots, served by `GET /chain` for a conformance
+    /// harness (see `queso_net::chain`). Omit to leave the hook off, which
+    /// is what an ordinary deployment wants -- it is test-support
+    /// observability, not a production metric. Requires `--status-listen`.
+    ///
+    /// Every replica in the cluster must be given the *same* N, or their
+    /// checkpoints land on disjoint slots and cannot be compared.
+    #[arg(long, value_name = "N")]
+    chain_checkpoints: Option<u64>,
 }
 
 /// All-or-nothing validation for `--tls-cert`/`--tls-key`/`--tls-ca`: `None`
@@ -176,6 +187,9 @@ async fn main() -> anyhow::Result<()> {
         // Phase 8.2 (issue #47): opt in only if `--status-listen` was
         // passed -- see `NodeConfig::status_listen_addr`'s docs.
         status_listen_addr: args.status_listen,
+        // Phase 9.2 (issue #56): opt in only if `--chain-checkpoints` was
+        // passed -- see `NodeConfig::chain_checkpoints`'s docs.
+        chain_checkpoints: args.chain_checkpoints,
     };
 
     queso_net::run_node(config).await

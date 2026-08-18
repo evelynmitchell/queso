@@ -55,6 +55,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+
+use crate::chain::ChainCheckpoints;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::warn;
@@ -109,6 +111,15 @@ pub struct StatusShared {
     /// replica's driver loop starting up) -- fixed for the process's whole
     /// lifetime, used only to compute `/metrics`' `uptime_secs`.
     started_at: Instant,
+    /// Phase 9.2 (issue #56): the Chain-of-Blocks checkpoint table `GET
+    /// /chain` serves, or `None` when `NodeConfig::chain_checkpoints` did
+    /// not opt in -- in which case `/chain` 404s exactly like any other
+    /// unknown path and the driver never folds a chain at all.
+    ///
+    /// This is the one field here that is not a plain atomic; see
+    /// [`crate::chain::ChainCheckpoints`]'s "Concurrency" for why that
+    /// exception is bounded and deliberate.
+    chain: Option<ChainCheckpoints>,
 }
 
 impl StatusShared {
@@ -121,13 +132,27 @@ impl StatusShared {
     /// listener accepting a connection and the driver's first publish, not
     /// as this replica's steady-state answer.
     pub fn new() -> Arc<Self> {
+        Self::with_chain(None)
+    }
+
+    /// As [`Self::new`], but with the Phase 9.2 chain-checkpoint hook
+    /// enabled at the given spacing when `checkpoint_every` is `Some` (see
+    /// [`crate::chain`]). `None` is exactly [`Self::new`]: no chain state,
+    /// no `/chain` endpoint, and no fold work in the driver.
+    pub fn with_chain(checkpoint_every: Option<u64>) -> Arc<Self> {
         Arc::new(Self {
             events_processed: AtomicU64::new(0),
             next_slot: AtomicU64::new(0),
             save_count: AtomicU64::new(0),
             ready: AtomicBool::new(false),
             started_at: Instant::now(),
+            chain: checkpoint_every.map(ChainCheckpoints::new),
         })
+    }
+
+    /// This replica's chain-checkpoint table, if the hook is enabled.
+    pub fn chain(&self) -> Option<&ChainCheckpoints> {
+        self.chain.as_ref()
     }
 
     /// Publish a fresh snapshot: `events_delta` (the number of events the
@@ -329,6 +354,18 @@ fn route(path: &str, status: &StatusShared) -> (&'static str, &'static str, Stri
             }
         }
         "/metrics" => ("200 OK", "application/json", status.metrics_json()),
+        // Phase 9.2 (issue #56). 404s when the hook is off, so a harness
+        // pointed at a node that was not configured for conformance runs
+        // finds out immediately rather than reading an empty table as
+        // "this replica has applied nothing".
+        "/chain" => match status.chain() {
+            Some(chain) => ("200 OK", "application/json", chain.to_json()),
+            None => (
+                "404 Not Found",
+                "text/plain",
+                "chain checkpoints not enabled on this node\n".to_string(),
+            ),
+        },
         _ => ("404 Not Found", "text/plain", "not found\n".to_string()),
     }
 }

@@ -218,6 +218,62 @@ slow-loris-style request gets a bounded-size, bounded-time read and a `400`
 or a dropped connection, never a panic. See `cargo test -p queso-net --test
 status` (below) for the acceptance test against a real cluster.
 
+## Phase 9.2: `GET /chain` — conformance observability (issue #56)
+
+Pass `--chain-checkpoints <N>` (alongside `--status-listen`) to make this
+replica fold the Chain-of-Blocks hash over the commands it applies and
+publish its hash every `N` slots:
+
+```sh
+queso-node --id 0 ... --status-listen 127.0.0.1:9100 --chain-checkpoints 64
+curl -s 127.0.0.1:9100/chain
+```
+
+```json
+{
+  "checkpoint_every": 64,
+  "frontier": { "n": 137, "h": "0x9d2f..." },
+  "truncated": false,
+  "checkpoints": [ { "n": 64, "h": "0x41a8..." }, { "n": 128, "h": "0x7c03..." } ]
+}
+```
+
+**What it's for.** A conformance harness (`queso-conformance`, Phase 9.1)
+checks replication safety by comparing replicas' `(n, h)` chain states: if
+two replicas ever show a different `h` at the same `n`, they applied
+different command sequences. In-process it can fold that chain itself; against
+real `queso-node` processes it cannot, so the node publishes it here.
+
+**Why checkpoints rather than just the frontier.** `/metrics`' `next_slot`
+looks like enough, and isn't: replicas lag each other by design, so two
+frontier readings almost never share an `n` and there is nothing to compare
+— 9.1 measured 2 cross-replica comparisons for frontier-only sampling versus
+20 for checkpointed sampling on the same workload. Publishing at fixed `n`
+boundaries makes replicas comparable by construction.
+
+**Operational notes.**
+
+- **Off by default**, and off entirely without `--status-listen`. `/chain`
+  is a `404` when unconfigured (deliberately, so a harness pointed at the
+  wrong node finds out rather than reading an empty table as "applied
+  nothing"). An ordinary deployment pays nothing for it.
+- **Every replica must use the same `N`.** Different spacings publish at
+  disjoint slots and can never be compared.
+- Hashes are hex **strings**: they use the full 64-bit range, which does not
+  survive a JSON reader that parses numbers as doubles.
+- The table is a bounded ring (256 entries); once it wraps, `truncated`
+  becomes `true` rather than silently serving a partial history.
+- The fold is volatile and rebuilt from the durable applied log at boot, so
+  a restarted replica republishes the same hashes for slots it applied
+  before the crash — verified against real `SIGKILL`ed processes in
+  `tests/chain_restart.rs`. This holds while the whole applied log stays
+  resident; log compaction (deferred, issue #46) would need a snapshot base.
+
+Tests: `cargo test -p queso-net --test chain` (in-process cluster: published
+checkpoints match a chain computed independently in the test, replicas never
+conflict at a shared `n`, `/chain` 404s when unconfigured) and `--test
+chain_restart` (real processes, `SIGKILL` and reboot).
+
 ## `queso-admin`: out-of-cluster operator CLI (Phase 8.2d, issue #47)
 
 `queso-admin` is a small operator tool that talks to a running cluster from

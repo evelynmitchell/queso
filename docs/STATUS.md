@@ -41,13 +41,13 @@ real traffic. See §4 for the honest remaining gaps.
 | M5 | Auto-tuning (multi-armed bandit) | ✅ merged (#28) |
 | M6 | Real transport, deployment, fuzzing, perf & comparison | ✅ merged (#30 — #32, #33, #34, #35) |
 | M7 | Operability: durability hardening, TLS, status/metrics, admin CLI | ✅ merged (#45 — #46, #47) |
-| — | Phase 9: Antithesis-style conformance testing | 🔶 9.1 merged (#55); 9.2 open (#56) |
+| — | Phase 9: Antithesis-style conformance testing | 🔶 9.1 merged (#55); 9.2 in progress (#56 — node-side hook landed) |
 
 ---
 
 ## 2. Accomplishments (built & merged)
 
-**Six crates + two formal specs**, ~271 test functions, CI green on every PR.
+**Seven crates + two formal specs**, ~277 test functions, CI green on every PR.
 
 ### `crates/sim` — deterministic simulation harness (Phase 0)
 - Single-threaded discrete-event kernel; virtual logical clock; one seeded PRNG.
@@ -107,9 +107,21 @@ changed to accommodate it.
   operator CLI that polls every replica and renders a health/catch-up table.
 - **Fault injection** (`nemesis.rs`): in-transport latency/drop/partition against a real
   cluster.
+- **Conformance observability** (`chain.rs`, Phase 9.2): opt-in
+  (`--chain-checkpoints N`) fold of the Chain-of-Blocks hash over applied
+  commands, published at fixed slot boundaries via `GET /chain` so an
+  out-of-process harness can compare replicas. Volatile and rebuilt from the
+  durable applied log at boot — verified against `SIGKILL`ed real processes.
 - Tests: real multi-process cluster formation, TLS, group commit, nemesis scenarios,
   bench, admin, status parsing, and `restart_recovery.rs` (spawn real `queso-node`
   processes, `SIGKILL` a majority, assert no acknowledged write is lost).
+
+### `crates/chain` — the shared `(n, h)` hash chain (Phase 9.2)
+The Chain-of-Blocks state machine and its stable command encoding, in a leaf
+crate depending only on `queso-smr`. Extracted from `crates/conformance` so the
+**node** (`queso-net`'s `/chain` checkpoints) and the **harness** compute
+byte-identical hashes from the same code — an encoding drift between them would
+make every cross-replica comparison silently miss.
 
 ### `crates/conformance` — Chain-of-Blocks harness (Phase 9.1)
 A Queso port of Antithesis's Chain-of-Blocks workload — the `(n, h)` hash-chain
@@ -271,11 +283,11 @@ no schedule.
 
 1. ~~**Phase 9.1 — Chain-of-Blocks workload + divergence/liveness observer (#55).**~~
    Merged: `crates/conformance`.
-2. **Phase 9.2 — real-binary-under-fault soak (#56).** Now the top item, and the piece
-   that actually closes the sim↔real gap. Start from 9.1's `CobTarget` seam, and act on
-   the two findings above — in particular, expose checkpointed chain hashes from the node
-   rather than relying on `next_slot` alone, or the soak's safety verdict will be
-   vacuous.
+2. **Phase 9.2 — real-binary-under-fault soak (#56).** The piece that actually closes
+   the sim↔real gap. The node-side observability hook it depends on is **done** (`GET
+   /chain`, `crates/net/src/chain.rs`); what remains is the `CobTarget` implementation
+   that polls real processes, an out-of-process nemesis so real sockets are faulted
+   rather than app frames, and the sustained soak plus its bounded CI variant.
 3. **Durability fault-injection coverage (#39)** — partly overlapping what a 9.2 soak
    exercises, but the unit-level torn-write and ENOSPC cases are worth having directly.
 4. **CI/CD catch-up (cheap, independent):** nightly TLA+ + DST soak, `cargo audit`/`deny`,

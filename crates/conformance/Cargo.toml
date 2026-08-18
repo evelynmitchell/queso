@@ -21,6 +21,7 @@ description = "Phase 9.1: an Antithesis-style Chain-of-Blocks conformance worklo
 workspace = true
 
 [dependencies]
+queso-chain = { path = "../chain" }
 queso-sim = { path = "../sim" }
 queso-smr = { path = "../smr" }
 

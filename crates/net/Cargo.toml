@@ -14,6 +14,7 @@ description = "Phase 7: a real-TCP transport and node binary driving the sim-ver
 # enforced here.
 
 [dependencies]
+queso-chain = { path = "../chain" }
 queso-consensus = { path = "../consensus", features = ["serde"] }
 queso-sim = { path = "../sim", features = ["serde"] }
 queso-smr = { path = "../smr", features = ["serde"] }

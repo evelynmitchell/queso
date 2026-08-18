@@ -230,6 +230,11 @@ fn spawn_cluster_inner(
             // did before that field existed. `spawn_cluster_with_status`
             // below is the one helper that opts in.
             status_listen_addr: None,
+            // Phase 9.2 (issue #56): likewise opt-in, and inert without a
+            // status listener -- see
+            // `spawn_cluster_with_status_and_chain` for the variant that
+            // turns the chain hook on.
+            chain_checkpoints: None,
         };
         thread::Builder::new()
             .name(format!("queso-node-{i}"))
@@ -320,6 +325,23 @@ pub fn spawn_cluster_with_status(
     n: usize,
     leader: Option<NodeId>,
 ) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+    spawn_cluster_with_status_and_chain(n, leader, None)
+}
+
+/// As [`spawn_cluster_with_status`], but with Phase 9.2's (issue #56)
+/// chain-checkpoint hook configured: `chain_checkpoints` is passed straight
+/// through to every node's `NodeConfig`, so `Some(k)` makes each replica
+/// publish `GET /chain` checkpoints every `k` applied slots and `None`
+/// leaves the hook off (and `/chain` a 404) exactly as an ordinary run has
+/// it.
+///
+/// Every node gets the *same* spacing, which is what a real cluster must
+/// also do -- see `queso_net::chain`'s module docs.
+pub fn spawn_cluster_with_status_and_chain(
+    n: usize,
+    leader: Option<NodeId>,
+    chain_checkpoints: Option<u64>,
+) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
     // Gap-free bind of all three listener kinds up front, exactly like
     // `spawn_cluster_inner` already does for peer/client -- see that
     // function's docs for why (the `free_addr` TOCTOU).
@@ -376,6 +398,7 @@ pub fn spawn_cluster_with_status(
             // always serves status. Set to the real address anyway so the
             // config, if ever logged/inspected, isn't misleadingly `None`.
             status_listen_addr: Some(status_addrs[i]),
+            chain_checkpoints,
         };
         thread::Builder::new()
             .name(format!("queso-node-status-{i}"))
