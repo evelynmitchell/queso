@@ -716,6 +716,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "queso-conformance"
+version = "0.1.0"
+dependencies = [
+ "queso-sim",
+ "queso-smr",
+ "rand",
+]
+
+[[package]]
 name = "queso-consensus"
 version = "0.1.0"
 dependencies = [

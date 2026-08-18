@@ -1,0 +1,28 @@
+[package]
+name = "queso-conformance"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Phase 9.1: an Antithesis-style Chain-of-Blocks conformance workload plus divergence/liveness observers, fed by a pluggable sample source so the same observers can watch an in-process cluster now and real queso-node processes later."
+
+# Unlike `queso-net`/`queso-compare` (the real-I/O boundary crates), this
+# crate DOES opt into the workspace determinism lints: Phase 9.1 drives the
+# deterministic in-process cluster, so a conformance run is seeded and
+# reproducible like any other sim test, and the lints keep it that way.
+#
+# Phase 9.2 (issue #56) adds a source that polls real `queso-node`
+# processes over HTTP. That source needs real time and real sockets, so it
+# will have to live behind a feature/module that drops this opt-in (the way
+# `queso-net`'s manifest documents), or in its own crate. Deliberately left
+# strict here rather than pre-emptively relaxed for code that doesn't exist
+# yet.
+[lints]
+workspace = true
+
+[dependencies]
+queso-sim = { path = "../sim" }
+queso-smr = { path = "../smr" }
+
+[dev-dependencies]
+rand = "0.8"
