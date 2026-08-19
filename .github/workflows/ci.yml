@@ -65,5 +65,10 @@ jobs:
       - name: cargo build
         run: cargo build --all
 
+      # `--nocapture` so the schedule and the report land in the log even on
+      # a pass. Two reasons: a failure's first question is "which schedule",
+      # and a pass still needs its margin visible -- the anti-vacuity floors
+      # are only trustworthy if someone can see how far above them this
+      # runner actually lands.
       - name: real-process scenarios and the bounded soak
-        run: cargo test -p queso-soak -- --ignored --skip a_long_soak_over_many_seeds
+        run: cargo test -p queso-soak -- --ignored --skip a_long_soak_over_many_seeds --nocapture
