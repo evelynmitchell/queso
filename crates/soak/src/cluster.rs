@@ -129,11 +129,13 @@ pub struct RealCluster {
 ///
 /// Detaching decouples offered load from a blocked target, but without a
 /// cap a long partition would accumulate one task per step for the whole
-/// window. 64 is far more than the handful of submissions a soak step
-/// issues, so the cap only ever binds when a large fraction of targets has
-/// genuinely stopped answering -- which is the case where backing off is
+/// window. The cap has to clear `offered_rate * submit_timeout` or it binds
+/// in normal operation rather than only under fault: a soak offering 30/s
+/// against a 4s timeout can legitimately have 120 outstanding. 256 leaves
+/// room above that, so the cap only engages when a large fraction of
+/// targets has genuinely stopped answering -- the case where backing off is
 /// the right behavior anyway.
-const MAX_INFLIGHT_SUBMISSIONS: u64 = 64;
+const MAX_INFLIGHT_SUBMISSIONS: u64 = 256;
 
 /// Locate the `queso-node` binary to spawn.
 ///

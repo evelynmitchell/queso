@@ -78,7 +78,25 @@ pub struct SoakConfig {
     /// Floor on cross-replica comparisons; below this the safety verdict is
     /// vacuous and the run is a failure regardless of what it found.
     pub min_comparisons: u64,
-    /// Floor on acknowledged submissions, for the same reason.
+    /// Floor on the cluster's furthest chain height -- the direct evidence
+    /// that writes were accepted and applied, and the primary
+    /// "did anything happen" check.
+    ///
+    /// This, rather than the acknowledgement count, because a submission
+    /// the client abandons on timeout is still *applied*: measured on one
+    /// schedule, the frontier lands within 7% (598 / 557 / 560) across a
+    /// fast machine, the same machine pinned to two cores, and a CI runner,
+    /// while acknowledgements over the same runs vary four-fold
+    /// (511 / 423 / 136). The frontier measures what the cluster did; the
+    /// acknowledgement count measures how fast the client heard about it.
+    pub min_frontier: u64,
+    /// Floor on acknowledged submissions.
+    ///
+    /// Deliberately low. It proves the client path works end to end at all
+    /// -- a run where every single submission timed out would be worth
+    /// failing -- but it cannot be tightened without encoding one machine's
+    /// round-trip latency into a correctness assertion, which is how a soak
+    /// starts failing for reasons that have nothing to do with Queso.
     pub min_acked: u64,
 }
 
@@ -94,6 +112,7 @@ impl Default for SoakConfig {
             converge_advance_ms: 150,
             liveness_budget_ms: 8_000,
             min_comparisons: 20,
+            min_frontier: 100,
             min_acked: 20,
         }
     }
@@ -149,7 +168,13 @@ pub struct SoakReport {
     pub samples: u64,
     /// The cluster's furthest `n`.
     pub frontier: u64,
+    /// Submissions the cluster acknowledged.
     pub acked: u64,
+    /// Submissions the client **gave up on** -- overwhelmingly a timeout,
+    /// not a refusal. Worth stating plainly because the number reads like
+    /// cluster failure and is not: a submission abandoned at the timeout is
+    /// still applied, which is why a run can show 136 acknowledgements and
+    /// a frontier of 560.
     pub failed: u64,
     /// Submissions never offered because the in-flight cap was reached --
     /// the honest measure of how much load the partitions cost.
@@ -218,10 +243,19 @@ impl SoakReport {
                 self.comparisons, config.min_comparisons
             ));
         }
+        if self.frontier < config.min_frontier {
+            problems.push(format!(
+                "VACUOUS: the cluster only reached n={} (want >= {}). It applied \
+                 almost nothing, so \"no divergence\" is a statement about an \
+                 empty chain.",
+                self.frontier, config.min_frontier
+            ));
+        }
         if self.acked < config.min_acked {
             problems.push(format!(
-                "VACUOUS: only {} submissions acknowledged (want >= {}). A cluster \
-                 that accepted no writes proves nothing about applying them consistently.",
+                "VACUOUS: only {} submissions acknowledged (want >= {}). The client \
+                 path never worked end to end, so nothing here exercised a real \
+                 submission.",
                 self.acked, config.min_acked
             ));
         }

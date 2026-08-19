@@ -218,10 +218,9 @@ the tests both go through so neither can drift into a laxer standard:
   than in total, because a total stays green if only the crash path still
   works, and each kind drives different node code (reconnect,
   restart-from-disk, timeout behavior).
-- **The comparison and acknowledgement floors scale with run length**
-  (10 comparisons and 8 acknowledgements per second of soak). The bounded
-  20s run measures ~760 comparisons and ~580 acknowledgements against floors
-  of 200 and 160 — clear of timing variance, nowhere near zero.
+- **The floors scale with run length**, and the primary one is the
+  **chain frontier** rather than the acknowledgement count. See below for
+  why that distinction cost a CI run to learn.
 - **The liveness budget has a demonstrated falsifier.**
   `a_permanently_dead_replica_is_reported_stuck` kills a replica for good and
   asserts the observer reports it *at the same 5s budget the soaks assert
@@ -229,6 +228,47 @@ the tests both go through so neither can drift into a laxer standard:
   fail: a budget in the wrong units, or one widened to stop a flake, passes
   healthy and broken runs alike. Phase 9.1 walked into exactly that and had
   to go back and measure.
+
+## A finding: acknowledgements are not evidence that writes happened
+
+The first version of this floored on acknowledged submissions — a cluster
+that accepted no writes proves nothing about applying them consistently.
+That reasoning is fine; the metric was wrong, and CI said so:
+
+| | fast machine | same machine, 2 cores | CI runner |
+|---|---|---|---|
+| chain frontier after 20s | 598 | 557 | 560 |
+| comparisons | ~800 | 785 | 823 |
+| **acknowledged submissions** | **511** | **423** | **136** |
+
+The frontier and the comparison count land within 7% of each other across
+all three. Acknowledgements vary four-fold — and the run with 136 of them
+still applied 560 chain entries.
+
+The explanation is that **a submission the client abandons on timeout is
+still applied**. The cluster was doing ~28 entries a second everywhere; what
+collapsed on the loaded runner was the client hearing back inside the 1.5s
+timeout. So the acknowledgement count was measuring round-trip latency, and
+a floor of 8/s had quietly encoded one machine's latency as a correctness
+assertion. It failed CI while the cluster underneath was entirely healthy.
+
+Two changes came out of it. The frontier now carries the "writes really
+happened" claim, because it measures what the cluster did rather than how
+fast the client learned of it. And the acknowledgement floor drops to 2/s,
+meaning only what it can honestly mean — that the client path worked end to
+end at all.
+
+The submit timeout went from 1.5s to 4s at the same time. Detached
+submissions make a long timeout nearly free (it bounds how long a doomed
+submission holds a runtime task, not how long the driver waits), so the
+short value bought nothing and threw away three quarters of the offered
+load. `failed` in a report is therefore "the client gave up", almost never
+"the cluster refused" — worth knowing, because the number reads like the
+second one.
+
+This is also the argument for `--nocapture` in the CI job. The first soak
+run passed with these same numbers invisible; the floors had margin nowhere
+except on my machine, and nothing in a green log would have said so.
 
 ## What's still open
 

@@ -138,8 +138,12 @@ fn run_seed(args: &Args, seed: u64) -> anyhow::Result<(SoakReport, SoakConfig)> 
         converge_rounds: 12,
         converge_advance_ms: 200,
         liveness_budget_ms: 5_000,
+        // See `tests/sustained_soak.rs` for how these were sized: the
+        // frontier carries the "writes really happened" claim because it is
+        // stable across machines, while the acknowledgement count is not.
         min_comparisons: 10 * duration_ms / 1_000,
-        min_acked: 8 * duration_ms / 1_000,
+        min_frontier: 10 * duration_ms / 1_000,
+        min_acked: 2 * duration_ms / 1_000,
     };
 
     let cluster_config = ClusterConfig {
@@ -147,7 +151,7 @@ fn run_seed(args: &Args, seed: u64) -> anyhow::Result<(SoakReport, SoakConfig)> 
         leader: 0,
         checkpoint_every: args.checkpoint_every,
         tick_ms: 5,
-        submit_timeout: Duration::from_millis(1_500),
+        submit_timeout: Duration::from_secs(4),
     };
 
     let data_dir = tempfile::tempdir()?;

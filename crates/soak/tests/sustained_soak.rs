@@ -59,10 +59,14 @@ fn cluster_config(replicas: usize) -> ClusterConfig {
         // comparisons where checkpoints gave 20 on the same run).
         checkpoint_every: 2,
         tick_ms: 5,
-        // Short, because the soak submits without blocking on the answer:
-        // this only bounds how long a doomed submission occupies a task,
-        // not how long the driver waits.
-        submit_timeout: Duration::from_millis(1_500),
+        // Generous, because the soak submits without blocking on the
+        // answer: this bounds how long a doomed submission occupies a
+        // runtime task, not how long the driver waits, so a short value
+        // buys nothing and costs real load. 1.5s was measurably too short
+        // -- on a CI runner it abandoned three quarters of submissions that
+        // the cluster went on to apply anyway (136 acknowledged against a
+        // frontier of 560).
+        submit_timeout: Duration::from_secs(4),
     }
 }
 
@@ -89,13 +93,24 @@ fn soak_config(fault_seed: u64, duration_ms: u64, replicas: usize) -> SoakConfig
         // the liveness assertion unfalsifiable, which is exactly the trap
         // 9.1 fell into and had to correct.
         liveness_budget_ms: 5_000,
-        // Measured on the bounded run: ~780 comparisons and ~570
-        // acknowledgements over 20s. The floors are set well below that so
-        // ordinary timing variance cannot trip them, and far above zero so
-        // a run that stopped observing cannot pass. They scale with
-        // duration, hence the division.
+        // The floors scale with run length, hence the division. Sized from
+        // measurement across three environments -- a fast machine, that
+        // machine pinned to two cores, and a CI runner -- where comparisons
+        // and chain height both landed within 7% of each other (~40 and ~28
+        // per second respectively).
+        //
+        // Acknowledgements are *not* stable across those environments:
+        // 511 / 423 / 136 on the same 20s schedule, because a submission the
+        // client abandons on timeout is still applied by the cluster. So the
+        // frontier carries the "writes really happened" claim, and the
+        // acknowledgement floor stays low enough to mean only what it can
+        // honestly mean -- that the client path worked at all. Tightening it
+        // would encode one machine's round-trip latency as a correctness
+        // assertion, and it did: at 8/s this failed CI while the cluster was
+        // applying 28 entries a second.
         min_comparisons: 10 * duration_ms / 1_000,
-        min_acked: 8 * duration_ms / 1_000,
+        min_frontier: 10 * duration_ms / 1_000,
+        min_acked: 2 * duration_ms / 1_000,
     }
 }
 
