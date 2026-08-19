@@ -70,10 +70,11 @@ Every replica then reports at the *same* `n` values, so comparisons align by
 construction. `Observability::Checkpoints` models exactly this, and the
 tests show it catches divergence that frontier-only sampling misses.
 
-**Status: implemented node-side.** `queso-net` now folds this chain and
-serves it at `GET /chain` behind `--chain-checkpoints N` (see that crate's
-README). What remains for [#56] is the `CobTarget` implementation that polls
-it, the out-of-process nemesis, and the soak itself.
+**Status: done.** `queso-net` folds this chain and serves it at `GET /chain`
+behind `--chain-checkpoints N` (see that crate's README); `queso-soak`'s
+`RealCluster` polls it as its `CobTarget` source, and the sustained soak
+measures ~760 cross-replica comparisons over a 20s run — the concrete payoff
+of checkpointed over frontier-only sampling.
 
 ### 2. A Queso replica does not catch up unless it is given work
 

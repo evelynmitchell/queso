@@ -24,27 +24,30 @@
 //! tokio runtime and `block_on`s inside the synchronous `CobTarget`
 //! methods, which would panic inside an outer runtime.
 //!
-//! # The CI subset, and why
+//! # Why every scenario here is `#[ignore]`d
 //!
-//! Only [`a_healthy_real_cluster_converges_and_is_actually_observed`] runs
-//! by default; the rest are `#[ignore]`d and run with
-//! `cargo test -p queso-soak -- --ignored`.
+//! They run in CI, just not in the `cargo test --all` job -- the workflow
+//! gives the real-process suite a job of its own
+//! (`cargo test -p queso-soak -- --ignored`). These scenarios spend nearly
+//! all their wall clock asleep waiting for real timers, so folding them
+//! into the commit gate would roughly double it to exercise a different
+//! layer, and a failure here (a real socket, a real `SIGKILL`) is more
+//! legible on its own than buried among unit tests.
 //!
-//! This is a load decision, not a confidence one. Each scenario boots three
-//! real `queso-node` processes and allocates nine ephemeral ports through
-//! the bind-then-drop `free_addr` pattern whose TOCTOU issue #40 already
-//! documents. `cargo test --all` runs test binaries in parallel, so those
-//! processes and port allocations land on top of `queso-net`'s own
-//! real-process tests -- and on a small CI runner that contention is enough
-//! to fail an unrelated, pre-existing test
-//! (`queso-net`'s `restart_recovery::minority_reboot_recovers_too` did
-//! exactly that, timing out its 10s submit retry loop while this file's
-//! scenarios were running).
-//!
-//! Keeping one bounded scenario in CI preserves a real-process smoke check
-//! at roughly the footprint `queso-net`'s own tests already have, while the
-//! full set stays one command away. Issue #56 asks for exactly this shape:
-//! a short bounded CI variant plus a documented longer mode.
+//! **Correcting what slice 2 wrote here.** That version said `cargo test
+//! --all` runs test binaries in parallel, and used that to explain why
+//! these scenarios had to be `#[ignore]`d: they were said to contend with
+//! `queso-net`'s own real-process tests, one of which
+//! (`restart_recovery::minority_reboot_recovers_too`) failed in CI on
+//! slice 2's PR. Cargo does not do that -- test binaries run strictly one
+//! after another, within a package and across `--all` alike (measured,
+//! cargo 1.94). These scenarios therefore never overlapped that test, and
+//! `#[ignore]`ing them cannot have been the fix. That failure is still
+//! unexplained; a slow runner remains the likeliest cause, and issue #40's
+//! bind-then-drop `free_addr` TOCTOU is a real hazard for anything
+//! allocating nine ephemeral ports per scenario. The `#[ignore]`s stay on
+//! the cost grounds above, which are true, rather than the contention
+//! grounds, which were not.
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -111,6 +114,7 @@ fn assert_no_divergence(observer: &Observer, min_comparisons: u64) {
 }
 
 #[test]
+#[ignore = "boots real node processes; run with --ignored (see this file's docs)"]
 fn a_healthy_real_cluster_converges_and_is_actually_observed() {
     let _guard = exclusive();
     let data_dir = tempfile::tempdir().expect("tempdir");
@@ -154,7 +158,7 @@ fn a_healthy_real_cluster_converges_and_is_actually_observed() {
 }
 
 #[test]
-#[ignore = "boots real node processes; run with --ignored (see this file's CI-subset docs)"]
+#[ignore = "boots real node processes; run with --ignored (see this file's docs)"]
 fn a_real_socket_partition_of_a_minority_never_causes_divergence() {
     let _guard = exclusive();
     let data_dir = tempfile::tempdir().expect("tempdir");
@@ -216,7 +220,7 @@ fn a_real_socket_partition_of_a_minority_never_causes_divergence() {
 }
 
 #[test]
-#[ignore = "boots real node processes; run with --ignored (see this file's CI-subset docs)"]
+#[ignore = "boots real node processes; run with --ignored (see this file's docs)"]
 fn a_killed_and_restarted_replica_rejoins_without_diverging() {
     let _guard = exclusive();
     let data_dir = tempfile::tempdir().expect("tempdir");
@@ -250,7 +254,7 @@ fn a_killed_and_restarted_replica_rejoins_without_diverging() {
 }
 
 #[test]
-#[ignore = "boots real node processes; run with --ignored (see this file's CI-subset docs)"]
+#[ignore = "boots real node processes; run with --ignored (see this file's docs)"]
 fn latency_turbulence_does_not_produce_divergence() {
     let _guard = exclusive();
     let data_dir = tempfile::tempdir().expect("tempdir");
@@ -271,7 +275,7 @@ fn latency_turbulence_does_not_produce_divergence() {
 }
 
 #[test]
-#[ignore = "boots real node processes; run with --ignored (see this file's CI-subset docs)"]
+#[ignore = "boots real node processes; run with --ignored (see this file's docs)"]
 fn the_observer_sees_nothing_from_a_replica_nobody_can_reach() {
     // A soak must not mistake "unreachable" for "applied nothing" -- the
     // former is silence, the latter is a claim. `poll_samples` skips a

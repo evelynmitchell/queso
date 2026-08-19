@@ -22,6 +22,11 @@
 //! - [`cluster`] -- [`cluster::RealCluster`], which implements
 //!   `queso_conformance::CobTarget` over spawned `queso-node` processes, so
 //!   the 9.1 observers work unchanged against them.
+//! - [`schedule`] -- the seeded, replayable fault schedule the sustained
+//!   soak runs against.
+//! - [`soak`] -- the sustained soak driver: schedule plus workload plus
+//!   observer over a [`cluster::RealCluster`], checking safety continuously
+//!   and liveness after the turbulence heals.
 //!
 //! # Determinism, honestly
 //!
@@ -34,6 +39,10 @@
 //! being replaced by this.
 pub mod cluster;
 pub mod proxy;
+pub mod schedule;
+pub mod soak;
 
 pub use cluster::RealCluster;
 pub use proxy::Turbulence;
+pub use schedule::{Fault, Schedule, ScheduleConfig, ScheduledFault};
+pub use soak::{Soak, SoakConfig, SoakReport};

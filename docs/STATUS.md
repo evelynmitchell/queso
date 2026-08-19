@@ -41,7 +41,7 @@ real traffic. See §4 for the honest remaining gaps.
 | M5 | Auto-tuning (multi-armed bandit) | ✅ merged (#28) |
 | M6 | Real transport, deployment, fuzzing, perf & comparison | ✅ merged (#30 — #32, #33, #34, #35) |
 | M7 | Operability: durability hardening, TLS, status/metrics, admin CLI | ✅ merged (#45 — #46, #47) |
-| — | Phase 9: Antithesis-style conformance testing | 🔶 9.1 merged (#55); 9.2 in progress (#56 — hook + real-process harness landed; soak remains) |
+| — | Phase 9: Antithesis-style conformance testing | 🔶 9.1 merged (#55); 9.2 complete (#56 — hook, real-process harness, sustained seeded soak); #54 open for deterministic replay of real runs |
 
 ---
 
@@ -123,16 +123,27 @@ crate depending only on `queso-smr`. Extracted from `crates/conformance` so the
 byte-identical hashes from the same code — an encoding drift between them would
 make every cross-replica comparison silently miss.
 
-### `crates/soak` — real-process conformance harness (Phase 9.2)
+### `crates/soak` — real-process conformance harness and soak (Phase 9.2)
 `RealCluster` implements `queso-conformance`'s `CobTarget` over spawned
 `queso-node` OS processes, so the 9.1 observers judge the **real** I/O layer
 unchanged, plus a TCP turbulence proxy mesh that partitions replicas at the
 *socket* level — cutting live connections and forcing real reconnects, rather
 than dropping already-decoded frames the way the in-transport 7.4 nemesis
-does. Scenarios cover a healthy cluster, a minority socket partition, a
-`SIGKILL`ed and restarted replica, and link latency. Honest limits: byte-stream
-faults only (no kernel-level loss/reordering), and runs are not reproducible
-from seeds the way 9.1's are.
+does. Scripted scenarios cover a healthy cluster, a minority socket partition,
+a `SIGKILL`ed and restarted replica, and link latency.
+
+On top of those, a **sustained soak**: a seeded generator draws a randomized
+fault schedule (isolations, one-way cuts, crashes, latency — deliberately
+overlapping, and never faulting more than `f = (n-1)/2` nodes at once), and a
+driver walks it, offering load continuously, checking divergence every step
+and judging liveness only after everything heals and every replica has been
+given work. A bounded 20s variant runs in a dedicated CI job; the `queso-soak`
+binary is the long mode.
+
+Honest limits: byte-stream faults only (no kernel-level loss/reordering); the
+fault *schedule* replays from a seed but the run does not — real scheduling,
+timers and TCP make the interleaving irreproducible; and the exploration is
+human-driven (pick a seed range, read the output) rather than autonomous.
 
 ### `crates/conformance` — Chain-of-Blocks harness (Phase 9.1)
 A Queso port of Antithesis's Chain-of-Blocks workload — the `(n, h)` hash-chain
@@ -194,11 +205,13 @@ runbook in `docs/deploy-flyio.md`. (Actual multi-region deploys need the owner's
   project's life nothing ran the real `crates/net` binary under fault at all, and the
   bug history says that is exactly where bugs live (#36, the 7.1 self-send drop, the
   #22 catch-up zombie). 9.1 (#55) built the workload and observers but ran them
-  in-process, closing none of it. 9.2's first two slices now do run the real binary
-  under real socket partitions, crashes, and latency — so what remains is narrower but
-  real: the faults are **scripted and short**, not the autonomous, sustained,
-  randomized turbulence Antithesis-style testing is actually about. A bug that needs
-  twenty minutes of churn to surface would still be missed.
+  in-process, closing none of it. 9.2 now runs the real binary under sustained,
+  randomized socket partitions, crashes and latency, with safety checked continuously
+  and liveness after each heal — so what remains is narrower: the turbulence is
+  randomized but **not autonomous** (a human picks a seed range and reads the output),
+  and a failing run reproduces its *schedule* but never its interleaving, because real
+  thread scheduling and real TCP see to that. Deterministic replay of real executions
+  is what would actually close the gap, and it is #54's remaining territory.
 - **Two findings from 9.1 that #56 must act on** (details in
   `crates/conformance/README.md`): (1) polling only `/metrics`' `next_slot` yields a
   *vacuous* safety verdict — replicas lag each other, so frontier samples almost never
@@ -279,8 +292,9 @@ no schedule.
   concrete nightly).
 - **No nightly DST soak** — the testing plan calls for per-PR bounded + nightly
   large-seed corpus + minimized-seed regression capture. Only the bounded portion exists.
-- **No long-running real-cluster fault soak** — this is Phase 9's CI deliverable (#56
-  specifies a bounded CI variant plus a documented long-soak mode).
+- ~~**No long-running real-cluster fault soak**~~ — landed with 9.2 slice 3: a bounded
+  20s soak in its own CI job, plus the `queso-soak` binary for the long mode. What is
+  still missing is a **nightly** invocation of that long mode; nothing schedules it.
 - **No coverage reporting**, no MSRV/toolchain matrix.
 - **No supply-chain checks** — `cargo audit`/`cargo deny` for advisories & licenses.
 - **No benchmark regression tracking** — `queso-bench` and `crates/compare` produce
@@ -297,11 +311,13 @@ no schedule.
 
 1. ~~**Phase 9.1 — Chain-of-Blocks workload + divergence/liveness observer (#55).**~~
    Merged: `crates/conformance`.
-2. **Phase 9.2 — real-binary-under-fault soak (#56).** Two of three slices are done:
-   the node-side hook (`GET /chain`) and the real-process harness plus socket-level
-   nemesis (`crates/soak`). What remains is the sustained, randomized, long-running
-   soak driver with a seeded fault schedule, its bounded CI variant, and the documented
-   long-soak invocation.
+2. ~~**Phase 9.2 — real-binary-under-fault soak (#56).**~~ All three slices merged:
+   the node-side hook (`GET /chain`), the real-process harness plus socket-level nemesis,
+   and the sustained seeded soak with its bounded CI variant and long mode
+   (`crates/soak`). Follow-on work, in rough order of value: schedule the long soak
+   nightly (nothing runs it on a timer today); shrink a failing schedule automatically
+   rather than by hand; and, for #54 proper, deterministic replay of a real execution —
+   the one thing that would let a soak failure be debugged the way a DST failure is.
 3. **Durability fault-injection coverage (#39)** — partly overlapping what a 9.2 soak
    exercises, but the unit-level torn-write and ENOSPC cases are worth having directly.
 4. **CI/CD catch-up (cheap, independent):** nightly TLA+ + DST soak, `cargo audit`/`deny`,

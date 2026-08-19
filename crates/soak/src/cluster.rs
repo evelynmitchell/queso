@@ -36,6 +36,8 @@ use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as OsCommand, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use queso_chain::ChainState;
@@ -108,10 +110,32 @@ pub struct RealCluster {
     /// so a poll reports what is new rather than the whole table again.
     emitted: BTreeMap<NodeId, u64>,
     /// Submissions that returned an error (expected under fault).
-    failed_submissions: u64,
+    ///
+    /// Shared and atomic because [`RealCluster::submit_detached`] settles
+    /// its submissions on the runtime rather than on the caller's thread,
+    /// so the two submit paths have to increment the same counters.
+    failed_submissions: Arc<AtomicU64>,
     /// Submissions that were acknowledged.
-    ok_submissions: u64,
+    ok_submissions: Arc<AtomicU64>,
+    /// Detached submissions still awaiting an answer.
+    inflight: Arc<AtomicU64>,
+    /// Submissions never issued because [`Self::inflight`] was at the cap.
+    /// Counted separately: a submission the harness declined to offer is
+    /// not evidence that the cluster refused it.
+    deferred_submissions: u64,
 }
+
+/// Ceiling on concurrent detached submissions.
+///
+/// Detaching decouples offered load from a blocked target, but without a
+/// cap a long partition would accumulate one task per step for the whole
+/// window. The cap has to clear `offered_rate * submit_timeout` or it binds
+/// in normal operation rather than only under fault: a soak offering 30/s
+/// against a 4s timeout can legitimately have 120 outstanding. 256 leaves
+/// room above that, so the cap only engages when a large fraction of
+/// targets has genuinely stopped answering -- the case where backing off is
+/// the right behavior anyway.
+const MAX_INFLIGHT_SUBMISSIONS: u64 = 256;
 
 /// Locate the `queso-node` binary to spawn.
 ///
@@ -231,8 +255,10 @@ impl RealCluster {
             next_submit: 0,
             seq: 0,
             emitted: BTreeMap::new(),
-            failed_submissions: 0,
-            ok_submissions: 0,
+            failed_submissions: Arc::new(AtomicU64::new(0)),
+            ok_submissions: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(AtomicU64::new(0)),
+            deferred_submissions: 0,
         };
         for i in 0..n {
             cluster.spawn(i);
@@ -309,12 +335,119 @@ impl RealCluster {
         self.status_addrs[i]
     }
 
+    /// Pick the next live replica round-robin and stamp the command with a
+    /// fresh client sequence, returning where to send it.
+    ///
+    /// `None` means no replica is running, which is counted as a failed
+    /// submission -- the caller has nothing to send.
+    fn next_submission(&mut self, command: Command) -> Option<(SocketAddr, Command)> {
+        let live: Vec<usize> = (0..self.config.replicas)
+            .filter(|&i| self.is_running(i))
+            .collect();
+        if live.is_empty() {
+            self.failed_submissions.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let target = live[self.next_submit % live.len()];
+        self.next_submit = self.next_submit.wrapping_add(1);
+
+        self.seq += 1;
+        let seq = self.seq;
+        let command = match command {
+            Command::Put {
+                client, key, value, ..
+            } => Command::Put {
+                client,
+                seq,
+                key,
+                value,
+            },
+            Command::Get { client, key, .. } => Command::Get { client, seq, key },
+        };
+        Some((self.client_addrs[target], command))
+    }
+
+    /// Offer a submission without waiting for it to settle.
+    ///
+    /// # Why a sustained soak needs this
+    ///
+    /// A client reaches a replica on its *client* port, which does not
+    /// cross the turbulence mesh -- so a replica that is isolated from its
+    /// peers still accepts the connection, and then cannot make progress on
+    /// it. The submission is not refused, it hangs, and the blocking
+    /// [`CobTarget::submit`] path absorbs the whole `submit_timeout` before
+    /// recording the failure.
+    ///
+    /// For the scripted slice-2 scenarios that is fine. For a soak it is
+    /// fatal to the point of the exercise: offered load would collapse
+    /// exactly during the partitions the run exists to test, and a cluster
+    /// that is not being asked to do anything cannot be caught failing to
+    /// do it. Detaching the wait means a partitioned target costs one idle
+    /// task rather than a stalled driver.
+    ///
+    /// The submission is still counted, just later -- by the runtime task,
+    /// into the same counters [`Self::submission_counts`] reports. Callers
+    /// that need the numbers to be final should
+    /// [`Self::drain_inflight`] first.
+    ///
+    /// Returns whether the submission was actually issued; `false` means
+    /// the in-flight cap was reached and it is counted as *deferred*, which
+    /// is deliberately neither an acknowledgement nor a failure.
+    pub fn submit_detached(&mut self, command: Command) -> bool {
+        if self.inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT_SUBMISSIONS {
+            self.deferred_submissions += 1;
+            return false;
+        }
+        let Some((addr, command)) = self.next_submission(command) else {
+            return false;
+        };
+        let timeout = self.config.submit_timeout;
+        let ok = Arc::clone(&self.ok_submissions);
+        let failed = Arc::clone(&self.failed_submissions);
+        let inflight = Arc::clone(&self.inflight);
+        inflight.fetch_add(1, Ordering::Relaxed);
+        self.runtime.spawn(async move {
+            let outcome =
+                tokio::time::timeout(timeout, queso_net::client::submit(addr, &command)).await;
+            match outcome {
+                Ok(Ok(_)) => ok.fetch_add(1, Ordering::Relaxed),
+                _ => failed.fetch_add(1, Ordering::Relaxed),
+            };
+            inflight.fetch_sub(1, Ordering::Relaxed);
+        });
+        true
+    }
+
+    /// Wait for detached submissions to settle, up to `timeout`, so
+    /// [`Self::submission_counts`] is final before a run is judged.
+    ///
+    /// Returns the number still outstanding, which is non-zero only if the
+    /// timeout was hit.
+    pub fn drain_inflight(&mut self, timeout: Duration) -> u64 {
+        let deadline = Instant::now() + timeout;
+        while self.inflight.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
+            self.runtime
+                .block_on(async { tokio::time::sleep(Duration::from_millis(20)).await });
+        }
+        self.inflight.load(Ordering::Relaxed)
+    }
+
+    /// Submissions the harness declined to offer because the in-flight cap
+    /// was reached. Reported rather than hidden: it is the honest measure
+    /// of how much offered load a partition actually cost.
+    pub fn deferred_submissions(&self) -> u64 {
+        self.deferred_submissions
+    }
+
     /// How many submissions were acknowledged, and how many failed. Under
     /// fault, failures are expected -- but a run in which *nothing* was
     /// ever acknowledged proved nothing, so a soak should assert on the
     /// first number.
     pub fn submission_counts(&self) -> (u64, u64) {
-        (self.ok_submissions, self.failed_submissions)
+        (
+            self.ok_submissions.load(Ordering::Relaxed),
+            self.failed_submissions.load(Ordering::Relaxed),
+        )
     }
 
     /// Wait until every live replica answers `GET /health`, so a scenario
@@ -395,45 +528,28 @@ impl CobTarget for RealCluster {
         (0..self.config.replicas as u32).map(NodeId).collect()
     }
 
-    /// Submit to the next live replica, round-robin.
+    /// Submit to the next live replica, round-robin, and **block** until it
+    /// answers or the submit timeout expires.
     ///
     /// A failure is recorded, not propagated: the Chain-of-Blocks client is
     /// stateless and its proposals are explicitly allowed to fail under
     /// fault. Judging the run is the observers' job.
+    ///
+    /// Blocking here is right for the scripted scenarios, which want each
+    /// submission resolved before they judge the next step. A sustained
+    /// soak wants the opposite -- see [`RealCluster::submit_detached`].
     fn submit(&mut self, command: Command) {
-        let live: Vec<usize> = (0..self.config.replicas)
-            .filter(|&i| self.is_running(i))
-            .collect();
-        if live.is_empty() {
-            self.failed_submissions += 1;
+        let Some((addr, command)) = self.next_submission(command) else {
             return;
-        }
-        let target = live[self.next_submit % live.len()];
-        self.next_submit = self.next_submit.wrapping_add(1);
-
-        self.seq += 1;
-        let seq = self.seq;
-        let command = match command {
-            Command::Put {
-                client, key, value, ..
-            } => Command::Put {
-                client,
-                seq,
-                key,
-                value,
-            },
-            Command::Get { client, key, .. } => Command::Get { client, seq, key },
         };
-
-        let addr = self.client_addrs[target];
         let timeout = self.config.submit_timeout;
         let outcome = self.runtime.block_on(async move {
             tokio::time::timeout(timeout, queso_net::client::submit(addr, &command)).await
         });
         match outcome {
-            Ok(Ok(_)) => self.ok_submissions += 1,
-            _ => self.failed_submissions += 1,
-        }
+            Ok(Ok(_)) => self.ok_submissions.fetch_add(1, Ordering::Relaxed),
+            _ => self.failed_submissions.fetch_add(1, Ordering::Relaxed),
+        };
     }
 
     /// Sleep `units` **milliseconds** of real time.

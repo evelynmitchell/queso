@@ -792,6 +792,7 @@ name = "queso-soak"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "queso-chain",
  "queso-conformance",
  "queso-net",
