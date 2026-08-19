@@ -34,3 +34,36 @@ jobs:
 
       - name: cargo test
         run: cargo test --all
+
+  # The real-process suite gets a job of its own rather than a place in
+  # `cargo test --all`. Every scenario boots real `queso-node` processes and
+  # spends most of its wall clock asleep waiting for real timers, so folding
+  # it into the commit gate would roughly double that job's runtime to
+  # exercise a different layer -- and a failure here (a real socket, a real
+  # SIGKILL) wants to be legible as such rather than buried among unit
+  # tests.
+  #
+  # `--ignored` is how those tests are marked; see `crates/soak`'s README
+  # for why, and for the long-soak mode this bounded variant is the CI
+  # sibling of.
+  soak:
+    name: real-process soak (phase 9.2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # `queso-soak` spawns the `queso-node` binary, which its own test
+      # profile does not build: the crate depends on `queso-net`'s library,
+      # not its binary. Without this the tests panic with that instruction.
+      - name: cargo build
+        run: cargo build --all
+
+      - name: real-process scenarios and the bounded soak
+        run: cargo test -p queso-soak -- --ignored --skip a_long_soak_over_many_seeds

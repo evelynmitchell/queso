@@ -29,6 +29,10 @@ queso-smr = { path = "../smr" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
 serde_json = "1"
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# The long-soak binary needs a scratch data directory of its own, which is
+# exactly what the tests use it for -- hence a regular dependency here.
+tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"

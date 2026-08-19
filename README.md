@@ -224,8 +224,8 @@ assert no write is lost), and TLA+/TLC formal model-checking. The full plan is i
 ## Roadmap
 
 Queso was built in phases, each a milestone with its own reviewed pull requests.
-Phases 0–8 (milestones M0–M7) are complete; Phase 9 (conformance testing
-against the real binary under sustained fault) is planned.
+Phases 0–9 are complete; what remains open in Phase 9's epic (#54) is
+deterministic **replay** of a real execution, not the fault testing itself.
 
 | Phase | Milestone | What it delivered |
 |------:|:---------:|-------------------|
@@ -238,7 +238,7 @@ against the real binary under sustained fault) is planned.
 | 6 | M5 | Auto-tuning (multi-armed-bandit leader selection) |
 | 7 | M6 | Real TCP transport, `queso-node`, workload generator, connection fuzzing, fly.io deployment, and comparison vs. etcd |
 | 8 | M7 | Operability: durability hardening (group-commit, async fsync, versioned snapshots), TLS, status/metrics endpoints, `queso-admin` operator CLI (log compaction deliberately deferred) |
-| 9 | — | Antithesis-style conformance testing: a Chain-of-Blocks workload and divergence/liveness observers run against real `queso-node` processes under sustained fault — *planned* |
+| 9 | — | Antithesis-style conformance testing: a Chain-of-Blocks workload and divergence/liveness observers, a `GET /chain` checkpoint hook on the node, and a seeded randomized fault soak driving real `queso-node` processes under socket-level turbulence (`crates/conformance`, `crates/soak`) |
 
 Explicit **non-goals**: Byzantine fault tolerance, being a general-purpose
 database, side-channel resistance, and dynamic reconfiguration/membership change.
