@@ -113,6 +113,17 @@ pub struct NodeConfig {
     /// `group_commit_coalesces_fsyncs_under_concurrent_load`. `None` for
     /// every real `queso-node` run and every other test.
     pub durable_event_counter: Option<Arc<AtomicU64>>,
+    /// Phase 8.2 (issue #39) test-only instrumentation: a one-shot disk
+    /// failure to inject into this replica's
+    /// [`crate::persist::Store`] write path -- see
+    /// [`crate::persist::DiskFault`].
+    ///
+    /// `None` for every real `queso-node` run (the CLI has no flag for it)
+    /// and for every test but `tests/durability_faults.rs`, which uses it
+    /// to establish the one thing reading the code cannot: that a failed
+    /// durability write actually stops the node rather than letting it
+    /// carry on serving from state it never persisted.
+    pub disk_fault: Option<crate::persist::DiskFault>,
     /// Phase 8.2a (issue #47): opt-in app-level TLS for both this
     /// replica's peer-to-peer connections (mutual TLS -- see
     /// `crate::tls::build_peer_tls`) and its client-facing listener

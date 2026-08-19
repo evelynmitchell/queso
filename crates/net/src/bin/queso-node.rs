@@ -181,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
         persist_delay: Duration::ZERO,
         save_counter: None,
         durable_event_counter: None,
+        disk_fault: None,
         // Phase 8.2a (issue #47): opt in only if all three --tls-* flags
         // were passed -- see `resolve_tls_config`.
         tls,

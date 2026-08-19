@@ -20,127 +20,21 @@
 //! the post-reboot `Get` with `None` instead of `Some(7)` (see this crate's
 //! README / `docs/STATUS.md` for how that was confirmed before landing the
 //! fix).
+//!
+//! The real-process cluster helper this file used to define now lives in
+//! `tests/support` as `ProcCluster`, so `tests/durability_faults.rs`
+//! (issue #39) could use the same one rather than a second copy. It gained
+//! a boot retry in the move -- see that type's docs and issue #40 for the
+//! `free_addr` race it works around.
 
-use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use queso_net::client;
 use queso_smr::{ClientId, Command as KvCommand, Outcome};
 
-/// The `queso-node` binary under test, built by Cargo before this
-/// integration test binary runs (`CARGO_BIN_EXE_<bin-target-name>` is set
-/// automatically for any binary target in the same package).
-fn node_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_queso-node")
-}
-
-/// An ephemeral, currently-free localhost port -- see `tests/cluster.rs`'s
-/// identical helper for the caveats (small accept-immediately-drop race,
-/// standard practice in tests).
-fn free_addr() -> SocketAddr {
-    let listener = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind an ephemeral port");
-    listener.local_addr().expect("read back the bound address")
-}
-
-/// One real 3-node `queso-node` cluster, each replica a genuine OS process,
-/// with helpers to `SIGKILL` and respawn any subset of them against the
-/// *same* on-disk `--data-dir` (so a respawned node's `queso-node` process
-/// goes through exactly the same boot-time reload path a real redeploy
-/// would). Kills every still-running child on drop, so a failing assertion
-/// mid-test never leaks orphan processes (mirrors `probe_amnesia.sh`'s own
-/// `trap cleanup EXIT`).
-struct RealCluster {
-    n: usize,
-    peer_addrs: Vec<SocketAddr>,
-    client_addrs: Vec<SocketAddr>,
-    leader: u32,
-    data_dir: std::path::PathBuf,
-    children: Vec<Option<Child>>,
-}
-
-impl RealCluster {
-    fn new(n: usize, leader: u32, data_dir: &Path) -> Self {
-        let peer_addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
-        let client_addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
-        let mut cluster = Self {
-            n,
-            peer_addrs,
-            client_addrs,
-            leader,
-            data_dir: data_dir.to_path_buf(),
-            children: (0..n).map(|_| None).collect(),
-        };
-        for i in 0..n {
-            cluster.spawn(i);
-        }
-        cluster
-    }
-
-    /// Boot (or reboot) replica `i` as a fresh `queso-node` process,
-    /// pointed at this cluster's shared `--data-dir` -- the same directory
-    /// every previous incarnation of replica `i` wrote its durable
-    /// snapshot into, so this exercises the real reload-on-boot path.
-    fn spawn(&mut self, i: usize) {
-        assert!(
-            self.children[i].is_none(),
-            "replica {i} is already running -- kill it first"
-        );
-        let mut cmd = Command::new(node_bin());
-        cmd.arg("--id")
-            .arg(i.to_string())
-            .arg("--seed")
-            .arg((9_000 + i as u64).to_string())
-            .arg("--listen")
-            .arg(self.peer_addrs[i].to_string())
-            .arg("--client-listen")
-            .arg(self.client_addrs[i].to_string())
-            .arg("--leader")
-            .arg(self.leader.to_string())
-            .arg("--tick-ms")
-            .arg("5")
-            .arg("--data-dir")
-            .arg(&self.data_dir);
-        for j in 0..self.n {
-            cmd.arg("--peer").arg(format!("{j}={}", self.peer_addrs[j]));
-        }
-        // Quiet by default -- these tests assert on the client protocol's
-        // observable behavior, not log output; pass through `RUST_LOG` if a
-        // human wants to watch a failure locally.
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        let child = cmd.spawn().expect("spawn queso-node subprocess");
-        self.children[i] = Some(child);
-    }
-
-    /// `SIGKILL` replica `i` and reap it -- `Child::wait` blocks until the
-    /// OS has fully torn the process down (including releasing its
-    /// listening sockets), so a subsequent `spawn` rebinding the same ports
-    /// never races the kernel's own cleanup the way an in-process
-    /// task-abort simulation would.
-    fn kill(&mut self, i: usize) {
-        let mut child = self.children[i]
-            .take()
-            .unwrap_or_else(|| panic!("replica {i} is not running"));
-        child.kill().expect("SIGKILL replica");
-        child.wait().expect("reap killed replica");
-    }
-
-    fn client_addr(&self, i: usize) -> SocketAddr {
-        self.client_addrs[i]
-    }
-}
-
-impl Drop for RealCluster {
-    fn drop(&mut self) {
-        for slot in &mut self.children {
-            if let Some(mut child) = slot.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
-}
+mod support;
+use support::ProcCluster as RealCluster;
 
 /// Retry `client::submit` against `addr` until it succeeds or `timeout`
 /// elapses -- see `tests/cluster.rs`'s identical helper's docs.
@@ -198,7 +92,7 @@ fn get(client: u32, seq: u64, key: u32) -> KvCommand {
 #[tokio::test(flavor = "multi_thread")]
 async fn majority_reboot_does_not_lose_an_acknowledged_write() {
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let mut cluster = RealCluster::new(3, 0, data_dir.path());
+    let mut cluster = RealCluster::start(3, 0, data_dir.path());
     let timeout = Duration::from_secs(15);
 
     let put_outcome = submit_with_retry(cluster.client_addr(0), &put(1, 0, 42, 7), timeout).await;
@@ -250,7 +144,7 @@ async fn majority_reboot_does_not_lose_an_acknowledged_write() {
 #[tokio::test(flavor = "multi_thread")]
 async fn minority_reboot_recovers_too() {
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let mut cluster = RealCluster::new(3, 0, data_dir.path());
+    let mut cluster = RealCluster::start(3, 0, data_dir.path());
     let timeout = Duration::from_secs(15);
 
     let put_outcome = submit_with_retry(cluster.client_addr(0), &put(1, 0, 99, 5), timeout).await;

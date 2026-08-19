@@ -105,6 +105,7 @@ fn spawn_cluster_with_only(leader: Option<NodeId>, live: &[usize]) -> Vec<Socket
             persist_delay: Duration::ZERO,
             save_counter: None,
             durable_event_counter: None,
+            disk_fault: None,
             tls: None,
             status_listen_addr: None,
             // Phase 9.2 (issue #56): chain-checkpoint hook off, as for any
