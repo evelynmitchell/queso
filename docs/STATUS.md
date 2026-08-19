@@ -41,13 +41,13 @@ real traffic. See §4 for the honest remaining gaps.
 | M5 | Auto-tuning (multi-armed bandit) | ✅ merged (#28) |
 | M6 | Real transport, deployment, fuzzing, perf & comparison | ✅ merged (#30 — #32, #33, #34, #35) |
 | M7 | Operability: durability hardening, TLS, status/metrics, admin CLI | ✅ merged (#45 — #46, #47) |
-| — | Phase 9: Antithesis-style conformance testing | 🔶 9.1 merged (#55); 9.2 in progress (#56 — node-side hook landed) |
+| — | Phase 9: Antithesis-style conformance testing | 🔶 9.1 merged (#55); 9.2 in progress (#56 — hook + real-process harness landed; soak remains) |
 
 ---
 
 ## 2. Accomplishments (built & merged)
 
-**Seven crates + two formal specs**, ~277 test functions, CI green on every PR.
+**Eight crates + two formal specs**, ~285 test functions, CI green on every PR.
 
 ### `crates/sim` — deterministic simulation harness (Phase 0)
 - Single-threaded discrete-event kernel; virtual logical clock; one seeded PRNG.
@@ -123,6 +123,17 @@ crate depending only on `queso-smr`. Extracted from `crates/conformance` so the
 byte-identical hashes from the same code — an encoding drift between them would
 make every cross-replica comparison silently miss.
 
+### `crates/soak` — real-process conformance harness (Phase 9.2)
+`RealCluster` implements `queso-conformance`'s `CobTarget` over spawned
+`queso-node` OS processes, so the 9.1 observers judge the **real** I/O layer
+unchanged, plus a TCP turbulence proxy mesh that partitions replicas at the
+*socket* level — cutting live connections and forcing real reconnects, rather
+than dropping already-decoded frames the way the in-transport 7.4 nemesis
+does. Scenarios cover a healthy cluster, a minority socket partition, a
+`SIGKILL`ed and restarted replica, and link latency. Honest limits: byte-stream
+faults only (no kernel-level loss/reordering), and runs are not reproducible
+from seeds the way 9.1's are.
+
 ### `crates/conformance` — Chain-of-Blocks harness (Phase 9.1)
 A Queso port of Antithesis's Chain-of-Blocks workload — the `(n, h)` hash-chain
 state machine, a divergence observer (no two replicas may show a different `h` at
@@ -173,18 +184,21 @@ runbook in `docs/deploy-flyio.md`. (Actual multi-region deploys need the owner's
 | Property/DST | Agreement/Validity/Integrity, linearizability, partition, restart, hedging, tuning — adversarial seed corpora | High for the *implementation* under simulated faults |
 | Linearizability | Sound in-tree checker + real anomaly control | Good |
 | Real transport | Multi-process cluster tests, TLS, majority-reboot durability, in-transport nemesis | Moderate — scripted scenarios, not sustained soak |
+| Real-process conformance | CoB observers vs. real `queso-node` processes under socket-level partition/crash/latency (`crates/soak`) | Moderate — the real I/O layer is now checked, but only over short scripted faults |
 | Review | Independent fresh-env review per PR | High — found real bugs |
 | CI | fmt + clippy `-D warnings` + build + test on stable, per PR | Good baseline |
 
 **Known verification gaps:**
-- **The sim↔real gap (the big one, Phase 9 / #54).** DST verifies the consensus *logic*
-  against a mock `Ctx` in a single-threaded, in-process kernel. It never runs the real
-  `crates/net` binary — real tokio scheduling, real sockets, real disk — under sustained
-  autonomous fault. The project's own bug history says that's exactly where bugs live
-  (#36, the 7.1 self-send drop, the #22 catch-up zombie). **9.1 (#55) built the workload
-  and observers; it does not close this gap** — it runs in-process, over the same fault
-  surface the existing DST suite covers. #56 is what closes it, by pointing those
-  observers at real processes under a randomized, long-running soak.
+- **The sim↔real gap (Phase 9 / #54) — partly closed.** DST verifies the consensus *logic*
+  against a mock `Ctx` in a single-threaded, in-process kernel; for most of the
+  project's life nothing ran the real `crates/net` binary under fault at all, and the
+  bug history says that is exactly where bugs live (#36, the 7.1 self-send drop, the
+  #22 catch-up zombie). 9.1 (#55) built the workload and observers but ran them
+  in-process, closing none of it. 9.2's first two slices now do run the real binary
+  under real socket partitions, crashes, and latency — so what remains is narrower but
+  real: the faults are **scripted and short**, not the autonomous, sustained,
+  randomized turbulence Antithesis-style testing is actually about. A bug that needs
+  twenty minutes of churn to surface would still be missed.
 - **Two findings from 9.1 that #56 must act on** (details in
   `crates/conformance/README.md`): (1) polling only `/metrics`' `next_slot` yields a
   *vacuous* safety verdict — replicas lag each other, so frontier samples almost never
@@ -283,11 +297,11 @@ no schedule.
 
 1. ~~**Phase 9.1 — Chain-of-Blocks workload + divergence/liveness observer (#55).**~~
    Merged: `crates/conformance`.
-2. **Phase 9.2 — real-binary-under-fault soak (#56).** The piece that actually closes
-   the sim↔real gap. The node-side observability hook it depends on is **done** (`GET
-   /chain`, `crates/net/src/chain.rs`); what remains is the `CobTarget` implementation
-   that polls real processes, an out-of-process nemesis so real sockets are faulted
-   rather than app frames, and the sustained soak plus its bounded CI variant.
+2. **Phase 9.2 — real-binary-under-fault soak (#56).** Two of three slices are done:
+   the node-side hook (`GET /chain`) and the real-process harness plus socket-level
+   nemesis (`crates/soak`). What remains is the sustained, randomized, long-running
+   soak driver with a seeded fault schedule, its bounded CI variant, and the documented
+   long-soak invocation.
 3. **Durability fault-injection coverage (#39)** — partly overlapping what a 9.2 soak
    exercises, but the unit-level torn-write and ENOSPC cases are worth having directly.
 4. **CI/CD catch-up (cheap, independent):** nightly TLA+ + DST soak, `cargo audit`/`deny`,

@@ -1,0 +1,34 @@
+[package]
+name = "queso-soak"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Phase 9.2: drive the Chain-of-Blocks conformance workload against real queso-node OS processes under socket-level turbulence, so the divergence/liveness observers watch the real I/O layer rather than the in-process simulator."
+
+# Like `queso-net` and `queso-compare`, this is real-I/O boundary code:
+# spawning OS processes, real sockets, real wall-clock time is exactly its
+# job. It therefore does NOT opt into `[workspace.lints]` -- those
+# determinism lints (no `Instant::now`, no threads, no ambient randomness)
+# are a property of the sim-verified core and of `queso-conformance`'s
+# in-process harness, and would be meaningless here.
+#
+# This separation is the reason this is its own crate rather than a module
+# in `queso-conformance`: that crate's determinism opt-in is what makes a
+# 9.1 run reproducible from its seeds, and relaxing it crate-wide to
+# accommodate real-process code would quietly weaken the guarantee for the
+# in-process harness too. See `queso-conformance`'s manifest, which called
+# this out before this crate existed.
+
+[dependencies]
+queso-chain = { path = "../chain" }
+queso-conformance = { path = "../conformance" }
+queso-net = { path = "../net" }
+queso-sim = { path = "../sim" }
+queso-smr = { path = "../smr" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+serde_json = "1"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
