@@ -266,6 +266,12 @@ load. `failed` in a report is therefore "the client gave up", almost never
 "the cluster refused" — worth knowing, because the number reads like the
 second one.
 
+The timeout turned out to be most of it. On the *same* CI runner and the
+same schedule, the bounded soak went from 136 acknowledged / 485 failed at
+1.5s to **587 / 25** at 4s. So 1.5s was not cutting off doomed submissions;
+it was cutting off ones that completed somewhere between 1.5 and 4 seconds.
+The runner is slower, but the harness was throwing the work away.
+
 This is also the argument for `--nocapture` in the CI job. The first soak
 run passed with these same numbers invisible; the floors had margin nowhere
 except on my machine, and nothing in a green log would have said so.
