@@ -62,9 +62,23 @@ fixed `n` (see [`queso-net`'s `/chain`](../net#phase-92-get-chain--conformance-o
 ## Running it
 
 ```sh
-cargo build --all                 # queso-soak spawns the queso-node binary
-cargo test -p queso-soak
+cargo build --all                      # queso-soak spawns the queso-node binary
+cargo test -p queso-soak               # proxy unit tests + one bounded real-process scenario
+cargo test -p queso-soak -- --ignored  # the full real-process set (~60s)
 ```
+
+**Only one real-process scenario runs by default.** The other four are
+`#[ignore]`d, and that is a load decision rather than a confidence one: each
+scenario boots three `queso-node` processes and allocates nine ephemeral
+ports through the bind-then-drop `free_addr` pattern whose TOCTOU [#40]
+already documents. `cargo test --all` runs test binaries in parallel, so
+that lands on top of `queso-net`'s own real-process tests — and on a small
+CI runner the contention was enough to fail an unrelated, pre-existing test
+(`queso-net`'s `restart_recovery::minority_reboot_recovers_too`, timing out
+its 10s submit retry loop). Keeping one bounded scenario in CI preserves a
+real-process smoke check at about the footprint `queso-net`'s own tests
+already have; [#56] asks for exactly this shape, a short bounded CI variant
+plus a documented longer mode.
 
 The `queso-node` binary is located at run time: `QUESO_NODE_BIN` if set,
 otherwise alongside the test executable (`<target>/<profile>/queso-node`).
@@ -130,5 +144,6 @@ partition is in force. A long soak should either shorten the timeout or
 track which replicas are currently answering, or it will spend most of a
 partition window blocked rather than driving traffic.
 
+[#40]: https://github.com/evelynmitchell/queso/issues/40
 [#54]: https://github.com/evelynmitchell/queso/issues/54
 [#56]: https://github.com/evelynmitchell/queso/issues/56

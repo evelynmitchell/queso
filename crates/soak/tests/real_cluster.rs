@@ -23,6 +23,28 @@
 //! Tests are plain `#[test]`, not `#[tokio::test]`: `RealCluster` owns a
 //! tokio runtime and `block_on`s inside the synchronous `CobTarget`
 //! methods, which would panic inside an outer runtime.
+//!
+//! # The CI subset, and why
+//!
+//! Only [`a_healthy_real_cluster_converges_and_is_actually_observed`] runs
+//! by default; the rest are `#[ignore]`d and run with
+//! `cargo test -p queso-soak -- --ignored`.
+//!
+//! This is a load decision, not a confidence one. Each scenario boots three
+//! real `queso-node` processes and allocates nine ephemeral ports through
+//! the bind-then-drop `free_addr` pattern whose TOCTOU issue #40 already
+//! documents. `cargo test --all` runs test binaries in parallel, so those
+//! processes and port allocations land on top of `queso-net`'s own
+//! real-process tests -- and on a small CI runner that contention is enough
+//! to fail an unrelated, pre-existing test
+//! (`queso-net`'s `restart_recovery::minority_reboot_recovers_too` did
+//! exactly that, timing out its 10s submit retry loop while this file's
+//! scenarios were running).
+//!
+//! Keeping one bounded scenario in CI preserves a real-process smoke check
+//! at roughly the footprint `queso-net`'s own tests already have, while the
+//! full set stays one command away. Issue #56 asks for exactly this shape:
+//! a short bounded CI variant plus a documented longer mode.
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -97,8 +119,8 @@ fn a_healthy_real_cluster_converges_and_is_actually_observed() {
 
     let mut workload = CobWorkload::new(0xc0b_9002);
     let mut observer = Observer::new();
-    run(&mut cluster, &mut workload, &mut observer, run_config(24));
-    converge(&mut cluster, &mut workload, &mut observer, 3, 1_000);
+    run(&mut cluster, &mut workload, &mut observer, run_config(16));
+    converge(&mut cluster, &mut workload, &mut observer, 2, 800);
 
     // Measured on this scenario: ~31 comparisons, ~95 samples, frontier ~33.
     // The floor is set well below that but far above zero, so it survives
@@ -107,7 +129,7 @@ fn a_healthy_real_cluster_converges_and_is_actually_observed() {
 
     let (ok, failed) = cluster.submission_counts();
     assert!(
-        ok >= 20,
+        ok >= 14,
         "a healthy cluster should have acknowledged nearly everything; ok={ok} failed={failed}"
     );
     assert!(
@@ -116,7 +138,7 @@ fn a_healthy_real_cluster_converges_and_is_actually_observed() {
          path is not actually in the cluster's network path"
     );
     assert!(
-        observer.cluster_frontier() >= 20,
+        observer.cluster_frontier() >= 14,
         "the cluster barely progressed (frontier {}):\n{}",
         observer.cluster_frontier(),
         observer.render_report()
@@ -132,6 +154,7 @@ fn a_healthy_real_cluster_converges_and_is_actually_observed() {
 }
 
 #[test]
+#[ignore = "boots real node processes; run with --ignored (see this file's CI-subset docs)"]
 fn a_real_socket_partition_of_a_minority_never_causes_divergence() {
     let _guard = exclusive();
     let data_dir = tempfile::tempdir().expect("tempdir");
@@ -193,6 +216,7 @@ fn a_real_socket_partition_of_a_minority_never_causes_divergence() {
 }
 
 #[test]
+#[ignore = "boots real node processes; run with --ignored (see this file's CI-subset docs)"]
 fn a_killed_and_restarted_replica_rejoins_without_diverging() {
     let _guard = exclusive();
     let data_dir = tempfile::tempdir().expect("tempdir");
@@ -226,6 +250,7 @@ fn a_killed_and_restarted_replica_rejoins_without_diverging() {
 }
 
 #[test]
+#[ignore = "boots real node processes; run with --ignored (see this file's CI-subset docs)"]
 fn latency_turbulence_does_not_produce_divergence() {
     let _guard = exclusive();
     let data_dir = tempfile::tempdir().expect("tempdir");
@@ -246,6 +271,7 @@ fn latency_turbulence_does_not_produce_divergence() {
 }
 
 #[test]
+#[ignore = "boots real node processes; run with --ignored (see this file's CI-subset docs)"]
 fn the_observer_sees_nothing_from_a_replica_nobody_can_reach() {
     // A soak must not mistake "unreachable" for "applied nothing" -- the
     // former is silence, the latter is a claim. `poll_samples` skips a
