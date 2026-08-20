@@ -194,3 +194,100 @@ fn reproducibility_holds_across_many_seeds_under_the_content_oblivious_adversary
         );
     }
 }
+
+/// Like [`run_scenario`], but drains the queue through `run_until` in
+/// `slice`-tick steps over an absolute timeline instead of one `run()`.
+fn run_scenario_sliced(seed: u64, scheduler_name: &str, slice: u64, horizon: u64) -> Trace {
+    let mut kernel = Kernel::new(seed, make_scheduler(scheduler_name));
+    for i in 0..RING_SIZE {
+        let node = EchoNode {
+            id: NodeId(i),
+            ring_size: RING_SIZE,
+            max_round: MAX_ROUND,
+            received: Rc::new(RefCell::new(Vec::new())),
+        };
+        kernel.add_node(NodeId(i), Box::new(node));
+    }
+    kernel.set_leader(Some(NodeId(0)));
+    kernel.schedule_fault(LogicalTime(5), FaultCommand::Crash(NodeId(2)));
+    kernel.schedule_fault(LogicalTime(15), FaultCommand::Restart(NodeId(2)));
+    kernel.schedule_fault(
+        LogicalTime(20),
+        FaultCommand::Partition(
+            BTreeSet::from([NodeId(0), NodeId(1)]),
+            BTreeSet::from([NodeId(2), NodeId(3), NodeId(4)]),
+        ),
+    );
+    kernel.schedule_fault(LogicalTime(30), FaultCommand::Heal);
+    kernel.schedule_fault(LogicalTime(8), FaultCommand::SlowNode(NodeId(3), 4));
+    kernel.inject_message(NodeId(0), NodeId(1), Msg::Ping(0));
+
+    let mut t = 0;
+    while t <= horizon {
+        kernel.run_until(LogicalTime(t));
+        t += slice;
+    }
+    kernel.run_until(LogicalTime(horizon));
+    kernel.trace().clone()
+}
+
+/// The instant a trace event was recorded at.
+fn event_time(event: &queso_sim::trace::TraceEvent) -> LogicalTime {
+    use queso_sim::trace::TraceEvent::*;
+    match event {
+        Send { time, .. }
+        | Deliver { time, .. }
+        | Drop { time, .. }
+        | TimerScheduled { time, .. }
+        | TimerFired { time, .. }
+        | TimerDropped { time, .. }
+        | Crash { time, .. }
+        | Restart { time, .. }
+        | Partition { time, .. }
+        | Heal { time, .. }
+        | SlowNode { time, .. }
+        | LeaderChanged { time, .. } => *time,
+    }
+}
+
+/// Draining the queue in slices must dispatch exactly what one `run()` does.
+///
+/// `queso_smr::SmrCluster::run_for` relies on this: under auto-tuning it
+/// advances a tick at a time so the kernel's leader hint can be re-synced
+/// between ticks (issue #29), which is only sound if slicing changes
+/// nothing about what runs. Asserted here, against the kernel itself,
+/// rather than left as a comment two crates away.
+///
+/// Note the **absolute** timeline. `run_until` takes an absolute instant and
+/// `now` only moves when an event is dispatched, so a loop of "advance one
+/// tick past wherever we are" stalls as soon as the next event is further
+/// out than the slice. That is an easy mistake to make — it was made
+/// writing this, and it is why `SmrCluster::run_for` captures its start
+/// instant once rather than re-reading `now` each step.
+#[test]
+fn draining_the_queue_in_slices_matches_one_run() {
+    for &name in SCHEDULERS {
+        let seed = 0x51CED ^ (name.len() as u64);
+        let whole = run_scenario(seed, name);
+        assert!(
+            !whole.events().is_empty(),
+            "{name}: the reference run recorded nothing, so this proves nothing"
+        );
+        let horizon = whole
+            .events()
+            .iter()
+            .map(event_time)
+            .max()
+            .expect("the reference run recorded events");
+
+        for slice in [1u64, 3, 7] {
+            let sliced = run_scenario_sliced(seed, name, slice, horizon.0 + slice);
+            assert_eq!(
+                whole, sliced,
+                "{name}: draining in {slice}-tick slices produced a different trace than \
+                 one run -- slicing is not dispatch-equivalent, and SmrCluster::run_for's \
+                 tuned path depends on it being so"
+            );
+        }
+    }
+}

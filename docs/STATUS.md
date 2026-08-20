@@ -277,8 +277,12 @@ node binary, real durability, a client API — is **done**. What remains:
 - **Bounded concurrent connections on the status port** (#50) — low severity; the port is
   opt-in and documented as internal-only.
 - Smaller robustness items: DNS-retry backoff and IPv6 family preference (#42),
-  tuning×restart coverage and leader-switch `set_leader` (#29), bench coverage (#40),
-  idempotent proposer `start()` (#13).
+  bench coverage (#40), idempotent proposer `start()` (#13). ~~Tuning×restart coverage
+  and leader-switch `set_leader` (#29)~~ — closed: the kernel's leader hint now tracks
+  the tuner across epoch switches (it used to be set once to epoch 0's leader, so a
+  leader-targeting adversary under tuning attacked a bystander), plus direct
+  tuning×crash/restart coverage of the per-epoch pinning invariant and a module-doc
+  callout on the switch rule's lack of hysteresis.
 
 **Out of scope by design:** Byzantine fault tolerance, side-channel resistance,
 dynamic reconfiguration/membership change, general-purpose DB features.
