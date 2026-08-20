@@ -35,22 +35,30 @@
 //! task into one `queso_net::metrics::Recorder` (see that module's docs for
 //! why a single collector, not a shared/locked histogram, is the simpler
 //! design here).
+//!
+//! # Where the actual scheduling lives
+//!
+//! In [`queso_net::bench`], not here. This file is the CLI: flags, a
+//! [`ClientTarget`] adapter, and printing. The schedulers moved into the
+//! library because their two most important properties -- that queue wait
+//! is counted in latency, and that shed operations are attributed to the
+//! right read/write side -- are only observable under sustained overload,
+//! and a binary's internals cannot be reached from a test at all. Issue #40
+//! and that module's docs cover it.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
+use queso_net::bench::{closed_loop_run, open_loop_run, OpTarget, StopCondition, WorkloadConfig};
 use queso_net::client::{Client, ClientConfig};
-use queso_net::metrics::{OpKind, Recorder, Sample};
+use queso_net::metrics::{Recorder, Sample};
 use queso_net::tls::ClientTlsConfig;
-use queso_smr::{ClientId, Command};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
-use tokio::sync::{mpsc, Mutex, Semaphore};
-use tokio::task::JoinSet;
+use queso_smr::Command;
+use tokio::sync::mpsc;
 use tracing::warn;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -153,236 +161,23 @@ struct Args {
     tls_server_name: Option<String>,
 }
 
-/// One virtual client session: a stable `ClientId` plus the monotonic
-/// `seq`/RNG state that must never be touched by two operations at once
-/// (A6 -- see `queso_smr::command::ClientSession`'s docs). Owned by exactly
-/// one in-flight operation at a time, by construction: closed-loop workers
-/// own theirs for the whole run; open-loop mode checks one out of a bounded
-/// pool per operation and checks it back in when done (see
-/// [`open_loop_run`]).
-struct Session {
-    id: ClientId,
-    seq: u64,
-    rng: StdRng,
-}
-
-impl Session {
-    fn new(idx: usize, seed: u64) -> Self {
-        Self {
-            id: ClientId(idx as u32),
-            seq: 0,
-            rng: StdRng::seed_from_u64(seed.wrapping_add(idx as u64)),
-        }
-    }
-}
-
-/// Combined run-length stop condition: either a wall-clock deadline, a
-/// target total op count, or both (whichever trips first).
-#[derive(Clone, Copy)]
-struct StopCondition {
-    deadline: Option<Instant>,
-    target_ops: Option<u64>,
-}
-
-impl StopCondition {
-    fn should_stop(&self, op_counter: &AtomicU64) -> bool {
-        if let Some(deadline) = self.deadline {
-            if Instant::now() >= deadline {
-                return true;
-            }
-        }
-        if let Some(target) = self.target_ops {
-            if op_counter.load(Ordering::Relaxed) >= target {
-                return true;
-            }
-        }
-        false
-    }
-}
-
-/// Build, submit, and time one operation of the caller-chosen kind
-/// (`is_read`) using (and mutating) `session`'s seq/RNG state for the key,
-/// returning the [`Sample`] it produced.
+/// A [`Client`] as an [`OpTarget`], so `queso_net::bench`'s schedulers can
+/// drive a real cluster.
 ///
-/// The read/write decision is made by the caller, not here, so that
-/// open-loop can attribute a *dropped* op (one that never gets a session)
-/// to the correct kind, and latency is measured from the caller-supplied
-/// `start` rather than from entry here -- the caller passes the moment the
-/// op was released (open-loop: when its tick fired), so time spent queued
-/// for a free session is included in the latency (the coordinated-omission
-/// correction the module docs promise), not silently omitted.
-async fn do_one_op(
-    client: &Client,
-    session: &mut Session,
-    keys: u32,
-    is_read: bool,
-    start: Instant,
-) -> Sample {
-    let key = session.rng.gen_range(0..keys.max(1));
-    let seq = session.seq;
-    session.seq += 1;
+/// That indirection is the whole reason the schedulers moved into the
+/// library: a test cannot make a real cluster reliably slower than the
+/// offered rate, and both properties worth regression-testing here
+/// (coordinated omission, drop attribution) only appear under sustained
+/// overload. See `queso_net::bench`'s module docs.
+struct ClientTarget(Arc<Client>);
 
-    let (kind, command) = if is_read {
-        (
-            OpKind::Read,
-            Command::Get {
-                client: session.id,
-                seq,
-                key,
-            },
-        )
-    } else {
-        let value = session.rng.gen::<i64>();
-        (
-            OpKind::Write,
-            Command::Put {
-                client: session.id,
-                seq,
-                key,
-                value,
-            },
-        )
-    };
-
-    let result = client.submit(&command).await;
-    let latency = start.elapsed();
-    Sample {
-        kind,
-        latency,
-        ok: result.is_ok(),
+impl OpTarget for ClientTarget {
+    fn submit<'a>(
+        &'a self,
+        command: Command,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move { self.0.submit(&command).await.is_ok() })
     }
-}
-
-/// Closed-loop mode: `concurrency` workers, each owning one [`Session`] for
-/// the whole run, looping "submit, wait, submit the next one" until `stop`.
-#[allow(clippy::too_many_arguments)]
-async fn closed_loop_run(
-    client: Arc<Client>,
-    concurrency: usize,
-    keys: u32,
-    read_frac: f64,
-    seed: u64,
-    stop: StopCondition,
-    sample_tx: mpsc::UnboundedSender<Sample>,
-    op_counter: Arc<AtomicU64>,
-) {
-    let mut workers = JoinSet::new();
-    for idx in 0..concurrency.max(1) {
-        let client = Arc::clone(&client);
-        let sample_tx = sample_tx.clone();
-        let op_counter = Arc::clone(&op_counter);
-        workers.spawn(async move {
-            let mut session = Session::new(idx, seed);
-            while !stop.should_stop(&op_counter) {
-                // Draw the read/write choice from the session RNG (same
-                // draw order as before this was hoisted out of do_one_op),
-                // then time from here: a closed-loop worker owns its session
-                // for the whole run, so there is no queueing to include --
-                // `start` here is exactly the operation's service latency.
-                let is_read = session.rng.gen_range(0.0..1.0) < read_frac;
-                let start = Instant::now();
-                let sample = do_one_op(&client, &mut session, keys, is_read, start).await;
-                op_counter.fetch_add(1, Ordering::Relaxed);
-                let _ = sample_tx.send(sample);
-            }
-        });
-    }
-    while workers.join_next().await.is_some() {}
-}
-
-/// Open-loop mode: operations are scheduled on a fixed `1/rate`-second
-/// tick. Each tick checks out a [`Session`] from a bounded pool (size
-/// `concurrency`) -- if the pool is empty, the operation queues for one,
-/// which is where sustained overload shows up as growing outstanding work
-/// rather than an unbounded task/session count. An outer admission
-/// semaphore (`concurrency * 8` slots) additionally caps how many ticks may
-/// be queued waiting on a session at once; a tick that can't get an
-/// admission slot is counted as a dropped/failed op immediately instead of
-/// piling up forever under an offered rate the cluster can never sustain.
-#[allow(clippy::too_many_arguments)]
-async fn open_loop_run(
-    client: Arc<Client>,
-    rate: f64,
-    concurrency: usize,
-    keys: u32,
-    read_frac: f64,
-    seed: u64,
-    stop: StopCondition,
-    sample_tx: mpsc::UnboundedSender<Sample>,
-    op_counter: Arc<AtomicU64>,
-) {
-    let concurrency = concurrency.max(1);
-    let period = Duration::from_secs_f64(1.0 / rate.max(0.001));
-    let mut ticker = tokio::time::interval(period);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
-
-    let (pool_tx, pool_rx) = mpsc::channel::<Session>(concurrency);
-    for idx in 0..concurrency {
-        let _ = pool_tx.send(Session::new(idx, seed)).await;
-    }
-    let pool_rx = Arc::new(Mutex::new(pool_rx));
-    let admission = Arc::new(Semaphore::new(concurrency * 8));
-
-    // A scheduler-level RNG for the read/write choice, independent of which
-    // pooled session (if any) an op ends up running on. Deciding the kind
-    // here, before admission, lets a *dropped* op -- which never gets a
-    // session -- still be attributed to the correct read/write side of the
-    // mix instead of always being charged to writes. Its own stream (seed
-    // perturbed) so it doesn't shadow any session's key/value draws.
-    let mut sched_rng = StdRng::seed_from_u64(seed ^ 0x00D5_C7ED_0BEE_F00D);
-
-    let mut tasks = JoinSet::new();
-    loop {
-        if stop.should_stop(&op_counter) {
-            break;
-        }
-        ticker.tick().await;
-        if stop.should_stop(&op_counter) {
-            break;
-        }
-
-        // The op is "released" now (its scheduled tick fired); time it from
-        // here so any wait for a free session counts toward its latency
-        // (coordinated-omission correction), and pick its kind now so a drop
-        // is attributed correctly.
-        let scheduled = Instant::now();
-        let is_read = sched_rng.gen_range(0.0..1.0) < read_frac;
-
-        let Ok(permit) = Arc::clone(&admission).try_acquire_owned() else {
-            // The client-side admission queue is already full: the offered
-            // rate is outrunning what `concurrency` sessions plus the
-            // buffer can absorb. Count it as a dropped op rather than
-            // growing memory unboundedly.
-            op_counter.fetch_add(1, Ordering::Relaxed);
-            let _ = sample_tx.send(Sample {
-                kind: if is_read { OpKind::Read } else { OpKind::Write },
-                latency: Duration::ZERO,
-                ok: false,
-            });
-            continue;
-        };
-
-        let client = Arc::clone(&client);
-        let pool_tx = pool_tx.clone();
-        let pool_rx = Arc::clone(&pool_rx);
-        let sample_tx = sample_tx.clone();
-        let op_counter = Arc::clone(&op_counter);
-        tasks.spawn(async move {
-            let _permit = permit;
-            let mut session = {
-                let mut rx = pool_rx.lock().await;
-                match rx.recv().await {
-                    Some(session) => session,
-                    None => return, // pool sender dropped: run is shutting down.
-                }
-            };
-            let sample = do_one_op(&client, &mut session, keys, is_read, scheduled).await;
-            op_counter.fetch_add(1, Ordering::Relaxed);
-            let _ = sample_tx.send(sample);
-            let _ = pool_tx.send(session).await;
-        });
-    }
-    while tasks.join_next().await.is_some() {}
 }
 
 #[tokio::main]
@@ -430,6 +225,13 @@ async fn main() -> anyhow::Result<()> {
         },
     ));
 
+    let target: Arc<dyn OpTarget> = Arc::new(ClientTarget(Arc::clone(&client)));
+    let workload = WorkloadConfig {
+        concurrency: args.concurrency,
+        keys: args.keys,
+        read_frac: args.read_frac,
+        seed: args.seed,
+    };
     let stop = StopCondition {
         deadline: args
             .duration_secs
@@ -451,12 +253,9 @@ async fn main() -> anyhow::Result<()> {
     match args.rate {
         Some(rate) => {
             open_loop_run(
-                Arc::clone(&client),
+                Arc::clone(&target),
                 rate,
-                args.concurrency,
-                args.keys,
-                args.read_frac,
-                args.seed,
+                workload,
                 stop,
                 sample_tx.clone(),
                 Arc::clone(&op_counter),
@@ -465,11 +264,8 @@ async fn main() -> anyhow::Result<()> {
         }
         None => {
             closed_loop_run(
-                Arc::clone(&client),
-                args.concurrency,
-                args.keys,
-                args.read_frac,
-                args.seed,
+                Arc::clone(&target),
+                workload,
                 stop,
                 sample_tx.clone(),
                 Arc::clone(&op_counter),

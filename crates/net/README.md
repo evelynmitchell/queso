@@ -519,6 +519,33 @@ queso-bench: 15670 ops in 8.04s = 1950.2 ops/sec (0 errors)
   writes   count=7869     errors=0      mean= 33037.2us  p50=  30863us  p90=  62879us  p99=  81279us  max=  93887us
 ```
 
+### Where the scheduling lives, and why (issue #40)
+
+The open- and closed-loop schedulers are in **`src/bench.rs`**, not in the
+binary; `queso-bench` is the CLI wrapper plus a `ClientTarget` adapter. They
+moved there because the two properties most worth guarding cannot be
+eyeballed from a summary table and cannot be tested inside a binary:
+
+- **Coordinated omission.** An open-loop generator that starts its stopwatch
+  when an operation *begins service* rather than when it was *scheduled*
+  deletes all the queueing delay from its own measurements and reports
+  beautiful latencies for a drowning cluster. A `Sample`'s latency therefore
+  runs from the moment the operation was released — before it queues for a
+  session.
+- **Drop attribution.** Under sustained overload some operations are shed
+  before they run. The read/write choice is drawn *before* admission so a
+  shed operation is charged to the side it was actually drawn as; deciding
+  after admission forces every shed op onto one default kind and makes the
+  error columns lie about the mix exactly when they matter.
+
+Both were bugs the #37 review found, and neither had a regression test.
+They do now, driven by an `OpTarget` with a chosen service time — a real
+cluster cannot be made reliably slower than the offered rate, which is
+precisely why the indirection exists. Each test was verified by
+reintroducing its bug: restarting the clock after queueing drops the worst
+observed latency from hundreds of milliseconds to 22ms against a 20ms
+service time, and charging shed ops to writes yields `reads=0, writes=400`.
+
 ## Phase 7.4: nemesis fault injection + adversarial perf (issue #34)
 
 `src/nemesis.rs`'s `Nemesis` is an **in-transport** fault injector for this

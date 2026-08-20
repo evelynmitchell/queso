@@ -531,6 +531,11 @@ pub struct ProcCluster {
     n: usize,
     peer_addrs: Vec<SocketAddr>,
     client_addrs: Vec<SocketAddr>,
+    /// Present only when the status server is enabled -- see
+    /// [`ProcCluster::start_with_status`].
+    status_addrs: Vec<SocketAddr>,
+    /// `--chain-checkpoints`, when the Phase 9.2 hook is enabled.
+    chain_checkpoints: Option<u64>,
     leader: u32,
     data_dir: PathBuf,
     children: Vec<Option<std::process::Child>>,
@@ -558,12 +563,45 @@ impl ProcCluster {
     /// boundary -- so retrying is the honest remedy. Blaming Queso for the
     /// harness's port allocation would be exactly the wrong signal.
     pub fn start(n: usize, leader: u32, data_dir: &std::path::Path) -> Self {
+        Self::start_inner(n, leader, data_dir, false, None)
+    }
+
+    /// Like [`Self::start`], but every replica also serves the status port
+    /// and (if `chain_checkpoints` is set) the Phase 9.2 `GET /chain` hook.
+    ///
+    /// Status addresses are read back with [`Self::status_addr`]. Sharing
+    /// one spawner rather than keeping a second copy per test file is the
+    /// point: the boot retry below only protects the clusters that go
+    /// through it, and issue #40's `free_addr` race applies to every
+    /// real-process spawner equally.
+    pub fn start_with_status(
+        n: usize,
+        leader: u32,
+        data_dir: &std::path::Path,
+        chain_checkpoints: Option<u64>,
+    ) -> Self {
+        Self::start_inner(n, leader, data_dir, true, chain_checkpoints)
+    }
+
+    fn start_inner(
+        n: usize,
+        leader: u32,
+        data_dir: &std::path::Path,
+        with_status: bool,
+        chain_checkpoints: Option<u64>,
+    ) -> Self {
         const ATTEMPTS: usize = 3;
         for attempt in 1..=ATTEMPTS {
             let mut cluster = Self {
                 n,
                 peer_addrs: (0..n).map(|_| free_addr()).collect(),
                 client_addrs: (0..n).map(|_| free_addr()).collect(),
+                status_addrs: if with_status {
+                    (0..n).map(|_| free_addr()).collect()
+                } else {
+                    Vec::new()
+                },
+                chain_checkpoints,
                 leader,
                 data_dir: data_dir.to_path_buf(),
                 children: (0..n).map(|_| None).collect(),
@@ -611,6 +649,12 @@ impl ProcCluster {
             .arg("5")
             .arg("--data-dir")
             .arg(&self.data_dir);
+        if let Some(addr) = self.status_addrs.get(i) {
+            cmd.arg("--status-listen").arg(addr.to_string());
+        }
+        if let Some(every) = self.chain_checkpoints {
+            cmd.arg("--chain-checkpoints").arg(every.to_string());
+        }
         for j in 0..self.n {
             cmd.arg("--peer").arg(format!("{j}={}", self.peer_addrs[j]));
         }
@@ -659,6 +703,15 @@ impl ProcCluster {
 
     pub fn client_addr(&self, i: usize) -> SocketAddr {
         self.client_addrs[i]
+    }
+
+    /// Status address of replica `i`. Panics unless the cluster was built
+    /// with [`Self::start_with_status`].
+    pub fn status_addr(&self, i: usize) -> SocketAddr {
+        *self
+            .status_addrs
+            .get(i)
+            .expect("this cluster was not started with the status server enabled")
     }
 
     pub fn replicas(&self) -> usize {
