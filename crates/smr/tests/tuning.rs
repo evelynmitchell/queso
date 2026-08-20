@@ -304,6 +304,315 @@ fn re_exploration_switches_leader_when_it_degrades_without_stalling() {
 }
 
 // ---------------------------------------------------------------------
+// Issue #29: the kernel's leader hint under tuning, and tuning x restart.
+// ---------------------------------------------------------------------
+
+/// Every leader the kernel was told about, in order, read out of the trace.
+fn kernel_leader_hints(cluster: &SmrCluster) -> Vec<Option<NodeId>> {
+    cluster
+        .trace()
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            queso_sim::trace::TraceEvent::LeaderChanged { leader, .. } => Some(*leader),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The kernel's leader hint must follow the tuner across epoch switches.
+///
+/// This is issue #29's middle item. `Kernel::set_leader` is the hook
+/// adversary schedulers use to decide who to target, and a tuned cluster
+/// used to set it exactly once, to epoch 0's leader. Any leader-targeting
+/// adversary run under auto-tuning was therefore attacking a replica that
+/// had long since stopped leading — a test that looked like it stressed the
+/// leader while stressing a bystander.
+///
+/// The assertion is written against the tuner's own leader log rather than
+/// a hardcoded expectation, so it stays true if the tuner's choices change.
+#[test]
+fn the_kernel_leader_hint_follows_the_tuner_across_epoch_switches() {
+    let n = 4usize;
+    let mut c = SmrCluster::new_with_tuning(
+        11,
+        SchedulerKind::Oblivious(Box::new(Fifo::new(1))),
+        n,
+        3,
+        12,
+    );
+    drive_puts(
+        &mut c,
+        &[NodeId(0), NodeId(1), NodeId(2), NodeId(3)],
+        40,
+        2_000,
+        0,
+    );
+    c.run_for(50_000);
+
+    let hints = kernel_leader_hints(&c);
+    let leader_log = c
+        .tuning_leader_log()
+        .expect("a tuned cluster has a leader log");
+
+    // Anti-vacuity first: before the fix this vector had exactly one entry,
+    // so a test that only checked "the hints are a subsequence of the log"
+    // would have passed unchanged on the broken code.
+    assert!(
+        hints.len() > 1,
+        "the kernel was told about the leader exactly {} time(s); under tuning the \
+         hint must track epoch switches, not be set once and left stale",
+        hints.len()
+    );
+    let distinct: std::collections::BTreeSet<_> = hints.iter().collect();
+    assert!(
+        distinct.len() > 1,
+        "the kernel only ever heard about one leader ({distinct:?}), so a \
+         leader-targeting adversary would have spent the run attacking a bystander"
+    );
+
+    // The hints are exactly the leader log with consecutive repeats
+    // collapsed: the tuner keeps the same leader across many epochs during
+    // exploitation, and `set_leader` is only called when the value actually
+    // moves (it records a trace event, and a per-tick stream of no-ops would
+    // swamp the trace).
+    let mut expected: Vec<Option<NodeId>> = Vec::new();
+    for leader in leader_log.iter().map(|&l| Some(l)) {
+        if expected.last() != Some(&leader) {
+            expected.push(leader);
+        }
+    }
+    // The run may end mid-epoch, so the hints are a prefix of the collapsed
+    // log rather than the whole of it.
+    assert!(
+        hints.len() <= expected.len(),
+        "more hints ({}) than the tuner ever had distinct leaders ({}): {hints:?} vs {expected:?}",
+        hints.len(),
+        expected.len()
+    );
+    assert_eq!(
+        hints,
+        expected[..hints.len()],
+        "the kernel's leader hints must be the tuner's leader log with consecutive \
+         repeats collapsed"
+    );
+}
+
+/// A leader-targeting adversary under auto-tuning: safety holds, and the
+/// DoS really does move with the leader.
+///
+/// The existing adversary-under-tuning scenario uses a uniform drop
+/// probability, which never reads the kernel's leader hint at all — so
+/// nothing in the suite exercised `with_leader_dos` together with tuning,
+/// which is exactly why the stale hint could sit there unnoticed. This is
+/// the combination issue #29 asks for.
+#[test]
+fn a_leader_targeting_adversary_under_tuning_stays_safe_and_follows_the_leader() {
+    for seed in 0..6u64 {
+        let n = 4usize;
+        let adversary = ContentObliviousAdversary::new(1, 6).with_leader_dos(0.9);
+        let mut c = SmrCluster::new_with_tuning(
+            seed,
+            SchedulerKind::Oblivious(Box::new(adversary)),
+            n,
+            3,
+            10 + seed % 10,
+        );
+
+        let submitters: Vec<NodeId> = (0..n as u32).map(NodeId).collect();
+        drive_puts(&mut c, &submitters, 30, 3_000, 0);
+        c.run_for(300_000);
+
+        // Safety (P5/P6/P7): every applied log is a prefix of the longest.
+        let logs: Vec<Vec<queso_smr::Command>> =
+            c.replicas().iter().map(|&r| c.applied_log(r)).collect();
+        let longest = logs
+            .iter()
+            .max_by_key(|l| l.len())
+            .cloned()
+            .unwrap_or_default();
+        for (replica, log) in c.replicas().iter().zip(&logs) {
+            assert_eq!(
+                &longest[..log.len()],
+                log.as_slice(),
+                "seed={seed}: replica {replica} diverged under a leader-targeting adversary"
+            );
+        }
+
+        let history = history_from_records(&c.results());
+        assert!(
+            is_linearizable(&history),
+            "seed={seed}: history was not linearizable"
+        );
+
+        // The point of the scenario: the DoS target moved. Without the
+        // hint-syncing fix this is 1 for every seed, and the whole run
+        // hammers epoch 0's leader while the cluster quietly leads from
+        // somewhere else.
+        let distinct: std::collections::BTreeSet<_> = kernel_leader_hints(&c).into_iter().collect();
+        assert!(
+            distinct.len() > 1,
+            "seed={seed}: the adversary only ever targeted one replica ({distinct:?}), \
+             so this scenario did not actually test a leader-targeting adversary \
+             *under tuning* -- it tested one against a bystander"
+        );
+    }
+}
+
+/// Issue #29's first item: tuning combined with crash and restart.
+///
+/// The invariant at stake is per-epoch leader **pinning**. The tuner stores
+/// every epoch's configuration forever (`epoch_configs`) precisely so that a
+/// replica proposing "late" — a restarted one catching up on old slots —
+/// reconstructs the same leader that epoch always had. Nothing exercised
+/// that directly: the existing restart tests use fixed leaders, and the
+/// existing tuning tests never crash anything.
+#[test]
+fn tuning_survives_a_crash_and_restart_with_epoch_leaders_pinned() {
+    for seed in 0..6u64 {
+        let n = 4usize;
+        let mut c = SmrCluster::new_with_tuning(
+            seed,
+            SchedulerKind::Oblivious(Box::new(Fifo::new(1))),
+            n,
+            3,
+            10,
+        );
+        let submitters: Vec<NodeId> = (0..n as u32).map(NodeId).collect();
+
+        // Establish some history and let the tuner get past exploration.
+        drive_puts(&mut c, &submitters, 20, 2_000, 0);
+        let log_before = c
+            .tuning_leader_log()
+            .expect("a tuned cluster has a leader log");
+        assert!(
+            log_before.len() > 1,
+            "seed={seed}: the tuner should have opened several epochs before the crash"
+        );
+
+        // Snapshot what each already-decided slot's leader is *now*, so the
+        // same question can be asked again after the restart.
+        let decided_slots = c.next_slot(NodeId(0));
+        assert!(
+            decided_slots > 1,
+            "seed={seed}: only {decided_slots} slot(s) decided before the crash -- \
+             too few for the pinning check below to mean anything"
+        );
+        let pinned_before: Vec<(u64, NodeId)> = (0..decided_slots)
+            .map(|slot| {
+                (
+                    slot,
+                    c.tuning_leader_for_slot(slot)
+                        .expect("a tuned cluster pins a leader per slot"),
+                )
+            })
+            .collect();
+        // Anti-vacuity: if every slot so far happened to share one leader,
+        // a break that answered from the current epoch could still look
+        // right. Require the snapshot to span at least two leaders.
+        let distinct_pinned: std::collections::BTreeSet<_> =
+            pinned_before.iter().map(|(_, l)| *l).collect();
+        assert!(
+            distinct_pinned.len() > 1,
+            "seed={seed}: all {decided_slots} decided slots share one pinned leader \
+             ({distinct_pinned:?}), so the pinning check could not distinguish a \
+             per-slot lookup from a current-leader lookup"
+        );
+
+        // Crash a replica that is *not* the current leader, so the cluster
+        // keeps a majority and owes progress throughout -- the same
+        // discipline the soak's fault schedule follows. A crashed leader is
+        // a legitimate scenario too, but it conflates "did tuning survive a
+        // restart" with "did the cluster recover from losing its leader".
+        let leader = c.current_leader().expect("a tuned cluster has a leader");
+        let victim = c
+            .replicas()
+            .iter()
+            .copied()
+            .find(|&r| r != leader)
+            .expect("some replica is not the leader");
+        c.crash(victim);
+        drive_puts(
+            &mut c,
+            &submitters
+                .iter()
+                .copied()
+                .filter(|&r| r != victim)
+                .collect::<Vec<_>>(),
+            20,
+            2_000,
+            100,
+        );
+
+        c.restart(victim);
+        drive_puts(&mut c, &submitters, 20, 2_000, 200);
+        c.run_for(300_000);
+
+        // The pinning invariant, checked where it actually lives: the
+        // leader a proposer derives for an *old* slot must be the same
+        // after the restart as before it. If catch-up could re-derive it
+        // from the tuner's current leader instead, two replicas proposing
+        // for the same old slot would disagree about who leads it.
+        //
+        // Snapshotted per slot rather than compared against the leader log:
+        // the log is append-only and would look identical even if
+        // `leader_for_slot` had started answering from the current epoch,
+        // which is exactly the break this is meant to catch.
+        let log_after = c
+            .tuning_leader_log()
+            .expect("a tuned cluster has a leader log");
+        assert!(
+            log_after.len() >= log_before.len(),
+            "seed={seed}: the leader log shrank across a restart"
+        );
+        assert_eq!(
+            &log_after[..log_before.len()],
+            log_before.as_slice(),
+            "seed={seed}: an epoch's recorded leader changed across a crash/restart"
+        );
+        for (slot, expected) in &pinned_before {
+            assert_eq!(
+                c.tuning_leader_for_slot(*slot),
+                Some(*expected),
+                "seed={seed}: slot {slot}'s pinned leader changed across a crash/restart"
+            );
+        }
+
+        // Safety, and that the restarted replica actually rejoined rather
+        // than parking as a zombie (#22's failure mode).
+        let logs: Vec<Vec<queso_smr::Command>> =
+            c.replicas().iter().map(|&r| c.applied_log(r)).collect();
+        let longest = logs
+            .iter()
+            .max_by_key(|l| l.len())
+            .cloned()
+            .unwrap_or_default();
+        for (replica, log) in c.replicas().iter().zip(&logs) {
+            assert_eq!(
+                &longest[..log.len()],
+                log.as_slice(),
+                "seed={seed}: replica {replica} diverged across a tuned crash/restart"
+            );
+        }
+        assert!(
+            !longest.is_empty(),
+            "seed={seed}: nothing was ever decided, so this proved nothing"
+        );
+        let restarted = c.applied_log(victim);
+        assert!(
+            !restarted.is_empty(),
+            "seed={seed}: the restarted replica applied nothing -- it never rejoined"
+        );
+
+        let history = history_from_records(&c.results());
+        assert!(
+            is_linearizable(&history),
+            "seed={seed}: history was not linearizable across a tuned crash/restart"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
 // Scenario 4: safety unchanged while the tuner explores/switches, plus
 // determinism.
 // ---------------------------------------------------------------------

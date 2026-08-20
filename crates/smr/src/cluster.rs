@@ -86,6 +86,10 @@ pub struct SmrCluster {
     tuner: Option<Rc<RefCell<EpochTuner>>>,
     live: BTreeSet<NodeId>,
     next_op_id: u64,
+    /// What the kernel was last told the leader is, so
+    /// [`Self::sync_kernel_leader`] can tell a real switch from a no-op and
+    /// avoid recording a `LeaderChanged` trace event per tick.
+    kernel_leader: Option<NodeId>,
 }
 
 impl SmrCluster {
@@ -166,12 +170,11 @@ impl SmrCluster {
     ) -> Self {
         let mut kernel = Kernel::new(seed, scheduler);
         // Purely a hook for adversary schedulers that target "the leader"
-        // (see `Kernel::set_leader`'s docs) -- set once, to the *initial*
-        // leader, for both policies. For `LeaderPolicy::Tuned` this does
-        // *not* track subsequent epoch/leader changes (out of scope here:
-        // no test in this phase exercises a leader-targeting adversary
-        // together with auto-tuning), which is worth being explicit about
-        // rather than silently stale.
+        // (see `Kernel::set_leader`'s docs). For a fixed-leader cluster it
+        // is set once and never changes; for `LeaderPolicy::Tuned` it is
+        // kept in step with the tuner by [`Self::sync_kernel_leader`], so a
+        // leader-targeting adversary follows the leader across epoch
+        // switches instead of aiming at whoever led epoch 0 (issue #29).
         kernel.set_leader(kernel_leader_hint);
         let results = Rc::new(RefCell::new(BTreeMap::new()));
         let mut states = BTreeMap::new();
@@ -207,6 +210,7 @@ impl SmrCluster {
             tuner,
             live,
             next_op_id: 0,
+            kernel_leader: kernel_leader_hint,
         }
     }
 
@@ -264,6 +268,24 @@ impl SmrCluster {
     /// `None` if this cluster was not built with tuning.
     pub fn tuning_switch_count(&self) -> Option<u64> {
         self.tuner.as_ref().map(|t| t.borrow().switch_count())
+    }
+
+    /// The leader pinned to `slot`'s epoch, or `None` for a cluster that is
+    /// not tuned.
+    ///
+    /// The value a proposer for `slot` will use, whenever it runs. That
+    /// "whenever" is the whole point: a replica catching up after a restart
+    /// proposes for slots whose epoch closed long ago, and it must
+    /// reconstruct the *same* leader those slots always had. If this ever
+    /// returned the tuner's current leader instead of the pinned one, two
+    /// replicas proposing for the same old slot would disagree about who
+    /// leads it. Exposed so
+    /// `tests/tuning.rs::tuning_survives_a_crash_and_restart_with_epoch_leaders_pinned`
+    /// can check that directly rather than inferring it (issue #29).
+    pub fn tuning_leader_for_slot(&self, slot: u64) -> Option<NodeId> {
+        self.tuner
+            .as_ref()
+            .map(|tuner| tuner.borrow().leader_for_slot(slot))
     }
 
     /// The leader assigned to every epoch so far, in epoch order, or `None`
@@ -444,9 +466,77 @@ impl SmrCluster {
 
     /// Run the kernel forward `ticks` logical ticks from wherever it
     /// currently is.
+    ///
+    /// Under [`LeaderPolicy::Tuned`] this advances a tick at a time so the
+    /// kernel's leader hint can be re-synced from the tuner as epochs turn
+    /// -- see [`Self::sync_kernel_leader`]. Splitting one `run_until(t)`
+    /// into successive `run_until` calls over the same range dispatches
+    /// exactly the same events in exactly the same order (the queue is
+    /// drained in `(time, seq)` order either way), so this changes nothing
+    /// about what runs; it only creates points at which the hint can be
+    /// updated. That equivalence is asserted rather than assumed --
+    /// `queso-sim`'s `reproducibility::draining_the_queue_in_slices_matches_one_run`
+    /// compares a sliced drain against one `run()` byte for byte under every
+    /// scheduler. Fixed-leader clusters take the single-call path unchanged,
+    /// since their hint never moves.
+    ///
+    /// Note that `start` is captured once. `run_until` takes an *absolute*
+    /// instant and `now` only moves when an event is dispatched, so
+    /// re-reading `now` each step would stall the moment the next event sat
+    /// further out than one tick.
     pub fn run_for(&mut self, ticks: u64) {
-        let until = self.kernel.now().advance(ticks);
-        self.kernel.run_until(until);
+        let target = self.kernel.now().advance(ticks);
+        if self.tuner.is_none() {
+            self.kernel.run_until(target);
+            return;
+        }
+        let start = self.kernel.now();
+        // From 0, not 1: `run_for(0)` must still dispatch whatever is
+        // already due at the current instant, exactly as the single-call
+        // path does. Starting at 1 would silently make it a no-op for tuned
+        // clusters only.
+        for tick in 0..=ticks {
+            self.sync_kernel_leader();
+            self.kernel.run_until(start.advance(tick));
+        }
+        self.sync_kernel_leader();
+    }
+
+    /// Point the kernel's leader hint at the tuner's current leader, if it
+    /// has moved.
+    ///
+    /// # Why this exists
+    ///
+    /// `Kernel::set_leader` is the hook adversary schedulers use to decide
+    /// who to target (`ContentObliviousAdversary::with_leader_dos` reads it
+    /// fresh on every decision). Before this, a tuned cluster set it once,
+    /// to epoch 0's leader, and never again -- so a leader-targeting
+    /// adversary under auto-tuning would spend the whole run attacking a
+    /// replica that had stopped being leader, and the test asserting it
+    /// "stresses the leader" would be quietly asserting much less than it
+    /// claimed. That is issue #29's middle item, and it is the same shape of
+    /// problem as a vacuous fault test: green, and testing less than
+    /// advertised.
+    ///
+    /// Only called when the value actually changes, because
+    /// `Kernel::set_leader` records a `LeaderChanged` trace event and a
+    /// per-tick stream of no-op events would swamp the trace.
+    ///
+    /// **Granularity, honestly:** the hint is refreshed between ticks, not
+    /// between individual events. Several events can share a tick, so a
+    /// switch caused by one of them is visible to the adversary from the
+    /// next tick onward rather than immediately. Epochs span many ticks, so
+    /// this is far finer than the thing being tracked -- but it is a
+    /// residual, not exactness, and closing it properly would mean the
+    /// kernel reading the leader through a shared cell rather than being
+    /// told.
+    fn sync_kernel_leader(&mut self) {
+        let Some(tuner) = &self.tuner else { return };
+        let current = Some(tuner.borrow().leader());
+        if current != self.kernel_leader {
+            self.kernel_leader = current;
+            self.kernel.set_leader(current);
+        }
     }
 
     /// The current logical time.

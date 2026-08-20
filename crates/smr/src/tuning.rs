@@ -41,6 +41,29 @@
 //! refinement (periodically re-exploring non-leader replicas to detect
 //! *improvements* elsewhere) is deliberately out of scope here.
 //!
+//! # No hysteresis, and why that is safe but not free (issue #29)
+//!
+//! The switch rule above has no minimum dwell time and no margin: a leader
+//! is replaced the moment its average falls behind the next-ranked
+//! replica's, by any amount. That is faithful to §5.3's literal wording,
+//! and it is deliberate — but it means an adversary with oracle-level
+//! control of delivery timing can keep the comparison flipping and force a
+//! leader change every epoch.
+//!
+//! What that can and cannot cost is worth being precise about. It is never
+//! a safety or liveness failure: P15 holds regardless of how the leader is
+//! chosen, every epoch's configuration stays pinned once assigned (see
+//! [`EpochConfig`]), and the section above explains why nothing this module
+//! produces can affect Agreement. The cost is latency and churn — each
+//! switch re-ranks the hedging schedule, so the fast path keeps being handed
+//! to a replica that has not settled.
+//!
+//! A small dwell-time or margin would damp that, at the price of reacting
+//! more slowly to a leader that has genuinely degraded — which is the
+//! failure the monitoring exists to catch in the first place. Left as a
+//! future refinement rather than guessed at, since choosing the margin
+//! wants a workload to measure against, not an invented constant.
+//!
 //! # Why this can never be a safety mechanism
 //!
 //! Everything this module produces -- a `leader: NodeId` and a
