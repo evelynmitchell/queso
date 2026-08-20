@@ -83,6 +83,7 @@ pub fn spawn_cluster(
             persist_delay: Duration::ZERO,
             save_counter: None,
             durable_event_counter: None,
+            disk_fault: None,
             // Phase 8.2a (issue #47): this harness doesn't opt into TLS --
             // see `queso_net::config::NodeConfig::tls`'s docs.
             tls: None,

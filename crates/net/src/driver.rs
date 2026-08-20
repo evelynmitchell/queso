@@ -390,6 +390,10 @@ async fn run_node_inner(
     // counter) for every real `queso-node` run.
     let store = persist::Store::new(&config.data_dir, config.id)?
         .with_artificial_delay(config.persist_delay);
+    let store = match &config.disk_fault {
+        Some(fault) => store.with_disk_fault(fault.clone()),
+        None => store,
+    };
     let store = match &config.save_counter {
         Some(counter) => store.with_save_counter(counter.clone()),
         None => store,

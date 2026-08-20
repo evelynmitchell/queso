@@ -127,7 +127,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -219,6 +219,126 @@ fn decode(bytes: &[u8]) -> anyhow::Result<(Durable, u64)> {
     Ok((state.durable, state.max_tick))
 }
 
+/// Where in the atomic-write sequence an injected [`DiskFault`] fires.
+///
+/// The variants are the three places a real crash or a real `ENOSPC` can
+/// land inside [`Store::write_bytes_blocking`], and each leaves the data
+/// directory in a materially different state -- which is the whole point:
+/// the recovery argument in this module's docs is about *which* of these
+/// states `load` can encounter, and until this existed none of them had
+/// ever actually been produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskFaultPoint {
+    /// Fail partway through `write_all`, after `after_bytes` bytes have
+    /// reached the temp file.
+    ///
+    /// The dangerous one, and the reason issue #39 lists it first: it
+    /// leaves a **torn** temp file -- real bytes, truncated mid-structure,
+    /// with a valid-looking header if `after_bytes >= HEADER_LEN`. The
+    /// claim being tested is that such a file can never be loaded as a
+    /// snapshot, because only `path` is ever read and the torn bytes are at
+    /// `tmp_path`.
+    DuringWrite { after_bytes: usize },
+    /// Fail after the temp file is complete and fsync'd, before the rename.
+    ///
+    /// Leaves a *complete, valid* temp file that is nonetheless not the
+    /// snapshot. Distinct from the torn case on purpose: this is the state
+    /// where a loader that got clever about "recovering" a leftover temp
+    /// file would silently promote an uncommitted write.
+    BeforeRename,
+    /// Fail after the rename, before the directory fsync.
+    ///
+    /// The rename has already happened and is visible to this process, so
+    /// the new snapshot *is* what loads. Included to pin that down rather
+    /// than leave it ambiguous -- and to be explicit about the limit: a
+    /// userspace test cannot reproduce the power-loss case this directory
+    /// fsync actually defends against (a filesystem rolling the directory
+    /// entry back after `rename` returned success). That remains argued
+    /// from POSIX semantics, as the module docs say.
+    BeforeDirSync,
+}
+
+/// A single injected disk failure, for exercising the recovery paths this
+/// module's docs argue for.
+///
+/// **Test-only instrumentation**, in the same sense as
+/// [`Store::artificial_delay`] and [`Store::save_count`] and for the same
+/// reason: `queso-node`'s CLI never constructs one, a `Store` has none
+/// unless a test explicitly calls [`Store::with_disk_fault`], and the
+/// disarmed path costs one `Option` check per write. It lives in ordinary
+/// (non-`cfg(test)`) code because integration tests in `tests/` compile
+/// against this crate as an external dependency, where `cfg(test)` items do
+/// not exist -- the same constraint that put `with_artificial_delay` here.
+///
+/// One-shot: it fires on the `skip`-th-plus-one write and never again, so a
+/// test can let a cluster reach a known good state, break exactly one
+/// write, and then watch it recover.
+#[derive(Debug, Clone)]
+pub struct DiskFault {
+    point: DiskFaultPoint,
+    kind: std::io::ErrorKind,
+    /// Writes to let through before firing.
+    skip: u64,
+    /// Shared so that every clone of a `Store` -- including the one
+    /// [`Store::persist`] moves into `spawn_blocking` -- arms and disarms
+    /// the same fault. Without this the fault would re-arm on every
+    /// persist, because each one clones the store.
+    seen: Arc<AtomicU64>,
+    fired: Arc<AtomicBool>,
+}
+
+impl DiskFault {
+    /// A fault at `point` reported as `ErrorKind::Other`, firing on the
+    /// very next write.
+    pub fn at(point: DiskFaultPoint) -> Self {
+        Self {
+            point,
+            kind: std::io::ErrorKind::Other,
+            skip: 0,
+            seen: Arc::new(AtomicU64::new(0)),
+            fired: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Report the failure as `kind` -- e.g. `ErrorKind::StorageFull` for
+    /// the disk-full case issue #39 asks about, or
+    /// `ErrorKind::PermissionDenied` for an EIO-shaped one.
+    #[must_use]
+    pub fn with_kind(mut self, kind: std::io::ErrorKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Let `n` writes succeed before firing.
+    #[must_use]
+    pub fn after_writes(mut self, n: u64) -> Self {
+        self.skip = n;
+        self
+    }
+
+    /// Whether this fault has actually fired.
+    ///
+    /// Anti-vacuity, and not a formality: a test that arms a fault the
+    /// write path never reaches proves nothing, and looks exactly like a
+    /// test whose recovery worked. Every test here asserts on this.
+    pub fn has_fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+
+    /// Whether this fault should fire on the write now beginning.
+    fn should_fire_at(&self, point: DiskFaultPoint) -> bool {
+        self.point == point && !self.fired.load(Ordering::SeqCst)
+    }
+
+    fn fire(&self, what: &str) -> anyhow::Error {
+        self.fired.store(true, Ordering::SeqCst);
+        anyhow::Error::new(std::io::Error::new(
+            self.kind,
+            format!("injected disk fault ({what})"),
+        ))
+    }
+}
+
 /// One replica's on-disk snapshot store: a single file per node id inside a
 /// shared data directory (so a whole cluster's replicas can share one
 /// `--data-dir` without colliding), written via the atomic-rename pattern
@@ -275,6 +395,9 @@ pub struct Store {
     /// observed from outside the process). Never set by `queso-node`'s CLI
     /// or by any other test.
     artificial_delay: Duration,
+    /// A one-shot injected disk failure, or `None` (always, outside the
+    /// tests that opt in) -- see [`DiskFault`].
+    disk_fault: Option<DiskFault>,
 }
 
 impl Store {
@@ -291,6 +414,7 @@ impl Store {
             dir,
             save_count: Arc::new(AtomicU64::new(0)),
             artificial_delay: Duration::ZERO,
+            disk_fault: None,
         })
     }
 
@@ -310,6 +434,14 @@ impl Store {
     #[must_use]
     pub fn with_artificial_delay(mut self, delay: Duration) -> Self {
         self.artificial_delay = delay;
+        self
+    }
+
+    /// Arm `fault` on this store's write path -- see [`DiskFault`].
+    /// Test-only; `queso-node`'s CLI never calls this.
+    #[must_use]
+    pub fn with_disk_fault(mut self, fault: DiskFault) -> Self {
+        self.disk_fault = Some(fault);
         self
     }
 
@@ -400,16 +532,57 @@ impl Store {
             std::thread::sleep(self.artificial_delay);
         }
 
+        // Count every write -- including the ones that pass through
+        // untouched, so `after_writes` means what it says -- then arm the
+        // fault only if this write is past the skip count and it has not
+        // already fired. Counting is a side effect, so it happens plainly
+        // here rather than inside an `Option::filter` predicate where a
+        // reader would not expect it.
+        let fault = match &self.disk_fault {
+            None => None,
+            Some(fault) => {
+                let nth = fault.seen.fetch_add(1, Ordering::SeqCst);
+                (nth >= fault.skip && !fault.has_fired()).then_some(fault)
+            }
+        };
+
         let mut tmp = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&self.tmp_path)?;
-        tmp.write_all(bytes)?;
-        tmp.sync_all()?; // fsync the temp file's contents + metadata.
-        drop(tmp);
+
+        match fault.filter(|f| matches!(f.point, DiskFaultPoint::DuringWrite { .. })) {
+            Some(fault) => {
+                // Write the prefix for real before failing, so what is left
+                // behind is a genuinely torn file rather than an empty one
+                // -- an empty temp file would not exercise the case that
+                // matters (a truncated file whose header still parses).
+                let DiskFaultPoint::DuringWrite { after_bytes } = fault.point else {
+                    unreachable!("filtered above")
+                };
+                let prefix = after_bytes.min(bytes.len());
+                tmp.write_all(&bytes[..prefix])?;
+                tmp.sync_all()?;
+                drop(tmp);
+                return Err(fault.fire("during write"));
+            }
+            None => {
+                tmp.write_all(bytes)?;
+                tmp.sync_all()?; // fsync the temp file's contents + metadata.
+                drop(tmp);
+            }
+        }
+
+        if let Some(fault) = fault.filter(|f| f.should_fire_at(DiskFaultPoint::BeforeRename)) {
+            return Err(fault.fire("before rename"));
+        }
 
         fs::rename(&self.tmp_path, &self.path)?; // atomic on the same filesystem.
+
+        if let Some(fault) = fault.filter(|f| f.should_fire_at(DiskFaultPoint::BeforeDirSync)) {
+            return Err(fault.fire("before directory fsync"));
+        }
 
         // fsync the containing directory: without this, a crash right after
         // a successful `rename` can, on some filesystems, still lose the
@@ -541,6 +714,227 @@ mod tests {
             msg.contains("9999"),
             "error should mention the offending version, got: {msg}"
         );
+    }
+
+    /// Issue #39's first coverage gap: the torn-write recovery path was
+    /// argued from POSIX semantics and code reading, never produced.
+    ///
+    /// A crash partway through the temp-file write must leave the
+    /// *previous* snapshot loadable and unchanged. The torn bytes are real
+    /// -- long enough to carry a valid header -- so a loader that ever
+    /// looked at `tmp_path` would find something that parses as the start
+    /// of a snapshot, which is exactly the trap.
+    #[test]
+    fn a_torn_write_leaves_the_previous_snapshot_intact() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fault = DiskFault::at(DiskFaultPoint::DuringWrite {
+            after_bytes: HEADER_LEN + 8,
+        })
+        .after_writes(1);
+        let store = Store::new(tmp.path(), NodeId(6))
+            .expect("new store")
+            .with_disk_fault(fault.clone());
+
+        store.save(&Durable::default(), 100).expect("first save");
+        let err = store
+            .save(&Durable::default(), 200)
+            .expect_err("the second save must fail, not silently half-succeed");
+
+        assert!(fault.has_fired(), "the injected fault never fired");
+        assert!(
+            err.to_string().contains("during write"),
+            "unexpected error: {err}"
+        );
+
+        let (_loaded, max_tick) = store.load().expect("load").expect("snapshot present");
+        assert_eq!(
+            max_tick, 100,
+            "a torn write must leave the previous snapshot, not the torn one"
+        );
+        assert_eq!(
+            store.save_count(),
+            1,
+            "a failed write must not count as a durable save"
+        );
+
+        // The torn file is really there and really looks like a snapshot
+        // start -- so the reason `load` was correct is that it reads only
+        // `path`, not that the temp file was harmless.
+        let torn = fs::read(tmp.path().join("node-6.durable.bin.tmp")).expect("torn temp file");
+        assert_eq!(torn.len(), HEADER_LEN + 8);
+        assert_eq!(
+            &torn[..MAGIC.len()],
+            &MAGIC,
+            "the torn prefix parses as a header"
+        );
+    }
+
+    /// The other half of the fsync/rename window: a failure *after* the
+    /// temp file is complete and fsync'd but *before* the rename leaves a
+    /// perfectly valid file that is nonetheless not the snapshot.
+    ///
+    /// Worth separating from the torn case: this is the state where a
+    /// loader that tried to be helpful about leftover temp files would
+    /// promote a write that was never committed.
+    #[test]
+    fn a_complete_but_unrenamed_temp_file_is_never_promoted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fault = DiskFault::at(DiskFaultPoint::BeforeRename).after_writes(1);
+        let store = Store::new(tmp.path(), NodeId(7))
+            .expect("new store")
+            .with_disk_fault(fault.clone());
+
+        store.save(&Durable::default(), 10).expect("first save");
+        store
+            .save(&Durable::default(), 20)
+            .expect_err("the interrupted save must fail");
+        assert!(fault.has_fired(), "the injected fault never fired");
+
+        let (_loaded, max_tick) = store.load().expect("load").expect("snapshot present");
+        assert_eq!(max_tick, 10, "an unrenamed temp file must not be loaded");
+
+        // And the leftover really is a complete, valid snapshot -- decoding
+        // it directly succeeds. It is skipped because of *where* it is, not
+        // because it was unreadable.
+        let leftover = fs::read(tmp.path().join("node-7.durable.bin.tmp")).expect("temp file");
+        let (_durable, staged_tick) = decode(&leftover).expect("the temp file is itself valid");
+        assert_eq!(staged_tick, 20, "the uncommitted write really was complete");
+    }
+
+    /// A crash between the rename and the directory fsync: the rename is
+    /// already visible, so the new snapshot is what loads.
+    ///
+    /// Pinned down rather than left ambiguous -- but note the limit stated
+    /// in [`DiskFaultPoint::BeforeDirSync`]: this does not reproduce the
+    /// power-loss case the directory fsync defends against, which no
+    /// userspace test can.
+    #[test]
+    fn a_crash_after_the_rename_keeps_the_new_snapshot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fault = DiskFault::at(DiskFaultPoint::BeforeDirSync).after_writes(1);
+        let store = Store::new(tmp.path(), NodeId(8))
+            .expect("new store")
+            .with_disk_fault(fault.clone());
+
+        store.save(&Durable::default(), 1).expect("first save");
+        store
+            .save(&Durable::default(), 2)
+            .expect_err("the interrupted save must still report failure");
+        assert!(fault.has_fired(), "the injected fault never fired");
+
+        let (_loaded, max_tick) = store.load().expect("load").expect("snapshot present");
+        assert_eq!(
+            max_tick, 2,
+            "the rename already happened, so the new snapshot loads"
+        );
+        assert_eq!(
+            store.save_count(),
+            1,
+            "the write never completed, so it must not be counted as durable \
+             even though its rename landed"
+        );
+    }
+
+    /// Issue #39's disk-full item, at the `Store` level: a full disk must
+    /// surface as an error with its kind intact, so the driver's `?` can
+    /// fail-stop on it. The driver-level half is in
+    /// `tests/durability_faults.rs`.
+    #[test]
+    fn a_full_disk_surfaces_as_an_error_rather_than_a_silent_no_op() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fault = DiskFault::at(DiskFaultPoint::DuringWrite { after_bytes: 0 })
+            .with_kind(std::io::ErrorKind::StorageFull);
+        let store = Store::new(tmp.path(), NodeId(9))
+            .expect("new store")
+            .with_disk_fault(fault.clone());
+
+        let err = store
+            .save(&Durable::default(), 1)
+            .expect_err("a failed write must not report success");
+        assert!(fault.has_fired(), "the injected fault never fired");
+
+        let io_err = err
+            .downcast_ref::<std::io::Error>()
+            .expect("the failure should still be an io::Error the caller can inspect");
+        assert_eq!(io_err.kind(), std::io::ErrorKind::StorageFull);
+
+        assert!(
+            store.load().expect("load").is_none(),
+            "nothing should have been committed"
+        );
+        assert_eq!(store.save_count(), 0);
+    }
+
+    /// Recovery is not just "the old snapshot survives" -- the store has to
+    /// keep working afterwards. A stale temp file left by a crash must not
+    /// interfere with the next write.
+    #[test]
+    fn a_store_recovers_and_keeps_writing_after_an_interrupted_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fault = DiskFault::at(DiskFaultPoint::DuringWrite {
+            after_bytes: HEADER_LEN + 4,
+        })
+        .after_writes(1);
+        let store = Store::new(tmp.path(), NodeId(10))
+            .expect("new store")
+            .with_disk_fault(fault.clone());
+
+        store.save(&Durable::default(), 1).expect("save 1");
+        store
+            .save(&Durable::default(), 2)
+            .expect_err("save 2 is interrupted");
+        assert!(fault.has_fired());
+
+        // The fault is one-shot, standing in for a crash the operator
+        // restarted from: the next write must succeed and commit.
+        store
+            .save(&Durable::default(), 3)
+            .expect("save 3 after recovery");
+
+        let (_loaded, max_tick) = store.load().expect("load").expect("snapshot present");
+        assert_eq!(max_tick, 3);
+        assert_eq!(
+            store.save_count(),
+            2,
+            "two writes committed; the interrupted one must not be counted"
+        );
+        assert!(
+            !tmp.path().join("node-10.durable.bin.tmp").exists(),
+            "a successful save renames the temp file away, clearing the stale one"
+        );
+    }
+
+    /// The async path has to fail-stop identically -- it is the one the
+    /// driver actually calls, and it clones the `Store` into
+    /// `spawn_blocking`, which is exactly where a per-clone fault counter
+    /// would have re-armed and let the write through.
+    #[tokio::test]
+    async fn persist_fails_stop_on_a_disk_fault_just_like_save() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fault = DiskFault::at(DiskFaultPoint::BeforeRename)
+            .with_kind(std::io::ErrorKind::StorageFull)
+            .after_writes(2);
+        let store = Store::new(tmp.path(), NodeId(11))
+            .expect("new store")
+            .with_disk_fault(fault.clone());
+
+        store
+            .persist(&Durable::default(), 1)
+            .await
+            .expect("persist 1");
+        store
+            .persist(&Durable::default(), 2)
+            .await
+            .expect("persist 2");
+        store
+            .persist(&Durable::default(), 3)
+            .await
+            .expect_err("the third persist must fail");
+        assert!(fault.has_fired(), "the injected fault never fired");
+
+        let (_loaded, max_tick) = store.load().expect("load").expect("snapshot present");
+        assert_eq!(max_tick, 2, "the failed persist must not have committed");
+        assert_eq!(store.save_count(), 2);
     }
 
     #[test]

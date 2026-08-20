@@ -223,6 +223,11 @@ fn spawn_cluster_inner(
             persist_delay: this_persist_delay,
             save_counter: save_counter.clone(),
             durable_event_counter: durable_event_counter.clone(),
+            // Issue #39's disk fault injection is opt-in and never used by
+            // these shared helpers -- `tests/durability_faults.rs` builds
+            // its own `NodeConfig`s so it can observe a node *exiting*,
+            // which is exactly what these fire-and-forget threads cannot.
+            disk_fault: None,
             tls: tls_configs.as_ref().map(|configs| configs[i].clone()),
             // Phase 8.2's status/metrics server is opt-in (see
             // `NodeConfig::status_listen_addr`'s docs) -- `None` here means
@@ -388,6 +393,7 @@ pub fn spawn_cluster_with_status_and_chain(
             persist_delay: Duration::ZERO,
             save_counter: None,
             durable_event_counter: None,
+            disk_fault: None,
             // This status-server harness doesn't opt into TLS (Phase 8.2a);
             // plaintext client/peer connections, exactly like the other
             // `spawn_cluster*` variants.
@@ -503,4 +509,184 @@ pub async fn raw_status_request(addr: SocketAddr, raw: &[u8]) -> Option<u16> {
         .expect(
             "status server did not respond to (or close) a raw request within 10s -- possible hang",
         )
+}
+
+// ---------------------------------------------------------------------------
+// Real-process clusters
+// ---------------------------------------------------------------------------
+
+/// One cluster of real, independent `queso-node` **OS processes** sharing a
+/// `--data-dir`, with helpers to `SIGKILL` and respawn any subset.
+///
+/// Distinct from [`spawn_cluster`] and friends above, which run each
+/// replica as a thread inside this test binary. That is enough for most
+/// behavior, but not for durability: an in-process "drop and rebuild the
+/// `SmrNode`" restart still leaves the real disk path untested, and a
+/// thread cannot be `SIGKILL`ed mid-fsync. Anything asserting what survives
+/// a crash has to use this.
+///
+/// Extracted from `tests/restart_recovery.rs`, which had the only copy,
+/// when `tests/durability_faults.rs` (issue #39) needed the same thing.
+pub struct ProcCluster {
+    n: usize,
+    peer_addrs: Vec<SocketAddr>,
+    client_addrs: Vec<SocketAddr>,
+    leader: u32,
+    data_dir: PathBuf,
+    children: Vec<Option<std::process::Child>>,
+}
+
+impl ProcCluster {
+    /// The `queso-node` binary under test. `CARGO_BIN_EXE_<target>` is set
+    /// automatically for any test target in the same package as the binary,
+    /// which is why this works here and needs run-time resolution over in
+    /// `queso-soak` (a different package).
+    pub fn node_bin() -> &'static str {
+        env!("CARGO_BIN_EXE_queso-node")
+    }
+
+    /// Boot an `n`-replica cluster against `data_dir`, retrying the whole
+    /// boot if a node dies immediately.
+    ///
+    /// The retry exists because of the `free_addr` bind-then-drop TOCTOU
+    /// issue #40 documents: the port is probed, the probe listener dropped,
+    /// and only then does the spawned process bind it for real. Nothing
+    /// stops another test's probe taking it in between, and when that
+    /// happens the node exits at once and the whole cluster silently never
+    /// forms. The in-process helpers above close this properly by handing
+    /// over an already-bound listener, which is impossible across a process
+    /// boundary -- so retrying is the honest remedy. Blaming Queso for the
+    /// harness's port allocation would be exactly the wrong signal.
+    pub fn start(n: usize, leader: u32, data_dir: &std::path::Path) -> Self {
+        const ATTEMPTS: usize = 3;
+        for attempt in 1..=ATTEMPTS {
+            let mut cluster = Self {
+                n,
+                peer_addrs: (0..n).map(|_| free_addr()).collect(),
+                client_addrs: (0..n).map(|_| free_addr()).collect(),
+                leader,
+                data_dir: data_dir.to_path_buf(),
+                children: (0..n).map(|_| None).collect(),
+            };
+            for i in 0..n {
+                cluster.spawn(i);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            if (0..n).all(|i| !cluster.exited(i)) {
+                return cluster;
+            }
+            if attempt == ATTEMPTS {
+                panic!(
+                    "a queso-node process died immediately on all {ATTEMPTS} boot attempts \
+                     -- this is a harness/port problem, not a Queso failure"
+                );
+            }
+            // `cluster` drops here, killing whatever did come up, and the
+            // next attempt draws fresh ports.
+        }
+        unreachable!("the loop either returns or panics")
+    }
+
+    /// Boot (or reboot) replica `i` as a fresh process against this
+    /// cluster's shared `--data-dir` -- the same directory every previous
+    /// incarnation of replica `i` wrote its snapshot into, so this goes
+    /// through the real reload-on-boot path.
+    pub fn spawn(&mut self, i: usize) {
+        assert!(
+            self.children[i].is_none(),
+            "replica {i} is already running -- kill it first"
+        );
+        let mut cmd = std::process::Command::new(Self::node_bin());
+        cmd.arg("--id")
+            .arg(i.to_string())
+            .arg("--seed")
+            .arg((9_000 + i as u64).to_string())
+            .arg("--listen")
+            .arg(self.peer_addrs[i].to_string())
+            .arg("--client-listen")
+            .arg(self.client_addrs[i].to_string())
+            .arg("--leader")
+            .arg(self.leader.to_string())
+            .arg("--tick-ms")
+            .arg("5")
+            .arg("--data-dir")
+            .arg(&self.data_dir);
+        for j in 0..self.n {
+            cmd.arg("--peer").arg(format!("{j}={}", self.peer_addrs[j]));
+        }
+        // Quiet by default -- these tests assert on the client protocol's
+        // observable behavior, not log output; pass through `RUST_LOG` if a
+        // human wants to watch a failure locally.
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        self.children[i] = Some(cmd.spawn().expect("spawn queso-node subprocess"));
+    }
+
+    /// `SIGKILL` replica `i` and reap it.
+    ///
+    /// `Child::wait` blocks until the OS has fully torn the process down
+    /// (including releasing its listening sockets), so a later `spawn`
+    /// rebinding those ports never races kernel cleanup the way an
+    /// in-process task-abort simulation would.
+    pub fn kill(&mut self, i: usize) {
+        let mut child = self.children[i]
+            .take()
+            .unwrap_or_else(|| panic!("replica {i} is not running"));
+        child.kill().expect("SIGKILL replica");
+        child.wait().expect("reap killed replica");
+    }
+
+    /// Whether replica `i`'s process has exited on its own.
+    ///
+    /// Note this reaps it: a node that fail-stops is gone, and the test
+    /// asking this question is exactly the one that wants to know.
+    pub fn exited(&mut self, i: usize) -> bool {
+        match &mut self.children[i] {
+            None => true,
+            Some(child) => match child.try_wait().expect("poll replica process") {
+                Some(_status) => {
+                    self.children[i] = None;
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    pub fn is_running(&self, i: usize) -> bool {
+        self.children[i].is_some()
+    }
+
+    pub fn client_addr(&self, i: usize) -> SocketAddr {
+        self.client_addrs[i]
+    }
+
+    pub fn replicas(&self) -> usize {
+        self.n
+    }
+
+    /// Replica `i`'s committed snapshot file, and the temp file its writes
+    /// stage through -- the two paths `queso_net::persist`'s atomic-rename
+    /// scheme moves between. A durability test needs both by name to plant
+    /// or inspect the states a crash can leave behind.
+    pub fn snapshot_path(&self, i: usize) -> PathBuf {
+        self.data_dir.join(format!("node-{i}.durable.bin"))
+    }
+
+    pub fn snapshot_tmp_path(&self, i: usize) -> PathBuf {
+        self.data_dir.join(format!("node-{i}.durable.bin.tmp"))
+    }
+}
+
+impl Drop for ProcCluster {
+    /// Kill every still-running child, so a failing assertion mid-test never
+    /// leaks orphan `queso-node` processes.
+    fn drop(&mut self) {
+        for slot in &mut self.children {
+            if let Some(mut child) = slot.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
 }

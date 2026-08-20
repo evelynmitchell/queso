@@ -222,9 +222,14 @@ runbook in `docs/deploy-flyio.md`. (Actual multi-region deploys need the owner's
   replica was actually given work — the liveness budget must be chosen accordingly.
 - Liveness is not formally verified (safety-only); the fast path isn't in the concrete
   model.
-- Durability fault-injection coverage is incomplete (#39): no torn-write/mid-rename
-  crash test, no ENOSPC/EIO test, no unacked-write-safely-lost test, no
-  restart-under-load test.
+- ~~Durability fault-injection coverage is incomplete (#39)~~ — closed: a `DiskFault`
+  seam in `crates/net/src/persist.rs` now produces torn writes, complete-but-unrenamed
+  temp files, and crashes after the rename, and `crates/net/tests/durability_faults.rs`
+  covers ENOSPC fail-stop, unacked-write-safely-lost, and rolling-restart-under-load.
+  What genuinely cannot be tested from userspace is still noted there: a power loss
+  rolling back a directory entry after `rename` returned success remains argued from
+  POSIX semantics, as does a lying disk that acknowledges an fsync it never made
+  durable.
 - DST runs are per-PR bounded — no nightly soak, and no trace *shrinking* (deferred
   since Phase 0).
 
@@ -238,9 +243,9 @@ The P0 list from the previous snapshot — real transport, TLS, wire format, a r
 node binary, real durability, a client API — is **done**. What remains:
 
 **Correctness confidence (highest value):**
-- **Phase 9 conformance testing** (#54/#55/#56) — the real-binary-under-sustained-fault
-  harness described in §3. This is the top open item.
-- **Durability fault-injection coverage** (#39).
+- **Deterministic replay of a real execution** (#54's remainder) — the soak reproduces
+  a fault *schedule* but never an interleaving, which is what makes a rare soak failure
+  hard to debug. This is the top open item.
 
 **Functionality still missing:**
 - **Log compaction / snapshotting** — the log grows unbounded; every persist rewrites the
@@ -318,8 +323,10 @@ no schedule.
    nightly (nothing runs it on a timer today); shrink a failing schedule automatically
    rather than by hand; and, for #54 proper, deterministic replay of a real execution —
    the one thing that would let a soak failure be debugged the way a DST failure is.
-3. **Durability fault-injection coverage (#39)** — partly overlapping what a 9.2 soak
-   exercises, but the unit-level torn-write and ENOSPC cases are worth having directly.
+3. ~~**Durability fault-injection coverage (#39).**~~ Closed: the `DiskFault` injection
+   seam plus `tests/durability_faults.rs`. Every test there was verified by mutation —
+   disabling the boot-time reload fails three of the four, and swallowing the persist
+   error fails the fourth.
 4. **CI/CD catch-up (cheap, independent):** nightly TLA+ + DST soak, `cargo audit`/`deny`,
    coverage; then an image build and a release pipeline.
 5. **Docs:** the property→test **conformance matrix**, an architecture diagram, published

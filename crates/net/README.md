@@ -93,6 +93,15 @@ hardening plus Phase 8.1a, not Phase 8's full operability story):**
   match what the running build understands — see `src/persist.rs`'s docs.
   This is v1: the payload's own layout hasn't changed in this PR, only the
   header wrapping it.
+- **Injectable disk faults (issue #39).** `persist::DiskFault` breaks a write
+  at a chosen point in the atomic-write sequence — partway through the temp
+  file, after it is complete but before the rename, or after the rename but
+  before the directory fsync. Each leaves the data directory in a materially
+  different state, which is the point: the recovery argument in
+  `src/persist.rs`'s docs is about *which* of those states `load` can meet,
+  and until this existed none of them had ever actually been produced. Same
+  status as `persist_delay` and `save_counter` — test-only instrumentation,
+  `None` for every real run, no CLI flag. See `tests/durability_faults.rs`.
 - **Whole-state snapshot, not an append-only log.** Each persist still
   rewrites the replica's *entire* durable state (every slot's recorder,
   the whole applied log), not just the delta — `O(log length)` per write,
