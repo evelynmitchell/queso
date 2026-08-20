@@ -300,6 +300,63 @@ pub fn sample_from_log(replica: NodeId, observed_at: u64, log: &[Command]) -> Sa
     }
 }
 
+/// Turn one replica's published chain report into observer [`Sample`]s.
+///
+/// `emitted_through` is the caller's per-replica cursor: the highest
+/// checkpoint `n` already turned into a sample. It is advanced in place, so
+/// repeated polls report what is new rather than the whole table again.
+///
+/// # Why this is shared rather than written per harness
+///
+/// Every out-of-process source -- `queso-soak`'s spawned processes,
+/// `queso-antithesis`'s containers, anything later -- has to make the same
+/// two decisions, and getting either subtly wrong weakens the run without
+/// failing anything:
+///
+/// - **Checkpoints are what make a safety verdict non-vacuous.** Replicas
+///   lag each other, so frontier samples almost never share an `n`;
+///   9.1 measured frontier-only sampling collapsing 20 cross-replica
+///   comparisons to 2 on the same run.
+/// - **The frontier is reported on every poll anyway**, even when no new
+///   checkpoint was crossed. Without it the liveness observer cannot tell
+///   "this replica has stopped advancing" from "this replica has not been
+///   observed" -- and a crashed replica, publishing nothing new, becomes
+///   invisible exactly when it matters. 9.1 shipped that bug once and had
+///   to fix it; one shared implementation is how it stays fixed.
+///
+/// Pure: no I/O, no clock, so it stays inside this crate's determinism
+/// lints and is unit-testable directly.
+pub fn samples_from_chain(
+    replica: NodeId,
+    observed_at: u64,
+    frontier: ChainState,
+    checkpoints: &[(u64, u64)],
+    emitted_through: &mut u64,
+) -> Vec<Sample> {
+    let mut samples = Vec::with_capacity(checkpoints.len() + 1);
+    for &(n, h) in checkpoints {
+        if n > *emitted_through {
+            samples.push(Sample {
+                replica,
+                observed_at,
+                state: ChainState { n, h },
+                // A cross-process source sees hashes, never the commands
+                // behind them, so the observer's per-transition log stays
+                // empty here. Documented rather than faked.
+                command_digest: None,
+            });
+            *emitted_through = n;
+        }
+    }
+    samples.push(Sample {
+        replica,
+        observed_at,
+        state: frontier,
+        command_digest: None,
+    });
+    samples
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +378,56 @@ mod tests {
             key,
             value,
         }
+    }
+
+    #[test]
+    fn chain_samples_report_new_checkpoints_once_and_the_frontier_every_time() {
+        let mut cursor = 0;
+        let first = samples_from_chain(
+            NodeId(1),
+            10,
+            ChainState { n: 5, h: 0xaa },
+            &[(2, 0x22), (4, 0x44)],
+            &mut cursor,
+        );
+        assert_eq!(
+            first.iter().map(|s| s.state.n).collect::<Vec<_>>(),
+            vec![2, 4, 5],
+            "both checkpoints, then the frontier"
+        );
+        assert_eq!(cursor, 4);
+
+        // Same table again: nothing new to report except the frontier.
+        let second = samples_from_chain(
+            NodeId(1),
+            20,
+            ChainState { n: 5, h: 0xaa },
+            &[(2, 0x22), (4, 0x44)],
+            &mut cursor,
+        );
+        assert_eq!(
+            second.iter().map(|s| s.state.n).collect::<Vec<_>>(),
+            vec![5],
+            "a re-polled checkpoint must not be emitted twice"
+        );
+    }
+
+    #[test]
+    fn a_replica_with_no_checkpoints_still_reports_its_frontier() {
+        // The liveness case: a replica that has published nothing new must
+        // still be *observed*, or "stopped advancing" is indistinguishable
+        // from "never seen" and a crashed replica goes unnoticed.
+        let mut cursor = 7;
+        let samples = samples_from_chain(
+            NodeId(2),
+            99,
+            ChainState { n: 7, h: 0x77 },
+            &[],
+            &mut cursor,
+        );
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].state, ChainState { n: 7, h: 0x77 });
+        assert_eq!(samples[0].observed_at, 99);
     }
 
     #[test]

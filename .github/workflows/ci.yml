@@ -47,7 +47,7 @@ jobs:
   # for why, and for the long-soak mode this bounded variant is the CI
   # sibling of.
   soak:
-    name: real-process soak (phase 9.2)
+    name: real-process suite (phases 9.2-9.3)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -72,3 +72,12 @@ jobs:
       # runner actually lands.
       - name: real-process scenarios and the bounded soak
         run: cargo test -p queso-soak -- --ignored --skip a_long_soak_over_many_seeds --nocapture
+
+      # Phase 9.3 (#54): the Antithesis test template, exercised without
+      # Antithesis. Boots a real cluster, runs each Test Composer command as
+      # its own process, and checks every property was reached and
+      # evaluated -- the verifiable half of a deliverable whose other half
+      # needs an account. Lives in this job because it spawns real node
+      # processes, same as everything else here.
+      - name: antithesis test template (local)
+        run: cargo test -p queso-antithesis -- --ignored --test-threads=1 --nocapture

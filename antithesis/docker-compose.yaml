@@ -1,0 +1,110 @@
+# Antithesis topology for Queso (Phase 9.3, issue #54).
+#
+# Three replicas plus a workload container. Antithesis brings this up inside
+# its deterministic hypervisor, then injects faults — network partitions,
+# clock skew, process kills, message reordering — while the Test Composer
+# runs the commands baked into the workload image at
+# /opt/antithesis/test/v1/main/.
+#
+# Deliberately plain: `image:` only (no `build:`, since the platform pulls
+# pre-pushed images), no host port publishing (nothing outside the
+# environment needs to reach in), and one user-defined network so every
+# replica can address the others by service name.
+#
+# The `${QUESO_REGISTRY}` / `${QUESO_TAG}` indirection is so the same file
+# works for a local `docker compose up` and for a push to Antithesis's
+# registry — see this directory's README.
+
+services:
+  queso-0:
+    container_name: queso-0
+    hostname: queso-0
+    image: "${QUESO_REGISTRY:-queso}/queso-node:${QUESO_TAG:-latest}"
+    networks: [queso]
+    volumes: [queso-0-data:/data]
+    command:
+      - /usr/local/bin/queso-node
+      - --id=0
+      - --seed=9000
+      - --listen=0.0.0.0:7200
+      - --client-listen=0.0.0.0:7000
+      - --status-listen=0.0.0.0:7100
+      # Checkpoint spacing must be IDENTICAL across the cluster: replicas
+      # publish at fixed `n`, and differing spacings publish at disjoint
+      # heights that can never be compared — which would leave the
+      # divergence check with nothing to compare and no way to say so.
+      - --chain-checkpoints=4
+      - --leader=0
+      - --tick-ms=5
+      - --data-dir=/data
+      - --peer=0=queso-0:7200
+      - --peer=1=queso-1:7200
+      - --peer=2=queso-2:7200
+
+  queso-1:
+    container_name: queso-1
+    hostname: queso-1
+    image: "${QUESO_REGISTRY:-queso}/queso-node:${QUESO_TAG:-latest}"
+    networks: [queso]
+    volumes: [queso-1-data:/data]
+    command:
+      - /usr/local/bin/queso-node
+      - --id=1
+      - --seed=9001
+      - --listen=0.0.0.0:7200
+      - --client-listen=0.0.0.0:7000
+      - --status-listen=0.0.0.0:7100
+      - --chain-checkpoints=4
+      - --leader=0
+      - --tick-ms=5
+      - --data-dir=/data
+      - --peer=0=queso-0:7200
+      - --peer=1=queso-1:7200
+      - --peer=2=queso-2:7200
+
+  queso-2:
+    container_name: queso-2
+    hostname: queso-2
+    image: "${QUESO_REGISTRY:-queso}/queso-node:${QUESO_TAG:-latest}"
+    networks: [queso]
+    volumes: [queso-2-data:/data]
+    command:
+      - /usr/local/bin/queso-node
+      - --id=2
+      - --seed=9002
+      - --listen=0.0.0.0:7200
+      - --client-listen=0.0.0.0:7000
+      - --status-listen=0.0.0.0:7100
+      - --chain-checkpoints=4
+      - --leader=0
+      - --tick-ms=5
+      - --data-dir=/data
+      - --peer=0=queso-0:7200
+      - --peer=1=queso-1:7200
+      - --peer=2=queso-2:7200
+
+  # The container the Test Composer runs commands in. It holds no state and
+  # injects no faults: under Antithesis the platform is the adversary, and a
+  # workload adding its own turbulence would only obscure what the platform
+  # found. It idles so the commands under /opt/antithesis/test/v1/main can
+  # be invoked in it.
+  workload:
+    container_name: workload
+    hostname: workload
+    image: "${QUESO_REGISTRY:-queso}/queso-antithesis:${QUESO_TAG:-latest}"
+    networks: [queso]
+    command: ["sleep", "infinity"]
+
+networks:
+  queso:
+    driver: bridge
+
+# Durable state must outlive a container restart, because Antithesis restarts
+# containers as a fault and issue #36 is this project's evidence for what an
+# ephemeral data directory silently does: a replica that comes back blank
+# loses acknowledged writes, and the divergence check would be reporting a
+# harness misconfiguration as a Queso bug.
+volumes:
+  queso-0-data:
+  queso-1-data:
+  queso-2-data:

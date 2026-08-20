@@ -41,7 +41,7 @@ real traffic. See §4 for the honest remaining gaps.
 | M5 | Auto-tuning (multi-armed bandit) | ✅ merged (#28) |
 | M6 | Real transport, deployment, fuzzing, perf & comparison | ✅ merged (#30 — #32, #33, #34, #35) |
 | M7 | Operability: durability hardening, TLS, status/metrics, admin CLI | ✅ merged (#45 — #46, #47) |
-| — | Phase 9: Antithesis-style conformance testing | 🔶 9.1 merged (#55); 9.2 complete (#56 — hook, real-process harness, sustained seeded soak); #54 open for deterministic replay of real runs |
+| — | Phase 9: Antithesis-style conformance testing | ✅ 9.1 (#55), 9.2 (#56), 9.3 (#54 — Antithesis test template packaged; the run itself needs the owner's account) |
 
 ---
 
@@ -122,6 +122,21 @@ crate depending only on `queso-smr`. Extracted from `crates/conformance` so the
 **node** (`queso-net`'s `/chain` checkpoints) and the **harness** compute
 byte-identical hashes from the same code — an encoding drift between them would
 make every cross-replica comparison silently miss.
+
+### `crates/antithesis` — the Antithesis test template (Phase 9.3)
+`queso-antithesis` drives the Chain-of-Blocks workload against replicas that are
+already running (containers, under Antithesis) and expresses Queso's properties as
+Antithesis assertions: divergence forbidden always and under fault; progress and
+no-replica-left-behind in the quiescent branch after faults stop; plus three
+`sometimes` properties that fail a run which silently observed nothing. It injects
+**no faults of its own** — under Antithesis the platform is the adversary.
+
+Verified locally by `cargo test -p queso-antithesis -- --ignored` (in CI's real-process
+job): a real cluster is driven, every assertion is reached and evaluates as expected,
+`setup_complete` is signalled, and a negative control confirms the liveness properties
+can fail. Not verified: the container build, the registry push, and the run — see
+[`antithesis/README.md`](../antithesis/README.md), which is explicit about which is
+which.
 
 ### `crates/soak` — real-process conformance harness and soak (Phase 9.2)
 `RealCluster` implements `queso-conformance`'s `CobTarget` over spawned
@@ -243,9 +258,11 @@ The P0 list from the previous snapshot — real transport, TLS, wire format, a r
 node binary, real durability, a client API — is **done**. What remains:
 
 **Correctness confidence (highest value):**
-- **Deterministic replay of a real execution** (#54's remainder) — the soak reproduces
-  a fault *schedule* but never an interleaving, which is what makes a rare soak failure
-  hard to debug. This is the top open item.
+- **An actual Antithesis run.** The test template is packaged and its properties are
+  verified to fire (`crates/antithesis`, `antithesis/`), but the run needs an account,
+  and the container build has never been executed — no Docker daemon was available.
+  Until then, deterministic replay of a real execution remains the standing gap: the
+  soak reproduces a fault *schedule* but never an interleaving.
 
 **Functionality still missing:**
 - **Log compaction / snapshotting** — the log grows unbounded; every persist rewrites the
@@ -316,6 +333,10 @@ no schedule.
 
 1. ~~**Phase 9.1 — Chain-of-Blocks workload + divergence/liveness observer (#55).**~~
    Merged: `crates/conformance`.
+2b. ~~**Phase 9.3 — Antithesis test template (#54).**~~ Packaged and locally verified;
+   the run needs the owner's account. Next step there is a first Antithesis run, which
+   will also be the first time the container images are built.
+
 2. ~~**Phase 9.2 — real-binary-under-fault soak (#56).**~~ All three slices merged:
    the node-side hook (`GET /chain`), the real-process harness plus socket-level nemesis,
    and the sustained seeded soak with its bounded CI variant and long mode
