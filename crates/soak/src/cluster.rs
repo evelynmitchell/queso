@@ -40,9 +40,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use queso_chain::ChainState;
 use queso_conformance::observer::Sample;
 use queso_conformance::source::CobTarget;
+use queso_net::chain::parse_chain;
 use queso_sim::ids::NodeId;
 use queso_smr::{ClientId, Command};
 use tokio::runtime::Runtime;
@@ -594,61 +594,16 @@ impl CobTarget for RealCluster {
             };
 
             let cursor = self.emitted.entry(replica).or_insert(0);
-            for (n, h) in report.checkpoints {
-                if n > *cursor {
-                    samples.push(Sample {
-                        replica,
-                        observed_at: now,
-                        state: ChainState { n, h },
-                        // A real source sees hashes, never the individual
-                        // commands behind them, so the observer's
-                        // per-transition log stays empty here. Documented
-                        // rather than faked.
-                        command_digest: None,
-                    });
-                    *cursor = n;
-                }
-            }
-
-            // The frontier every poll, so the liveness observer can tell
-            // "not moving" from "not observed" even between checkpoints.
-            samples.push(Sample {
+            samples.extend(queso_conformance::source::samples_from_chain(
                 replica,
-                observed_at: now,
-                state: report.frontier,
-                command_digest: None,
-            });
+                now,
+                report.frontier,
+                &report.checkpoints,
+                cursor,
+            ));
         }
         samples
     }
-}
-
-/// A parsed `/chain` body.
-struct ChainReport {
-    frontier: ChainState,
-    checkpoints: Vec<(u64, u64)>,
-}
-
-fn parse_hash(value: &serde_json::Value) -> Option<u64> {
-    let text = value.as_str()?;
-    u64::from_str_radix(text.strip_prefix("0x").unwrap_or(text), 16).ok()
-}
-
-fn parse_chain(body: &str) -> Option<ChainReport> {
-    let json: serde_json::Value = serde_json::from_str(body).ok()?;
-    let frontier = ChainState {
-        n: json["frontier"]["n"].as_u64()?,
-        h: parse_hash(&json["frontier"]["h"])?,
-    };
-    let checkpoints = json["checkpoints"]
-        .as_array()?
-        .iter()
-        .filter_map(|entry| Some((entry["n"].as_u64()?, parse_hash(&entry["h"])?)))
-        .collect();
-    Some(ChainReport {
-        frontier,
-        checkpoints,
-    })
 }
 
 /// One `GET`, returning the body, or `None` for any failure -- an

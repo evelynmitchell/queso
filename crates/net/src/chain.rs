@@ -180,6 +180,52 @@ impl ChainCheckpoints {
     }
 }
 
+/// A parsed `GET /chain` body: what a conformance observer needs from one
+/// replica.
+///
+/// Lives next to [`ChainCheckpoints::to_json`], the code that *produces*
+/// this format, on purpose. The two halves are a private wire contract
+/// between the node and every harness that watches it, and a parser living
+/// in one of those harnesses could drift from the producer silently -- the
+/// same failure mode that put the hash chain itself in its own `queso-chain`
+/// crate rather than one copy per side. `chain_json_round_trips` is the
+/// guard: change the encoding and it fails here, not in a soak whose
+/// comparison count quietly drops to zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainReport {
+    /// The replica's furthest `(n, h)`, reported every poll.
+    pub frontier: ChainState,
+    /// Retained checkpoints, oldest first.
+    pub checkpoints: Vec<(u64, u64)>,
+}
+
+/// Hashes travel as hex strings so a 64-bit value survives any JSON reader
+/// (a plain number would lose precision in one that parses to `f64`).
+fn parse_hash(value: &serde_json::Value) -> Option<u64> {
+    let text = value.as_str()?;
+    u64::from_str_radix(text.strip_prefix("0x").unwrap_or(text), 16).ok()
+}
+
+/// Parse a `GET /chain` body. `None` for anything malformed -- a caller
+/// polling a replica that is rebooting, or reachable but not serving,
+/// treats "no report" as an ordinary condition rather than an error.
+pub fn parse_chain(body: &str) -> Option<ChainReport> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let frontier = ChainState {
+        n: json["frontier"]["n"].as_u64()?,
+        h: parse_hash(&json["frontier"]["h"])?,
+    };
+    let checkpoints = json["checkpoints"]
+        .as_array()?
+        .iter()
+        .filter_map(|entry| Some((entry["n"].as_u64()?, parse_hash(&entry["h"])?)))
+        .collect();
+    Some(ChainReport {
+        frontier,
+        checkpoints,
+    })
+}
+
 /// The driver-side half: folds newly-applied commands into the chain and
 /// publishes crossings into a [`ChainCheckpoints`].
 ///
@@ -333,6 +379,26 @@ mod tests {
         assert!(
             serde_json::from_str::<serde_json::Value>(&json).is_ok(),
             "body must be valid JSON:\n{json}"
+        );
+
+        // Producer and parser are checked against each other here, so an
+        // encoding change cannot pass one and silently break the other --
+        // which for a harness means a comparison count quietly dropping to
+        // zero rather than a failing test.
+        let report = parse_chain(&json).expect("the parser must accept what the producer emits");
+        assert_eq!(
+            report.frontier,
+            sink.frontier(),
+            "the frontier must survive the round trip, hash included"
+        );
+        assert_eq!(
+            report.checkpoints,
+            sink.checkpoints().0,
+            "the retained checkpoints must survive the round trip"
+        );
+        assert!(
+            report.checkpoints.iter().any(|(_, h)| *h != 0),
+            "a round trip of all-zero hashes would prove nothing about the hex encoding"
         );
     }
 
