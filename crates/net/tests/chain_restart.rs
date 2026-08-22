@@ -15,109 +15,27 @@
 //! Like `tests/restart_recovery.rs`, this spawns the actual `queso-node`
 //! binary as independent OS processes -- an in-process "drop the `SmrNode`
 //! and rebuild it" simulation would leave the real boot-time reload path
-//! (the thing under test) untested. The small `RealCluster` here is
-//! deliberately separate from that file's rather than shared: this one has
-//! to bind status listeners and pass `--chain-checkpoints`, and threading
-//! that through the durability test's harness would complicate a regression
-//! test that has nothing to do with conformance observability.
+//! (the thing under test) untested.
+//!
+//! It used to keep its own copy of that spawner, on the grounds that this
+//! one needs status listeners and `--chain-checkpoints`. Issue #40 is why
+//! it no longer does: the shared `support::ProcCluster` retries a boot that
+//! dies immediately, working around `free_addr`'s bind-then-drop race, and
+//! a private copy is a copy that quietly does not get that protection.
+//! Threading two optional flags through one spawner is a smaller cost than
+//! maintaining two.
 
 use std::collections::BTreeMap;
-use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use queso_net::client;
 use queso_smr::{ClientId, Command as KvCommand, Outcome};
 
+mod support;
+use support::ProcCluster;
+
 const SPACING: u64 = 2;
-
-fn node_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_queso-node")
-}
-
-fn free_addr() -> SocketAddr {
-    let listener = StdTcpListener::bind(("127.0.0.1", 0)).expect("bind an ephemeral port");
-    listener.local_addr().expect("read back the bound address")
-}
-
-/// A real `queso-node` cluster with the status server and chain hook turned
-/// on. Kills every still-running child on drop so a failed assertion never
-/// leaks orphan processes.
-struct RealCluster {
-    n: usize,
-    peer_addrs: Vec<SocketAddr>,
-    client_addrs: Vec<SocketAddr>,
-    status_addrs: Vec<SocketAddr>,
-    leader: u32,
-    data_dir: std::path::PathBuf,
-    children: Vec<Option<Child>>,
-}
-
-impl RealCluster {
-    fn new(n: usize, leader: u32, data_dir: &Path) -> Self {
-        let mut cluster = Self {
-            n,
-            peer_addrs: (0..n).map(|_| free_addr()).collect(),
-            client_addrs: (0..n).map(|_| free_addr()).collect(),
-            status_addrs: (0..n).map(|_| free_addr()).collect(),
-            leader,
-            data_dir: data_dir.to_path_buf(),
-            children: (0..n).map(|_| None).collect(),
-        };
-        for i in 0..n {
-            cluster.spawn(i);
-        }
-        cluster
-    }
-
-    fn spawn(&mut self, i: usize) {
-        assert!(self.children[i].is_none(), "replica {i} is already running");
-        let mut cmd = Command::new(node_bin());
-        cmd.arg("--id")
-            .arg(i.to_string())
-            .arg("--seed")
-            .arg((11_000 + i as u64).to_string())
-            .arg("--listen")
-            .arg(self.peer_addrs[i].to_string())
-            .arg("--client-listen")
-            .arg(self.client_addrs[i].to_string())
-            .arg("--status-listen")
-            .arg(self.status_addrs[i].to_string())
-            .arg("--chain-checkpoints")
-            .arg(SPACING.to_string())
-            .arg("--leader")
-            .arg(self.leader.to_string())
-            .arg("--tick-ms")
-            .arg("5")
-            .arg("--data-dir")
-            .arg(&self.data_dir);
-        for j in 0..self.n {
-            cmd.arg("--peer").arg(format!("{j}={}", self.peer_addrs[j]));
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        self.children[i] = Some(cmd.spawn().expect("spawn queso-node subprocess"));
-    }
-
-    fn kill(&mut self, i: usize) {
-        let mut child = self.children[i]
-            .take()
-            .unwrap_or_else(|| panic!("replica {i} is not running"));
-        child.kill().expect("SIGKILL replica");
-        child.wait().expect("reap killed replica");
-    }
-}
-
-impl Drop for RealCluster {
-    fn drop(&mut self) {
-        for slot in &mut self.children {
-            if let Some(mut child) = slot.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
-}
 
 async fn submit_with_retry(addr: SocketAddr, command: &KvCommand, timeout: Duration) -> Outcome {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -222,19 +140,19 @@ async fn wait_for_checkpoints(addr: SocketAddr, timeout: Duration) -> BTreeMap<u
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_replica_republishes_the_same_checkpoints() {
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let mut cluster = RealCluster::new(3, 0, data_dir.path());
+    let mut cluster = ProcCluster::start_with_status(3, 0, data_dir.path(), Some(SPACING));
     let timeout = Duration::from_secs(20);
 
     // Enough closed-loop writes to cross several checkpoints.
     for i in 0..8u64 {
         assert_eq!(
-            submit_with_retry(cluster.client_addrs[0], &put(i, i as i64 + 100), timeout).await,
+            submit_with_retry(cluster.client_addr(0), &put(i, i as i64 + 100), timeout).await,
             Outcome::Put,
             "write {i} should be applied"
         );
     }
 
-    let before = fetch_checkpoints(cluster.status_addrs[0], timeout).await;
+    let before = fetch_checkpoints(cluster.status_addr(0), timeout).await;
     assert!(
         before.len() >= 3,
         "expected several checkpoints before the restart, got {before:?}"
@@ -258,7 +176,7 @@ async fn a_restarted_replica_republishes_the_same_checkpoints() {
     // and what actually matters, is that the refold covers the *pre-crash*
     // slots: with the fold starting from the current frontier instead of
     // from genesis, this call fails outright.
-    let after = wait_for_checkpoints(cluster.status_addrs[0], timeout).await;
+    let after = wait_for_checkpoints(cluster.status_addr(0), timeout).await;
 
     let mut rechecked = 0usize;
     for (n, h) in &before {
@@ -293,15 +211,15 @@ async fn a_restarted_replica_republishes_the_same_checkpoints() {
     // same for real processes, and a 9.2 soak that drives load at a single
     // endpoint would compare nothing at all.)
     for i in 0..6u64 {
-        let addr = cluster.client_addrs[(i as usize) % cluster.client_addrs.len()];
+        let addr = cluster.client_addr((i as usize) % cluster.replicas());
         assert_eq!(
             submit_with_retry(addr, &put(200 + i, i as i64), timeout).await,
             Outcome::Put
         );
     }
 
-    let after = fetch_checkpoints(cluster.status_addrs[0], timeout).await;
-    let peer = fetch_checkpoints(cluster.status_addrs[1], timeout).await;
+    let after = fetch_checkpoints(cluster.status_addr(0), timeout).await;
+    let peer = fetch_checkpoints(cluster.status_addr(1), timeout).await;
     let mut cross_checked = 0usize;
     for (n, h) in &after {
         if let Some(peer_h) = peer.get(n) {

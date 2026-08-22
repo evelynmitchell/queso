@@ -277,7 +277,12 @@ node binary, real durability, a client API — is **done**. What remains:
 - **Bounded concurrent connections on the status port** (#50) — low severity; the port is
   opt-in and documented as internal-only.
 - Smaller robustness items: DNS-retry backoff and IPv6 family preference (#42),
-  bench coverage (#40), idempotent proposer `start()` (#13). ~~Tuning×restart coverage
+  idempotent proposer `start()` (#13). ~~Bench coverage (#40)~~ — closed: the
+  open/closed-loop schedulers moved from the `queso-bench` binary into
+  `queso_net::bench` behind an `OpTarget`, so the coordinated-omission and
+  drop-attribution fixes from #37 finally have regression tests (both
+  mutation-verified), and the last real-process test harness with the
+  `free_addr` race now shares `ProcCluster`'s retrying spawner. ~~Tuning×restart coverage
   and leader-switch `set_leader` (#29)~~ — closed: the kernel's leader hint now tracks
   the tuner across epoch switches (it used to be set once to epoch 0's leader, so a
   leader-targeting adversary under tuning attacked a bystander), plus direct
