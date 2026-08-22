@@ -85,15 +85,23 @@ fn run_one(n: u32, seed: u64) {
     // set at most once, guarded in `crate::proposer::Proposer::process_phase`
     // (only reachable while `self.decided.is_none()`, and `on_response`/
     // `on_timer` both bail out immediately once `self.decided.is_some()`).
-    // Re-assert that invariant here by running well past decision and
-    // confirming the value never changes (this also covers P4 Stability).
+    // Re-assert that invariant here by running well past decision --
+    // delivering every straggler still in flight, which the recorders do
+    // answer and the decided proposers must not act on -- and confirming
+    // the value never changes (this also covers P4 Stability). `advance`,
+    // not `run_slot`: what a *re-kick* does to an already-decided proposer
+    // is its own contract (issue #13) and is pinned by
+    // `proposer_start_contract.rs`, which asserts far more than "the value
+    // didn't change"; using `run_slot` here would look like it covered
+    // that and cover nothing, since `Proposer::start` is now a no-op once
+    // decided.
     let before: BTreeMap<NodeId, u32> = cluster
         .replicas()
         .iter()
         .filter(|id| !crashed.contains(id))
         .map(|&id| (id, cluster.decided(id).unwrap()))
         .collect();
-    cluster.run_slot(1_000);
+    cluster.advance(1_000);
     for (&id, &v) in &before {
         assert_eq!(
             cluster.decided(id).unwrap(),
