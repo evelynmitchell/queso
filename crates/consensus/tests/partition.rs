@@ -130,11 +130,13 @@ fn run_majority_minority_then_heal(n: u32, seed: u64) {
         );
     }
 
-    // Heal, then give every replica (majority included -- re-kicking an
-    // already-decided proposer is safe and exercised by
-    // `concrete_agreement_validity_integrity.rs`'s own P3/P4 check: `start`
-    // never touches `decided`, and `on_response`/`on_timer` bail out
-    // immediately once `decided` is `Some`) a chance to converge.
+    // Heal, then give every replica a chance to converge. This is the
+    // undecided half of `Proposer::start`'s re-kick contract (issue #13)
+    // doing its job: the minority proposers stalled out here get restarted
+    // at round 1 and catch up off the recorders' monotone ISR state, while
+    // the majority's already-decided proposers are left completely alone
+    // (`start` returns immediately once `decided` is `Some`). Both halves
+    // are pinned by `proposer_start_contract.rs`.
     cluster.heal();
     cluster.run_slot(HEAL_TICKS);
 

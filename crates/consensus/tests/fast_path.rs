@@ -360,14 +360,16 @@ fn run_one(n: u32, seed: u64) {
     );
 
     // P3/P4 -- Integrity / decide-once / Stability: run well past decision
-    // and confirm nothing changes.
+    // and confirm nothing changes. `advance`, not `run_slot`: see the same
+    // block in `concrete_agreement_validity_integrity.rs` for why the
+    // re-kick belongs to `proposer_start_contract.rs` instead.
     let before: BTreeMap<NodeId, u32> = cluster
         .replicas()
         .iter()
         .filter(|id| !crashed.contains(id))
         .map(|&id| (id, cluster.decided(id).unwrap()))
         .collect();
-    cluster.run_slot(1_000);
+    cluster.advance(1_000);
     for (&id, &v) in &before {
         assert_eq!(
             cluster.decided(id).unwrap(),
