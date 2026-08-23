@@ -276,7 +276,19 @@ node binary, real durability, a client API — is **done**. What remains:
 - **Flow control / backpressure** — unaddressed.
 - **Bounded concurrent connections on the status port** (#50) — low severity; the port is
   opt-in and documented as internal-only.
-- Smaller robustness items: DNS-retry backoff and IPv6 family preference (#42).
+- Smaller robustness items: ~~DNS-retry backoff and IPv6 family preference (#42)~~ —
+  closed: `spawn_peer_dialer` re-resolves on every dial attempt and used to sleep a flat
+  200ms on resolution failure too, so a hostname that will never resolve (an operator
+  typo in a fly app name) meant an indefinite ~5 Hz DNS query loop per peer. The
+  resolution half now backs off exponentially to a 25.6s ceiling and resets on any
+  success — the dial half deliberately keeps its flat cadence, since a peer that
+  resolves but isn't listening yet should rejoin fast. Five tests, mutation-verified
+  clause by clause (flat / uncapped / no-reset / computed-but-never-slept each fail a
+  different one), two of them on tokio's paused clock so a schedule spanning minutes is
+  asserted without spending it. The IPv4/IPv6 half is documented rather than enforced,
+  with the reason: because the dialer re-resolves every attempt, having *no* family
+  preference lets consecutive attempts try both, and pinning one could pin the
+  unreachable one forever.
   ~~Proposer `start()` re-kick contract (#13)~~ — closed: `ConcreteCluster::run_slot`
   re-injects every live replica's `KICKOFF_TIMER` on every call, so `start` was never a
   once-per-proposer call, and an unguarded re-kick rewound a *decided* proposer's step
