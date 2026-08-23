@@ -45,6 +45,72 @@ use crate::wire::{decode, encode, WireMsg};
 /// 7.2+.
 const RECONNECT_DELAY: Duration = Duration::from_millis(200);
 
+/// How many times [`ResolveBackoff`] may double [`RECONNECT_DELAY`] before
+/// it stops: `200ms << 7` = 25.6s between DNS queries for a peer whose
+/// hostname simply will not resolve.
+///
+/// Chosen so the cap is comfortably under a minute (an operator who fixes a
+/// typo'd hostname sees the cluster converge without restarting anything)
+/// while dropping the steady-state query rate for a permanently-broken name
+/// from ~5 Hz to ~0.04 Hz -- a factor of ~128.
+const RESOLVE_BACKOFF_MAX_SHIFT: u32 = 7;
+
+/// Capped exponential backoff for the *DNS-resolution* half of
+/// [`spawn_peer_dialer`]'s retry loop (issue #42).
+///
+/// # Why only this half
+///
+/// The dial half deliberately keeps its flat [`RECONNECT_DELAY`] cadence:
+/// a dead TCP connection to a peer whose address already resolved is
+/// expected back on an ordinary timescale, and reconnecting fast is worth
+/// more than the saved SYNs (see [`RECONNECT_DELAY`]'s own docs). Failing
+/// *resolution* is a different situation. It usually means the name is
+/// wrong -- an operator typo in a fly app name, say -- and a wrong name
+/// stays wrong. Re-resolving it every 200ms per peer forever is a ~5 Hz
+/// query loop aimed at a resolver, indefinitely, for no possible benefit.
+/// It also drowns the one log line that would tell the operator what is
+/// actually broken.
+///
+/// # Why it still converges
+///
+/// `reset` is the load-bearing half. The instant a name resolves, the next
+/// failure starts again at [`RECONNECT_DELAY`], so a peer whose DNS is
+/// merely *slow to propagate* (exactly fly.io's `.internal` at process
+/// start -- see [`resolve_peer_addr`]) never inherits a long delay earned
+/// during some earlier outage. Backoff is only ever paid by a name that is
+/// failing right now, repeatedly.
+#[derive(Debug, Default)]
+struct ResolveBackoff {
+    /// Resolution failures since the last success. `0` means the next
+    /// failure waits exactly [`RECONNECT_DELAY`], matching the pre-#42
+    /// behavior for the first attempt.
+    consecutive_failures: u32,
+}
+
+impl ResolveBackoff {
+    /// How long the *next* failure waits: `RECONNECT_DELAY << min(failures,
+    /// RESOLVE_BACKOFF_MAX_SHIFT)`. Pure and saturating -- the `min` is
+    /// what keeps a long-lived broken peer from shifting into overflow.
+    fn delay(&self) -> Duration {
+        let shift = self.consecutive_failures.min(RESOLVE_BACKOFF_MAX_SHIFT);
+        RECONNECT_DELAY.saturating_mul(1u32 << shift)
+    }
+
+    /// Wait out this failure, then escalate for the next one.
+    async fn sleep_and_escalate(&mut self) {
+        tokio::time::sleep(self.delay()).await;
+        // Saturating so a peer left broken for a very long time keeps
+        // waiting `delay()` (already clamped by the `min` above) rather
+        // than wrapping back to a tight loop.
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+    }
+
+    /// A name resolved: forget the failure history entirely.
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+    }
+}
+
 /// Bound on one peer's outbound queue (see [`crate::driver::run_node`],
 /// which creates the bounded channel this dialer drains). While a peer is
 /// reachable this never comes close to filling -- `rx.recv().await` below
@@ -83,6 +149,29 @@ pub const OUTBOUND_QUEUE_CAPACITY: usize = 1024;
 /// `docs/deploy-flyio.md`): that DNS may not have propagated yet the
 /// instant this process starts, and the address behind a hostname can
 /// legitimately change across a peer's restart.
+///
+/// # Address family (issue #42)
+///
+/// **This takes whatever the resolver returns first, with no IPv4/IPv6
+/// preference of its own** -- stated here because it is an assumption, not
+/// an accident, and nothing else in the code says so.
+///
+/// It is moot on the deployment target: fly.io's `.internal`/6PN network is
+/// IPv6-only, so a `.internal` name has exactly one family to return. It is
+/// also moot for every local and CI cluster, which pass literal `ip:port`
+/// and never reach the DNS path at all.
+///
+/// It would stop being moot on a dual-stack hostname, where `lookup_host`'s
+/// ordering is the platform resolver's business (`getaddrinfo` applies
+/// RFC 6724 source-address selection; other resolvers need not). Note what
+/// the *absence* of a preference buys there: because [`spawn_peer_dialer`]
+/// re-resolves on every attempt, consecutive attempts may legitimately land
+/// on different families, so a host reachable over only one of them still
+/// finds it. Pinning a family would make the choice deterministic and could
+/// pin it to the unreachable one forever. That trade-off is why this stays
+/// unopinionated until something actually dials a dual-stack peer -- at
+/// which point the fix is a preference *with* a fallback, not a bare
+/// preference.
 pub async fn resolve_peer_addr(addr: &str) -> std::io::Result<SocketAddr> {
     if let Ok(sock_addr) = addr.parse::<SocketAddr>() {
         return Ok(sock_addr);
@@ -142,12 +231,23 @@ pub fn spawn_peer_dialer(
     tls: Option<Arc<rustls::ClientConfig>>,
 ) {
     tokio::spawn(async move {
+        // Only the resolution failures back off; every other retry below
+        // keeps the flat `RECONNECT_DELAY` cadence on purpose -- see
+        // `ResolveBackoff`'s docs for the distinction.
+        let mut resolve_backoff = ResolveBackoff::default();
         loop {
             let resolved = match resolve_peer_addr(&peer_addr).await {
-                Ok(addr) => addr,
+                Ok(addr) => {
+                    resolve_backoff.reset();
+                    addr
+                }
                 Err(err) => {
-                    debug!(%peer_addr, %err, "peer address resolution failed, retrying");
-                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    debug!(
+                        %peer_addr, %err,
+                        retry_in_ms = resolve_backoff.delay().as_millis(),
+                        "peer address resolution failed, retrying"
+                    );
+                    resolve_backoff.sleep_and_escalate().await;
                     continue;
                 }
             };
@@ -360,5 +460,134 @@ mod tests {
     async fn resolve_peer_addr_rejects_an_unresolvable_hostname() {
         let result = resolve_peer_addr("this-host-does-not-exist.invalid:7000").await;
         assert!(result.is_err());
+    }
+
+    /// A literal IPv6 `[addr]:port` must take the same synchronous parse
+    /// path an IPv4 literal does, never DNS. This is the form fly.io's
+    /// IPv6-only 6PN network produces, so it has to work with no resolver
+    /// at all -- and it is the one address family `resolve_peer_addr`'s
+    /// "no explicit preference" note (issue #42) says the deployment
+    /// target actually uses.
+    #[tokio::test]
+    async fn resolve_peer_addr_accepts_an_ipv6_literal_without_dns() {
+        let resolved = resolve_peer_addr("[::1]:7000").await.unwrap();
+        assert_eq!(resolved, "[::1]:7000".parse::<SocketAddr>().unwrap());
+        assert!(resolved.is_ipv6(), "{resolved} should have stayed IPv6");
+    }
+
+    /// The backoff schedule itself: each successive failure doubles
+    /// `RECONNECT_DELAY`, starting *at* `RECONNECT_DELAY` so the first
+    /// failure waits exactly what it waited before issue #42.
+    #[test]
+    fn resolve_backoff_doubles_from_the_flat_reconnect_delay() {
+        let mut backoff = ResolveBackoff::default();
+        let mut expected = RECONNECT_DELAY;
+        for failure in 0..RESOLVE_BACKOFF_MAX_SHIFT {
+            assert_eq!(
+                backoff.delay(),
+                expected,
+                "failure #{failure} should wait {expected:?}"
+            );
+            backoff.consecutive_failures += 1;
+            expected *= 2;
+        }
+    }
+
+    /// The cap holds, and holds *forever*: a peer left broken for a very
+    /// long time must keep waiting the capped delay rather than shifting
+    /// into overflow or wrapping back to a tight loop. `u32::MAX` failures
+    /// is the extreme the `min`/`saturating_add` pair exists to survive.
+    #[test]
+    fn resolve_backoff_caps_and_never_overflows() {
+        let capped = RECONNECT_DELAY * (1 << RESOLVE_BACKOFF_MAX_SHIFT);
+        assert_eq!(capped, Duration::from_millis(25_600));
+
+        for failures in [
+            RESOLVE_BACKOFF_MAX_SHIFT,
+            RESOLVE_BACKOFF_MAX_SHIFT + 1,
+            RESOLVE_BACKOFF_MAX_SHIFT + 64,
+            u32::MAX,
+        ] {
+            let backoff = ResolveBackoff {
+                consecutive_failures: failures,
+            };
+            assert_eq!(
+                backoff.delay(),
+                capped,
+                "{failures} failures should still wait the capped {capped:?}"
+            );
+        }
+
+        // Escalating from the ceiling stays at the ceiling.
+        let mut backoff = ResolveBackoff {
+            consecutive_failures: u32::MAX,
+        };
+        backoff.consecutive_failures = backoff.consecutive_failures.saturating_add(1);
+        assert_eq!(backoff.delay(), capped);
+    }
+
+    /// `reset` is the half that makes this converge rather than punish: a
+    /// peer whose DNS was merely slow to propagate must not carry a long
+    /// delay forward once its name starts resolving. Without this, a peer
+    /// that flaps once ends up permanently 25.6s slow to reconnect.
+    #[test]
+    fn a_successful_resolution_clears_the_backoff() {
+        let mut backoff = ResolveBackoff {
+            consecutive_failures: RESOLVE_BACKOFF_MAX_SHIFT + 10,
+        };
+        assert_ne!(backoff.delay(), RECONNECT_DELAY, "test premise");
+
+        backoff.reset();
+
+        assert_eq!(
+            backoff.delay(),
+            RECONNECT_DELAY,
+            "after a success the next failure must wait the base delay again"
+        );
+    }
+
+    /// The schedule is not merely *computed* -- it is actually waited out.
+    /// Driven on tokio's paused clock, so this asserts real sleep calls
+    /// against virtual time without spending any wall-clock time: six
+    /// consecutive failures must consume 200+400+800+1600+3200+6400 ms.
+    ///
+    /// This is what a flat-cadence regression would fail on. Six failures
+    /// under the pre-#42 behavior would consume 1.2s, not 12.6s.
+    #[tokio::test(start_paused = true)]
+    async fn consecutive_failures_actually_sleep_the_escalating_schedule() {
+        let mut backoff = ResolveBackoff::default();
+        let started = tokio::time::Instant::now();
+
+        for _ in 0..6 {
+            backoff.sleep_and_escalate().await;
+        }
+
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(200 + 400 + 800 + 1_600 + 3_200 + 6_400)
+        );
+    }
+
+    /// The same, past the ceiling: once capped, each further failure costs
+    /// exactly the capped delay and no more, so a permanently-broken
+    /// hostname settles into a steady ~0.04 Hz query rate instead of the
+    /// ~5 Hz loop issue #42 reported.
+    #[tokio::test(start_paused = true)]
+    async fn a_permanently_broken_name_settles_at_the_capped_rate() {
+        let mut backoff = ResolveBackoff {
+            consecutive_failures: RESOLVE_BACKOFF_MAX_SHIFT,
+        };
+        let started = tokio::time::Instant::now();
+
+        for _ in 0..10 {
+            backoff.sleep_and_escalate().await;
+        }
+
+        let capped = RECONNECT_DELAY * (1 << RESOLVE_BACKOFF_MAX_SHIFT);
+        assert_eq!(started.elapsed(), capped * 10);
+        assert!(
+            started.elapsed() >= Duration::from_secs(256),
+            "10 capped waits should span minutes, not the 2s a flat 200ms cadence would"
+        );
     }
 }

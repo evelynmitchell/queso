@@ -263,6 +263,19 @@ Order doesn't matter much -- `queso-node`'s peer dialer retries forever
 comes up before its peers exist yet just keeps retrying (now also
 re-resolving DNS on every attempt, see section 1) until they do.
 
+The two failure modes retry at different cadences on purpose. A peer whose
+name *resolves* but isn't listening yet is redialed on the flat 200ms
+cadence, so it joins the moment it comes up. A peer whose name doesn't
+resolve at all backs off exponentially to a 25.6s ceiling
+(`transport::ResolveBackoff`, issue #42) -- because the overwhelming cause
+of that is a typo'd app name in `--peer`, and hammering fly's `.internal`
+resolver at 5 Hz per peer forever neither fixes the typo nor leaves the one
+useful log line visible. **If a replica never connects, look for
+`peer address resolution failed` in `fly logs`**: its `retry_in_ms` field
+climbing toward 25600 is the signature of a hostname that is simply wrong.
+Fix the name and redeploy -- the backoff resets to 200ms as soon as any
+resolution succeeds, so there's nothing to wait out.
+
 **If `fly deploy` can't find `deploy/Dockerfile`:** flyctl resolves a
 `[build].dockerfile` path in `fly.toml` relative to *either* the config
 file's own directory or the invocation directory, depending on flyctl

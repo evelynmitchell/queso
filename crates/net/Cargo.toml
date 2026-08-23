@@ -45,7 +45,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls-pemfile = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# `test-util` is what gives tests the paused/virtual clock
+# (`#[tokio::test(start_paused = true)]`). `transport`'s DNS-backoff tests
+# (issue #42) use it to assert that a schedule spanning minutes is actually
+# *slept*, without any test spending that time.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 tempfile = "3"
 # Phase 8.2a: generates throwaway CA + node/client certs at test-run time
 # (see `tests/tls.rs`) so no PEM fixtures are checked into the repo.
