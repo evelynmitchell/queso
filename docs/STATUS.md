@@ -276,8 +276,18 @@ node binary, real durability, a client API — is **done**. What remains:
 - **Flow control / backpressure** — unaddressed.
 - **Bounded concurrent connections on the status port** (#50) — low severity; the port is
   opt-in and documented as internal-only.
-- Smaller robustness items: DNS-retry backoff and IPv6 family preference (#42),
-  idempotent proposer `start()` (#13). ~~Bench coverage (#40)~~ — closed: the
+- Smaller robustness items: DNS-retry backoff and IPv6 family preference (#42).
+  ~~Proposer `start()` re-kick contract (#13)~~ — closed: `ConcreteCluster::run_slot`
+  re-injects every live replica's `KICKOFF_TIMER` on every call, so `start` was never a
+  once-per-proposer call, and an unguarded re-kick rewound a *decided* proposer's step
+  back to round 1 — which put a full round of `record` requests on the wire for a settled
+  slot and made `decided_via_fast_path` (literally `decided && step == FIRST_ROUND_STEP`)
+  claim a phase-0 fast-path decision for a replica that had decided several steps into the
+  ordinary spread/gather machinery. The contract is now written down and pinned:
+  undecided → restart round 1 (what partition-then-heal depends on), decided → complete
+  no-op. `tests/proposer_start_contract.rs` has a falsifier for each half, verified
+  against both mutations (guard removed → all three fail; fully idempotent → the restart
+  test fails). ~~Bench coverage (#40)~~ — closed: the
   open/closed-loop schedulers moved from the `queso-bench` binary into
   `queso_net::bench` behind an `OpTarget`, so the coordinated-omission and
   drop-attribution fixes from #37 finally have regression tests (both

@@ -425,11 +425,19 @@ impl<V: Ord + Clone + Debug + 'static> ConcreteCluster<V> {
     /// Advance the kernel by `more_ticks` from wherever it currently is,
     /// running whatever events (retries, hedge rechecks, in-flight
     /// messages) are already scheduled -- unlike [`Self::run_slot`], this
-    /// does **not** re-inject any replica's `KICKOFF_TIMER`, so it is safe
-    /// to call more than once on the same cluster (e.g. to observe a
-    /// hedging schedule's intermediate state before enough ticks have
-    /// passed for a later-ranked proposer to activate, then let it play
-    /// out further).
+    /// does **not** re-inject any replica's `KICKOFF_TIMER`. Use it to let
+    /// a run play out without disturbing it: to observe a hedging
+    /// schedule's intermediate state before enough ticks have passed for a
+    /// later-ranked proposer to activate and then let it continue, or to
+    /// deliver stragglers past a decision without a re-kick muddying what
+    /// caused what.
+    ///
+    /// Repeating [`Self::run_slot`] is also well-defined -- see
+    /// `queso_consensus::proposer::Proposer::start`'s re-kick contract
+    /// (issue #13): it restarts stalled undecided proposers at round 1 and
+    /// leaves decided ones untouched. Reach for `run_slot` when that
+    /// restart is the point (partition-then-heal), and `advance` when it
+    /// is not.
     pub fn advance(&mut self, more_ticks: u64) {
         let until = self.kernel.now().advance(more_ticks);
         self.kernel.run_until(until);

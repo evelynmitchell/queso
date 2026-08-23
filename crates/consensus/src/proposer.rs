@@ -629,8 +629,8 @@ impl<V: Ord + Clone> Proposer<V> {
         (0..self.total_replicas as u32).map(NodeId)
     }
 
-    /// Kick off round 1, phase 0 (`s <- 4*1 + 0`). Called once, from the
-    /// driver injecting a `KICKOFF_TIMER`.
+    /// Kick off round 1, phase 0 (`s <- 4*1 + 0`), from the driver
+    /// injecting a `KICKOFF_TIMER`.
     ///
     /// If this proposer was configured with [`Proposer::with_hedging`] and
     /// has a nonzero `activation_delay`, this does *not* activate
@@ -638,7 +638,48 @@ impl<V: Ord + Clone> Proposer<V> {
     /// `begin_step` to [`Proposer::maybe_activate_after_hedge`]. With no
     /// hedging configured (`activation_delay == 0`, the default), this is
     /// exactly Phase 3's unconditional behavior: activate right now.
+    ///
+    /// # The re-kick contract (issue #13)
+    ///
+    /// Drivers do not call this exactly once. `crate::concrete::
+    /// ConcreteCluster::run_slot` re-injects every live replica's
+    /// `KICKOFF_TIMER` on *every* call, so any test that runs a slot in
+    /// more than one push (heal-then-converge, run-past-decision) calls
+    /// `start` again on proposers that are mid-flight or already finished.
+    /// The contract that governs those repeat calls, chosen deliberately
+    /// rather than left to fall out of the code:
+    ///
+    /// - **Undecided: restart round 1.** `step` is reset to
+    ///   [`FIRST_ROUND_STEP`] and the first step is (re-)issued or
+    ///   re-hedged. This is a restart of *this proposer's* attempt, not of
+    ///   the protocol: the recorders' ISR state is monotone and survives
+    ///   independently, so the re-issued phase-0 `record` requests come
+    ///   back carrying whatever step the slot has actually reached and
+    ///   `process_quorum` catches straight back up. The stale higher-step
+    ///   retry timer left behind is inert -- `on_timer`'s
+    ///   `timer_id.0 != self.step` guard drops it. This is what lets a
+    ///   driver un-stall a proposer that was partitioned away from every
+    ///   quorum for its whole first push.
+    /// - **Decided: no-op.** A proposer that has decided is finished, and
+    ///   `start` returns immediately without touching `step`, without
+    ///   re-broadcasting, and without arming a hedge timer.
+    ///
+    /// The decided guard is not cosmetic. Without it a re-kick rewinds a
+    /// decided proposer's `step` to [`FIRST_ROUND_STEP`], which silently
+    /// rewrites the provenance [`Proposer::decided_via_fast_path`] reports
+    /// -- a replica that decided at step 8 through the ordinary
+    /// spread/gather machinery would afterwards claim a phase-0 fast-path
+    /// decision -- and puts a full round of `record` requests on the wire
+    /// for a slot that is already settled. Neither breaks P1/P3 (`decided`
+    /// is still write-once, and `on_response`/`on_timer` both bail out on
+    /// `decided.is_some()`), which is why this was filed as a robustness
+    /// item and not a safety bug; both are wrong anyway. See
+    /// `tests/proposer_start_contract.rs`, which pins every clause above.
     pub fn start(&mut self, ctx: &mut dyn Ctx<ConcreteMsg<V>>) {
+        if self.decided.is_some() {
+            // Already finished -- see "The re-kick contract" above.
+            return;
+        }
         self.step = FIRST_ROUND_STEP;
         if self.activation_delay == 0 {
             self.begin_step(ctx);
