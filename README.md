@@ -39,6 +39,108 @@ correctness at every layer** over raw performance — the interesting engineerin
 here is *how you gain confidence that a consensus protocol is actually correct*,
 not how many ops/sec a toy KV store can push.
 
+## How QuePaxa compares to Paxos, Raft, and etcd
+
+First, a category note, because the four names aren't the same kind of thing.
+**Multi-Paxos**, **Raft**, and **QuePaxa** are *algorithms*. **etcd** is a
+*product* — a mature, widely-deployed key-value store that happens to implement
+Raft. So "Queso vs. etcd" is really two separate comparisons: an algorithm
+comparison (QuePaxa vs. Raft), and a maturity comparison (a research prototype
+vs. the datastore behind Kubernetes). Queso wins nothing at all on the second
+one, and this section does not pretend otherwise.
+
+|  | Multi-Paxos | Raft | etcd | **QuePaxa** (Queso) |
+|---|---|---|---|---|
+| **Kind** | Algorithm | Algorithm | Product (Raft) | Algorithm |
+| **Leader** | Required for progress | Required for progress | Required for progress | *First among equals* — an optimization, never a requirement |
+| **Common-case commit** | 1 round trip | 1 round trip | 1 round trip | 1 round trip (leader fast path, §4.2.5) |
+| **Commit without the leader** | Blocked until a new leader is elected | Blocked until a new leader is elected | Blocked until a new leader is elected | ~3 round trips, immediately — no election |
+| **Liveness depends on** | Partial synchrony + timeouts | Partial synchrony + timeouts | Partial synchrony + timeouts | Randomization; each round decides with probability ≥ ½ |
+| **Failed leader** | View change after a timeout | Election after a randomized timeout | Same, with a default 1000 ms election timeout and randomized backoff to ~2× | Nothing to detect and nothing to elect — the next-ranked proposer's hedge delay elapses and it proceeds |
+| **Slow-but-alive leader** | Drags the whole system; too fast a timeout livelocks, too slow a timeout doesn't fire | Same | Same | The hedge schedule proceeds past it; the slow leader isn't in anyone's way |
+| **Timeouts to tune** | Yes, and there is no good WAN setting | Yes | Yes | None for liveness. The hedge delay δ is a *performance* knob: set it wrong and you get extra messages, not a stall |
+| **Messages per decision** | `O(n)` | `O(n)` | `O(n)` | `O(n)` on the fast path, `O(n²)` when every proposer is active |
+| **Safety under full asynchrony** | Yes | Yes | Yes | Yes — safety never rests on the randomization |
+| **Maturity** | Decades of deployments | The most-implemented consensus algorithm | Production-hardened, enormous operational track record | SOSP 2023; one production implementation (Cloudflare Meerkat). **Queso itself is a prototype** |
+
+### Why you would choose QuePaxa
+
+There is essentially one reason, and it is worth stating narrowly rather than
+broadly: **QuePaxa keeps making progress when the leader is degraded, and it
+does so without you having chosen a timeout in advance.**
+
+Leader-based protocols pay for their simplicity with what the QuePaxa paper
+calls the *tyranny of timeouts*. Liveness is gated on a number a human picked:
+too small and replicas trip over each other electing; too large and a dead
+leader stalls writes for that long. Worse, the failure mode timeouts handle
+*worst* is the common one — a leader that is slow but not slow enough to trip
+the timeout holds the entire cluster at its own speed indefinitely. And an
+adversary can weaponize this: DoS whichever single replica is currently leader
+(identifiable from traffic patterns), and progress halts while only one machine
+is ever under attack. Cloudflare cites multiple real incidents from unavailable
+leaders in Raft systems — which is why they built Meerkat on QuePaxa.
+
+QuePaxa's answer is that the leader is only ever an optimization. It gets the
+reserved top priority `H` and a one-round-trip fast path when it's healthy; when
+it isn't, the slot falls back to randomized leaderless rounds that terminate with
+probability 1 without anyone detecting anything. Instead of a timeout that
+*retroactively* declares the leader dead, a hedge schedule *proactively* has the
+next-ranked proposer step in at delay δ, 2δ, … — and because QuePaxa proposers
+cooperate rather than destructively interfere the way Paxos ballots do, an
+unnecessary hedge costs messages, not a view change.
+
+What that buys, measured in this repository rather than quoted from the paper:
+
+> With the fast-path leader fully network-isolated mid-run, the surviving
+> majority's **longest gap between two consecutive completed writes was 418 ms**
+> — no election, no stall. `crates/compare/tests/leader_dos.rs` asserts that gap
+> stays under 2 s on *every* run. For scale, etcd's default election timeout
+> alone is 1000 ms before randomized backoff.
+
+See [`docs/compare-etcd.md`](docs/compare-etcd.md) for the methodology, and note
+its honesty caveat: the Queso-side numbers there are real, but **the etcd-side
+numbers are placeholders** — this project's sandbox cannot reach or run etcd, so
+that half is a runbook for you to execute, not a result we're claiming.
+
+### Why you would not
+
+- **The liveness assumption is different, not strictly weaker.** Raft trades
+  timeouts for liveness under partial synchrony. QuePaxa trades randomization for
+  liveness under asynchrony — but only against a **content-oblivious** adversary
+  that can delay and reorder packets without reading them (assumption A3 in
+  [`docs/02-properties.md`](docs/02-properties.md); TLS is what makes it hold in
+  practice). An adversary who can read proposal contents and adaptively target
+  the highest priority is outside the model. Safety is unconditional either way;
+  it's the termination bound that rests on A3.
+- **Off the fast path you pay for it.** A non-leader proposer takes roughly 3
+  round trips instead of 1, and message cost goes to `O(n²)` when everyone is
+  active. QuePaxa is buying robustness with messages.
+- **Raft is dramatically easier to reason about**, and that is a real
+  engineering property, not a consolation prize. It was designed for
+  understandability and has the implementations, tooling, and operator intuition
+  to show for it.
+- **etcd is a product and Queso is not.** Watches, leases, MVCC, auth, backup and
+  restore, reconfiguration, and years of production traffic — Queso has a
+  demonstration KV store with 64-bit values, no pipelining, no log compaction, and
+  no membership change. See [Honest status & limitations](#honest-status--limitations).
+- **Leader-based systems can serve cheaper linearizable reads.** etcd's
+  ReadIndex/lease reads avoid a full consensus round; Queso's reads go through
+  the log so that a lagging replica is forced to catch up first.
+
+### The short version
+
+- **Choose Raft/etcd** if you want a consensus system today, your network is a
+  reasonably well-behaved data center, and you'd rather tune an election timeout
+  than reason about a probabilistic termination bound. This is the right default
+  and it isn't close.
+- **Choose QuePaxa** if leader unavailability is your actual operational pain —
+  a WAN with no good timeout setting, adversarial conditions, or an incident
+  history of leaders that were slow rather than dead — and you can accept a
+  younger protocol with one production implementation.
+- **Choose Queso** if you want to *read* a QuePaxa implementation whose
+  correctness argument is written down and mechanically checked. It's a reference
+  implementation and a learning vehicle, not a datastore to put real data in.
+
 ## How it's built: verified core, real-I/O shell
 
 The central design idea is a hard seam between a **deterministic, verified core**
@@ -176,7 +278,14 @@ cargo build --release -p queso-net --bin queso-bench
 alternative through one harness, and includes the headline experiment: with the
 fast-path leader isolated mid-run, Queso's majority keeps deciding (no election
 stall) where a single-leader protocol would pause. See
-[`docs/compare-etcd.md`](docs/compare-etcd.md) for methodology and results.
+[`docs/compare-etcd.md`](docs/compare-etcd.md) for methodology and results, and
+[How QuePaxa compares to Paxos, Raft, and etcd](#how-quepaxa-compares-to-paxos-raft-and-etcd)
+for what the experiment is actually arguing.
+
+```sh
+# The headline leader-DoS experiment -- self-contained, no external etcd needed.
+cargo test -p queso-compare --test leader_dos -- --nocapture
+```
 
 ## Deployment
 
