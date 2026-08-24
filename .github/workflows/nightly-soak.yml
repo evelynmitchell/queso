@@ -1,0 +1,158 @@
+# The long soak, on a timer.
+#
+# `ci.yml`'s `soak` job runs the *bounded* variant on every commit: one
+# seed, twenty seconds. That is sized to be a commit gate. This workflow is
+# the other half of what issue #56 asked for -- the documented long mode,
+# actually running, rather than a command in a README that nobody types.
+#
+# Two things it does that the commit gate cannot afford:
+#
+#   * **Many seeds.** One seed is one fault sequence. The schedule
+#     generator produces overlapping faults about a third of the time, so
+#     different seeds are genuinely different adversaries -- at n=5, 57 of
+#     64 seeds reach two concurrent node faults, against none at n=3.
+#   * **Long runs.** Some failures need accumulated state to surface, which
+#     twenty seconds never reaches. This repo has no log compaction, so
+#     on-disk state grows for as long as a run lasts.
+#
+# See `crates/soak/README.md` for what the soak checks and why its
+# anti-vacuity floors matter.
+name: Nightly soak
+
+on:
+  schedule:
+    # 07:00 UTC daily. Deliberately not on push or pull_request: this is
+    # tens of minutes of real-process turbulence, and a commit gate that
+    # slow would just get ignored.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Seeds per replica count"
+        required: false
+        default: "8"
+      duration_secs:
+        description: "Seconds of turbulence per seed"
+        required: false
+        default: "180"
+      first_seed:
+        description: >-
+          First seed. Leave empty to advance automatically (see the
+          seed-window step). Set it to re-run a night that failed.
+        required: false
+        default: ""
+
+# A manual dispatch while a scheduled run is still going would otherwise
+# put two soaks on the same runner pool competing for CPU -- which is
+# exactly the contention that makes cluster boot flaky.
+concurrency:
+  group: nightly-soak
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    name: long soak (n=${{ matrix.replicas }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    strategy:
+      # n=5 is worth running even when n=3 has already failed: it is the
+      # first size where two nodes may be faulted at once, so it exercises
+      # the driver's overlapping-fault handling that n=3 never reaches.
+      fail-fast: false
+      matrix:
+        replicas: [3, 5]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Release, unlike `ci.yml`'s debug build: a long soak should spend its
+      # wall clock on turbulence, not on debug-build slowness, and release
+      # is what `crates/soak/README.md` documents for this mode. `--all`
+      # because `queso-soak` spawns the `queso-node` binary, which its own
+      # package does not build.
+      - name: cargo build --release
+        run: cargo build --release --all
+
+      # A nightly that runs the same seeds every night re-tests one fixed
+      # set of fault sequences forever, and would look healthy while
+      # covering nothing new. `run_number` is monotonic per workflow, so
+      # each night takes a fresh, disjoint window -- and because the window
+      # is printed and the seeds are in the log, a failing night is still
+      # re-runnable: dispatch with `first_seed` set to what failed.
+      - name: Choose this run's seed window
+        id: window
+        shell: bash
+        run: |
+          seeds="${{ inputs.seeds || '8' }}"
+          explicit="${{ inputs.first_seed }}"
+          if [ -n "$explicit" ]; then
+            first="$explicit"
+          else
+            first=$(( ${{ github.run_number }} * seeds ))
+          fi
+          echo "first_seed=$first" >> "$GITHUB_OUTPUT"
+          echo "seeds=$seeds" >> "$GITHUB_OUTPUT"
+          echo "Seeds $first..$(( first + seeds - 1 )), n=${{ matrix.replicas }}" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # `shell: bash` (not the default) specifically for `pipefail`: without
+      # it the `tee` would swallow a non-zero exit and a failing soak would
+      # report success. `--keep-going` so one night reports *how many* seeds
+      # broke rather than stopping at the first -- more information per run,
+      # and the run is expensive.
+      - name: Long soak
+        id: soak
+        shell: bash
+        env:
+          QUESO_NODE_BIN: ${{ github.workspace }}/target/release/queso-node
+        run: |
+          ./target/release/queso-soak \
+            --seeds "${{ steps.window.outputs.seeds }}" \
+            --first-seed "${{ steps.window.outputs.first_seed }}" \
+            --duration-secs "${{ inputs.duration_secs || '180' }}" \
+            --replicas "${{ matrix.replicas }}" \
+            --keep-going \
+            2>&1 | tee "soak-n${{ matrix.replicas }}.log"
+
+      # The log carries the rendered fault schedule and the observer report
+      # for every failing seed -- which is the whole reproduction story, and
+      # is lost when a run's logs age out.
+      - name: Upload soak log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-log-n${{ matrix.replicas }}-run${{ github.run_number }}
+          path: soak-n${{ matrix.replicas }}.log
+          retention-days: 30
+
+      - name: Record the outcome
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.soak.outcome }}" = "success" ]; then
+            echo "n=${{ matrix.replicas }}: clean and non-vacuous" >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "n=${{ matrix.replicas }}: **FAILED** — see the uploaded log."
+              echo ""
+              echo 'Re-run this exact window:'
+              echo '```'
+              echo "gh workflow run nightly-soak.yml \\"
+              echo "  -f first_seed=${{ steps.window.outputs.first_seed }} \\"
+              echo "  -f seeds=${{ steps.window.outputs.seeds }} \\"
+              echo "  -f duration_secs=${{ inputs.duration_secs || '180' }}"
+              echo '```'
+              echo ""
+              echo 'The seed reproduces the *turbulence*, not the failure —'
+              echo 'real threads, real timers and real TCP make the interleaving'
+              echo 'irreproducible. It narrows the search; it does not replay it.'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
