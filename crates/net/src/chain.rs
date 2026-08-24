@@ -53,7 +53,6 @@
 //! lands, this refold needs a snapshot base to start from.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use queso_chain::ChainState;
@@ -72,41 +71,81 @@ pub const CHECKPOINT_RING_CAPACITY: usize = 256;
 /// # Concurrency
 ///
 /// `crate::status::StatusShared` is otherwise deliberately all atomics --
-/// see its docs for why "latest known status" wants no locks. A checkpoint
-/// *table* cannot be an atomic, so this holds one `Mutex`. That is an
-/// acceptable exception rather than a slip: the driver takes the lock only
-/// when a checkpoint is actually crossed (once per `every` applied
-/// commands, not once per event), the handler task takes it once per
-/// request, and the critical section is a `push_back` on a bounded deque.
-/// The frontier state stays lock-free so the common read path -- "where is
-/// this replica now" -- never contends with the driver at all.
+/// see its docs for why "latest known status" wants no locks. This type is
+/// the exception, and **everything it publishes lives under one `Mutex`**:
+/// the frontier, the checkpoint table, and the truncation flag together.
+///
+/// An earlier version kept the frontier lock-free, as two `AtomicU64`s, on
+/// the reasoning that "where is this replica now" should never contend with
+/// the driver. That reasoning was wrong, and issue #73 is what it cost.
+/// `(n, h)` is a *pair*: a hash is only meaningful attached to the height
+/// it was computed at. Two independent stores mean a reader on the status
+/// task can land between them and observe a hash from one chain position
+/// wearing another position's height -- which is, to the Chain-of-Blocks
+/// observer, indistinguishable from a genuine safety violation. The
+/// nightly soak duly reported one. `a_concurrent_reader_never_observes_a_
+/// torn_frontier` finds the tear within a few dozen writes when the two
+/// atomics are restored, so this was never a narrow window.
+///
+/// Reading under the lock also makes a `/chain` response one instant's
+/// view rather than two. Previously `to_json` took the frontier lock-free
+/// and the table under the lock, so a response could pair a frontier from
+/// one fold pass with a table from the next.
+///
+/// What that does *not* buy, and must not be assumed: the frontier is not
+/// guaranteed to be at least the newest checkpoint. [`ChainFolder::fold`]
+/// records crossings as it walks the batch and publishes the frontier only
+/// at the end, so a reader mid-pass legitimately sees a table entry beyond
+/// the frontier. That is harmless -- every `(n, h)` is still a pair that
+/// was really computed together, which is the only property the observer
+/// needs -- and closing it would mean holding the lock across a whole fold.
+///
+/// The cost is nil in practice: the driver takes the lock once per fold
+/// pass, the handler once per request, and the critical section is a
+/// `push_back` on a bounded deque.
 #[derive(Debug)]
 pub struct ChainCheckpoints {
     /// Checkpoint spacing in slots. See the module docs: cluster-wide.
+    /// Immutable after construction, so it needs no synchronization.
     every: u64,
+    /// Everything a reader can observe, behind one lock so it is always
+    /// observed as a consistent whole.
+    published: Mutex<Published>,
+}
+
+/// The mutable half of [`ChainCheckpoints`]. Never handed out by
+/// reference -- callers get copies taken under the lock.
+#[derive(Debug)]
+struct Published {
     /// The replica's current chain position, updated on every fold.
-    frontier_n: AtomicU64,
-    /// The hash at `frontier_n`.
-    frontier_h: AtomicU64,
+    frontier: ChainState,
     /// `(n, h)` for each crossed checkpoint, oldest first.
-    table: Mutex<VecDeque<(u64, u64)>>,
+    table: VecDeque<(u64, u64)>,
     /// Whether any checkpoint has been dropped to stay within
     /// [`CHECKPOINT_RING_CAPACITY`].
-    truncated: AtomicBool,
+    truncated: bool,
 }
 
 impl ChainCheckpoints {
     /// A fresh, empty checkpoint table with the given spacing. A spacing of
     /// `0` is treated as `1` (every slot is a checkpoint).
     pub fn new(every: u64) -> Self {
-        let genesis = ChainState::genesis();
         Self {
             every: every.max(1),
-            frontier_n: AtomicU64::new(genesis.n),
-            frontier_h: AtomicU64::new(genesis.h),
-            table: Mutex::new(VecDeque::new()),
-            truncated: AtomicBool::new(false),
+            published: Mutex::new(Published {
+                frontier: ChainState::genesis(),
+                table: VecDeque::new(),
+                truncated: false,
+            }),
         }
+    }
+
+    /// The published state, under the lock. A poisoned lock is recovered
+    /// rather than propagated: this is observability, and a panic in one
+    /// handler task must not take the endpoint down for every later
+    /// request.
+    fn published(&self) -> std::sync::MutexGuard<'_, Published> {
+        self.published.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// This node's checkpoint spacing, so a harness can verify every replica
@@ -117,35 +156,48 @@ impl ChainCheckpoints {
 
     /// Record a crossed checkpoint, evicting the oldest if the ring is full.
     fn record(&self, n: u64, h: u64) {
-        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
-        if table.len() == CHECKPOINT_RING_CAPACITY {
-            table.pop_front();
-            self.truncated.store(true, Ordering::Relaxed);
+        let mut published = self.published();
+        if published.table.len() == CHECKPOINT_RING_CAPACITY {
+            published.table.pop_front();
+            published.truncated = true;
         }
-        table.push_back((n, h));
+        published.table.push_back((n, h));
     }
 
     /// Publish the replica's current chain position.
+    ///
+    /// One store of the whole pair, not one per field -- see this type's
+    /// "Concurrency" docs and issue #73.
     fn set_frontier(&self, state: ChainState) {
-        self.frontier_n.store(state.n, Ordering::Relaxed);
-        self.frontier_h.store(state.h, Ordering::Relaxed);
+        self.published().frontier = state;
     }
 
     /// The replica's current chain position.
     pub fn frontier(&self) -> ChainState {
-        ChainState {
-            n: self.frontier_n.load(Ordering::Relaxed),
-            h: self.frontier_h.load(Ordering::Relaxed),
-        }
+        self.published().frontier
     }
 
     /// Every retained checkpoint, oldest first, plus whether any older ones
     /// were dropped.
     pub fn checkpoints(&self) -> (Vec<(u64, u64)>, bool) {
-        let table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        let published = self.published();
         (
-            table.iter().copied().collect(),
-            self.truncated.load(Ordering::Relaxed),
+            published.table.iter().copied().collect(),
+            published.truncated,
+        )
+    }
+
+    /// The frontier and the checkpoint table as they stood at one instant.
+    ///
+    /// Separate `frontier()` + `checkpoints()` calls take the lock twice
+    /// and can straddle a fold, pairing one pass's frontier with the next
+    /// pass's table. Callers serving a single response want this instead.
+    fn snapshot(&self) -> (ChainState, Vec<(u64, u64)>, bool) {
+        let published = self.published();
+        (
+            published.frontier,
+            published.table.iter().copied().collect(),
+            published.truncated,
         )
     }
 
@@ -156,8 +208,7 @@ impl ChainCheckpoints {
     /// IEEE doubles. The harness is Rust and would be fine either way, but
     /// an endpoint that silently rounds for `curl | jq` users is a trap.
     pub fn to_json(&self) -> String {
-        let frontier = self.frontier();
-        let (checkpoints, truncated) = self.checkpoints();
+        let (frontier, checkpoints, truncated) = self.snapshot();
 
         let mut out = String::from("{\n");
         out.push_str(&format!("  \"checkpoint_every\": {},\n", self.every));
@@ -295,6 +346,63 @@ mod tests {
             }
         }
         sink.set_frontier(folder.state);
+    }
+
+    /// Every `(n, h)` a reader observes must be a pair that was actually
+    /// published. `/chain` is served from the status task while the driver
+    /// task folds, so this is a genuine concurrent read, not a theoretical
+    /// one.
+    ///
+    /// Writes maintain the invariant `h == n * STRIDE`, so any observed
+    /// pair violating it is torn: a hash from one chain position wearing
+    /// another position's height. That is indistinguishable, to the
+    /// Chain-of-Blocks observer, from a real divergence.
+    ///
+    /// Falsifier: with the frontier held as two independent atomics this
+    /// fails within a fraction of a second.
+    #[test]
+    fn a_concurrent_reader_never_observes_a_torn_frontier() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
+        const WRITES: u64 = 2_000_000;
+
+        let chain = Arc::new(ChainCheckpoints::new(1));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let writer = {
+            let chain = Arc::clone(&chain);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                for n in 1..=WRITES {
+                    chain.set_frontier(ChainState {
+                        n,
+                        h: n.wrapping_mul(STRIDE),
+                    });
+                }
+                done.store(true, Ordering::Relaxed);
+            })
+        };
+
+        let mut torn: Option<ChainState> = None;
+        while !done.load(Ordering::Relaxed) && torn.is_none() {
+            let seen = chain.frontier();
+            if seen.n != 0 && seen.h != seen.n.wrapping_mul(STRIDE) {
+                torn = Some(seen);
+            }
+        }
+        writer.join().expect("writer thread");
+
+        assert!(
+            torn.is_none(),
+            "observed a torn frontier: n={} carried h={:#018x}, but the pair \
+             published at that n was h={:#018x}. A reader must never see a \
+             hash from one chain position labelled with another's height.",
+            torn.unwrap().n,
+            torn.unwrap().h,
+            torn.unwrap().n.wrapping_mul(STRIDE),
+        );
     }
 
     #[test]
