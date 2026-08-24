@@ -274,8 +274,19 @@ node binary, real durability, a client API — is **done**. What remains:
 - **Batching / pipelining** — one decision in flight per replica; group-commit batches
   fsyncs, not proposals.
 - **Flow control / backpressure** — unaddressed.
-- **Bounded concurrent connections on the status port** (#50) — low severity; the port is
-  opt-in and documented as internal-only.
+- ~~**Bounded concurrent connections on the status port** (#50)~~ — closed: the status
+  server's two per-connection bounds (8 KiB read cap, 5s request timeout) were never
+  joined by a bound on the *number* of connections, so a flood of idle connections could
+  pressure the file-descriptor limit shared with the peer and client listeners — an
+  opt-in observability endpoint able to take consensus down with it.
+  `MAX_STATUS_CONNECTIONS` (128) now caps in-flight connections, with the permit taken
+  *before* `accept` rather than after: shedding post-accept would still spend a
+  descriptor per connection, which is the resource being protected. Two tests, both
+  mutation-verified and each with its own falsifier — a no-op cap and a permit dropped
+  at spawn time (bounding spawns, not connections) fail the in-flight test; a permit
+  never released fails the sequential-requests test. Saturation is observed through
+  `available_permits()` rather than slept for, so the "not served while saturated"
+  assertion can't pass just because the accept loop lagged.
 - Smaller robustness items: ~~DNS-retry backoff and IPv6 family preference (#42)~~ —
   closed: `spawn_peer_dialer` re-resolves on every dial attempt and used to sleep a flat
   200ms on resolution failure too, so a hostname that will never resolve (an operator

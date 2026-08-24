@@ -227,6 +227,18 @@ slow-loris-style request gets a bounded-size, bounded-time read and a `400`
 or a dropped connection, never a panic. See `cargo test -p queso-net --test
 status` (below) for the acceptance test against a real cluster.
 
+Three bounds keep this endpoint from costing the replica anything it can't
+afford. Two are per connection -- an 8 KiB read cap and a 5s request
+timeout. The third bounds *how many connections there can be*:
+`MAX_STATUS_CONNECTIONS` (128) in-flight at a time, enforced by taking a
+semaphore permit **before** accepting rather than after (issue #50). That
+ordering is the point: shedding after accept would still spend a file
+descriptor on every connection in a flood, and those descriptors come from
+the same per-process limit the peer and client listeners draw on -- so an
+unbounded status port could take consensus down with it. Over the limit, a
+connection simply waits in the kernel backlog until a permit frees, which
+is bounded by the same 5s timeout.
+
 ## Phase 9.2: `GET /chain` — conformance observability (issue #56)
 
 Pass `--chain-checkpoints <N>` (alongside `--status-listen`) to make this
