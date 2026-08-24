@@ -245,8 +245,10 @@ runbook in `docs/deploy-flyio.md`. (Actual multi-region deploys need the owner's
   rolling back a directory entry after `rename` returned success remains argued from
   POSIX semantics, as does a lying disk that acknowledges an fsync it never made
   durable.
-- DST runs are per-PR bounded — no nightly soak, and no trace *shrinking* (deferred
-  since Phase 0).
+- DST runs are per-PR bounded, and no trace *shrinking* (deferred since Phase 0). The
+  nightly soak that now exists (`.github/workflows/nightly-soak.yml`) is the
+  *real-process* soak, not a DST one — it exercises real sockets and real process
+  kills, which is a different layer from a large-seed in-simulation corpus.
 
 ---
 
@@ -356,9 +358,14 @@ no schedule.
   concrete nightly).
 - **No nightly DST soak** — the testing plan calls for per-PR bounded + nightly
   large-seed corpus + minimized-seed regression capture. Only the bounded portion exists.
-- ~~**No long-running real-cluster fault soak**~~ — landed with 9.2 slice 3: a bounded
-  20s soak in its own CI job, plus the `queso-soak` binary for the long mode. What is
-  still missing is a **nightly** invocation of that long mode; nothing schedules it.
+- ~~**No long-running real-cluster fault soak**~~ — landed with 9.2 slice 3 (bounded 20s
+  soak in its own CI job, plus the `queso-soak` binary for the long mode) and now
+  scheduled: `.github/workflows/nightly-soak.yml` runs the long mode at 07:00 UTC daily,
+  across n=3 and n=5, 8 seeds x 180s each. Seeds advance with the run number rather than
+  repeating, so a nightly that stays green is covering new fault sequences instead of
+  re-testing one fixed set; `workflow_dispatch` with `first_seed` re-runs a window that
+  failed. Still missing: automatic *shrinking* of a failing schedule, and deterministic
+  replay (see #54).
 - **No coverage reporting**, no MSRV/toolchain matrix.
 - **No supply-chain checks** — `cargo audit`/`cargo deny` for advisories & licenses.
 - **No benchmark regression tracking** — `queso-bench` and `crates/compare` produce
@@ -382,10 +389,10 @@ no schedule.
 2. ~~**Phase 9.2 — real-binary-under-fault soak (#56).**~~ All three slices merged:
    the node-side hook (`GET /chain`), the real-process harness plus socket-level nemesis,
    and the sustained seeded soak with its bounded CI variant and long mode
-   (`crates/soak`). Follow-on work, in rough order of value: schedule the long soak
-   nightly (nothing runs it on a timer today); shrink a failing schedule automatically
-   rather than by hand; and, for #54 proper, deterministic replay of a real execution —
-   the one thing that would let a soak failure be debugged the way a DST failure is.
+   (`crates/soak`), now scheduled nightly. Follow-on work, in rough order of value:
+   shrink a failing schedule automatically rather than by hand; and, for #54 proper,
+   deterministic replay of a real execution — the one thing that would let a soak
+   failure be debugged the way a DST failure is.
 3. ~~**Durability fault-injection coverage (#39).**~~ Closed: the `DiskFault` injection
    seam plus `tests/durability_faults.rs`. Every test there was verified by mutation —
    disabling the boot-time reload fails three of the four, and swallowing the persist

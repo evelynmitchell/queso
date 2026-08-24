@@ -125,7 +125,12 @@ cargo run --release -p queso-soak --bin queso-soak -- --seeds 20 --duration-secs
 The `queso-soak` binary is the long mode proper: it runs a seed range, prints
 each schedule and report, and exits non-zero if any seed found a violation
 **or produced a vacuous run** — so it works as a nightly job as readily as a
-manual hunt. `--keep-going` reports how many seeds failed rather than
+manual hunt. It *is* one: `.github/workflows/nightly-soak.yml` runs it at
+07:00 UTC daily over n=3 and n=5, 8 seeds x 180s each, uploading the log as
+an artifact on failure. The seed window advances with the run number rather
+than repeating, so a green nightly means new fault sequences came back clean
+rather than one fixed set being re-tested forever; dispatch the workflow with
+`first_seed` to re-run a window that failed. `--keep-going` reports how many seeds failed rather than
 stopping at the first. `--replicas 5` is worth a run of its own; `f = 2` is
 the first size where two nodes may be faulted at once.
 
