@@ -40,7 +40,7 @@
 //! acknowledged, did not push traffic through the proxies, or did not
 //! actually inject its schedule.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use queso_conformance::observer::{Divergence, Observer, Stall};
@@ -307,15 +307,7 @@ impl SoakReport {
     /// reached, so a run cut short by a divergence is judged against the
     /// turbulence it actually saw.
     fn injections_expected(&self) -> Injections {
-        let mut expected = Injections::default();
-        for scheduled in self.schedule.faults().iter().take(self.windows_entered) {
-            match scheduled.fault {
-                Fault::Isolate { .. } | Fault::CutLink { .. } => expected.cuts += 1,
-                Fault::Crash { .. } => expected.kills += 1,
-                Fault::Latency { .. } => expected.latency_changes += 1,
-            }
-        }
-        expected
+        injections_expected(&self.schedule, self.windows_entered)
     }
 
     /// A one-screen summary, for a soak binary's stdout.
@@ -543,6 +535,60 @@ impl Soak {
     }
 }
 
+/// What the first `windows_entered` windows of `schedule` actually ask the
+/// fault injector to *do*, by kind -- the expectation
+/// [`Injections::covers`] is checked against.
+///
+/// # Why crash windows are merged (found by the first nightly soak)
+///
+/// Cuts and latency changes are counted per window, but crashes are not,
+/// because a crash is a *state transition* and the other two are not.
+/// [`Injected::reconcile`] kills a node on the `false -> true` edge of the
+/// desired crashed-set (`to.crashed.difference(&from.crashed)`), so two
+/// overlapping `Crash` windows for the same node produce exactly one
+/// `kill()` -- correctly, since a process cannot be killed twice while it
+/// is still dead. Counting one expected kill per window therefore accused
+/// a perfectly healthy run of being vacuous.
+///
+/// That is not hypothetical. The nightly soak's first run reported seed 14
+/// as `VACUOUS: scheduled kills: 14, injected kills: 13`, on a schedule
+/// containing `Crash { node: 0 }` over `168880..171117ms` and again over
+/// `170502..172247ms` -- overlapping, so one kill. Every seed in that run
+/// had verdict `0 divergence(s), 0 stall(s)`. It took a 180s schedule with
+/// 63 windows to make an overlap likely; the 20s bounded soak in CI has
+/// seven or eight windows and had never produced one.
+///
+/// Merging does not weaken the check. A schedule whose crash windows do
+/// *not* overlap still expects one kill each, and a genuinely missed kill
+/// still leaves `injected` short of `expected`. What changes is only that
+/// the expectation is now something the injector can physically deliver.
+///
+/// Assumes windows are in non-decreasing `start_ms` order, which
+/// [`Schedule::generate`] guarantees.
+fn injections_expected(schedule: &Schedule, windows_entered: usize) -> Injections {
+    let mut expected = Injections::default();
+    // Per node, the end of the crash window group currently open for it.
+    let mut open_crash: BTreeMap<usize, u64> = BTreeMap::new();
+    for scheduled in schedule.faults().iter().take(windows_entered) {
+        match scheduled.fault {
+            Fault::Isolate { .. } | Fault::CutLink { .. } => expected.cuts += 1,
+            Fault::Latency { .. } => expected.latency_changes += 1,
+            Fault::Crash { node } => match open_crash.get_mut(&node) {
+                // Still down from an earlier window: no new kill edge.
+                Some(open_until) if *open_until > scheduled.start_ms => {
+                    *open_until = (*open_until).max(scheduled.end_ms);
+                }
+                // Back up (or never down) by the time this window opens.
+                _ => {
+                    expected.kills += 1;
+                    open_crash.insert(node, scheduled.end_ms);
+                }
+            },
+        }
+    }
+    expected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +596,96 @@ mod tests {
 
     fn schedule_of(faults: Vec<ScheduledFault>) -> Schedule {
         Schedule::with_faults(0, ScheduleConfig::default(), faults)
+    }
+
+    fn crash(node: usize, start_ms: u64, end_ms: u64) -> ScheduledFault {
+        ScheduledFault {
+            start_ms,
+            end_ms,
+            fault: Fault::Crash { node },
+        }
+    }
+
+    /// The bug the nightly soak's first run found, reproduced from the
+    /// schedule that found it: seed 14 scheduled `Crash { node: 0 }` over
+    /// `168880..171117ms` and again over `170502..172247ms`. Those overlap,
+    /// so `reconcile` sees one `false -> true` edge on node 0 and performs
+    /// one `kill()` -- correctly. Counting one expected kill per *window*
+    /// made a run whose verdict was `0 divergence(s), 0 stall(s)` fail as
+    /// VACUOUS.
+    ///
+    /// Falsifier: count `Fault::Crash` per window (the pre-fix behavior)
+    /// and this expects 2.
+    #[test]
+    fn overlapping_crash_windows_for_one_node_expect_a_single_kill() {
+        let schedule = schedule_of(vec![crash(0, 168_880, 171_117), crash(0, 170_502, 172_247)]);
+        assert_eq!(injections_expected(&schedule, 2).kills, 1);
+    }
+
+    /// The other side of the same edge: windows that do *not* overlap each
+    /// imply their own kill, because the node is restarted in between. A
+    /// fix that merged unconditionally -- say, one kill per node -- would
+    /// pass the test above and fail this one.
+    ///
+    /// The gap here is the real one from seed 14: the second window ends at
+    /// `172247ms` and the third opens at `173074ms`.
+    #[test]
+    fn separated_crash_windows_for_one_node_expect_a_kill_each() {
+        let schedule = schedule_of(vec![
+            crash(0, 168_880, 171_117),
+            crash(0, 170_502, 172_247),
+            crash(0, 173_074, 175_984),
+        ]);
+        assert_eq!(
+            injections_expected(&schedule, 3).kills,
+            2,
+            "the first two windows overlap into one kill; the third is separate"
+        );
+    }
+
+    /// Merging is per node. Two nodes crashed over the same interval are
+    /// two kills, not one -- otherwise a five-replica schedule faulting
+    /// `f = 2` nodes at once would under-expect by half.
+    #[test]
+    fn overlapping_crash_windows_for_different_nodes_expect_a_kill_each() {
+        let schedule = schedule_of(vec![crash(0, 1_000, 3_000), crash(1, 2_000, 4_000)]);
+        assert_eq!(injections_expected(&schedule, 2).kills, 2);
+    }
+
+    /// The check must still catch what it exists to catch. A schedule with
+    /// separated crash windows expects a kill for each, so an injector that
+    /// silently performed fewer is still reported -- merging narrowed the
+    /// expectation to what is physically deliverable, it did not blunt it.
+    #[test]
+    fn a_genuinely_missed_kill_is_still_not_covered() {
+        let schedule = schedule_of(vec![crash(0, 1_000, 2_000), crash(0, 5_000, 6_000)]);
+        let expected = injections_expected(&schedule, 2);
+        assert_eq!(expected.kills, 2, "test premise: two separate windows");
+
+        let injected = Injections {
+            cuts: 0,
+            kills: 1,
+            latency_changes: 0,
+        };
+        assert!(
+            !injected.covers(&expected),
+            "one kill delivered against two expected must still read as vacuous"
+        );
+    }
+
+    /// Only the traversed prefix counts, and the merge respects it: a run
+    /// cut short before the second window opened expects one kill either
+    /// way, but must not carry the un-traversed window's end into the
+    /// merge state.
+    #[test]
+    fn untraversed_windows_are_not_expected() {
+        let schedule = schedule_of(vec![
+            crash(0, 1_000, 2_000),
+            crash(0, 5_000, 6_000),
+            crash(1, 5_500, 6_500),
+        ]);
+        assert_eq!(injections_expected(&schedule, 1).kills, 1);
+        assert_eq!(injections_expected(&schedule, 3).kills, 3);
     }
 
     #[test]

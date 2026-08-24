@@ -364,8 +364,15 @@ no schedule.
   across n=3 and n=5, 8 seeds x 180s each. Seeds advance with the run number rather than
   repeating, so a nightly that stays green is covering new fault sequences instead of
   re-testing one fixed set; `workflow_dispatch` with `first_seed` re-runs a window that
-  failed. Still missing: automatic *shrinking* of a failing schedule, and deterministic
-  replay (see #54).
+  failed. **Its first run earned its keep**: seeds 8/13/14 at n=3 and seed 8 at n=5 came
+  back `VACUOUS: scheduled kills 14, injected kills 13` on runs whose verdict was
+  `0 divergence(s), 0 stall(s)`. Not a Queso bug — the anti-vacuity accounting counted one
+  expected kill per scheduled `Crash` window, while `reconcile` kills on the crashed-set
+  transition, so two overlapping windows for one node correctly produce one `kill()`. Only
+  a 180s schedule with 60+ windows makes an overlap likely; CI's 20s bounded soak has
+  seven or eight and had never produced one. Fixed by merging overlapping same-node crash
+  windows when building the expectation. Still missing: automatic *shrinking* of a failing
+  schedule, and deterministic replay (see #54).
 - **No coverage reporting**, no MSRV/toolchain matrix.
 - **No supply-chain checks** — `cargo audit`/`cargo deny` for advisories & licenses.
 - **No benchmark regression tracking** — `queso-bench` and `crates/compare` produce
