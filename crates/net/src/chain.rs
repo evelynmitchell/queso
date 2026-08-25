@@ -119,8 +119,13 @@ pub struct ChainCheckpoints {
 struct Published {
     /// The replica's current chain position, updated on every fold.
     frontier: ChainState,
-    /// `(n, h)` for each crossed checkpoint, oldest first.
-    table: VecDeque<(u64, u64)>,
+    /// Each crossed checkpoint, oldest first.
+    ///
+    /// `ChainState`, not `(u64, u64)`: a height and a hash are meaningless
+    /// apart, so they travel as one value that cannot be taken apart and
+    /// reassembled wrongly. See this type's "Concurrency" docs -- the same
+    /// principle the frontier learned the hard way in #73.
+    table: VecDeque<ChainState>,
     /// Whether any checkpoint has been dropped to stay within
     /// [`CHECKPOINT_RING_CAPACITY`].
     truncated: bool,
@@ -155,13 +160,17 @@ impl ChainCheckpoints {
     }
 
     /// Record a crossed checkpoint, evicting the oldest if the ring is full.
-    fn record(&self, n: u64, h: u64) {
+    ///
+    /// Takes the state as one value rather than a loose `n` and `h`, so a
+    /// caller cannot pass a height from one position and a hash from
+    /// another.
+    fn record(&self, state: ChainState) {
         let mut published = self.published();
         if published.table.len() == CHECKPOINT_RING_CAPACITY {
             published.table.pop_front();
             published.truncated = true;
         }
-        published.table.push_back((n, h));
+        published.table.push_back(state);
     }
 
     /// Publish the replica's current chain position.
@@ -179,7 +188,7 @@ impl ChainCheckpoints {
 
     /// Every retained checkpoint, oldest first, plus whether any older ones
     /// were dropped.
-    pub fn checkpoints(&self) -> (Vec<(u64, u64)>, bool) {
+    pub fn checkpoints(&self) -> (Vec<ChainState>, bool) {
         let published = self.published();
         (
             published.table.iter().copied().collect(),
@@ -192,7 +201,7 @@ impl ChainCheckpoints {
     /// Separate `frontier()` + `checkpoints()` calls take the lock twice
     /// and can straddle a fold, pairing one pass's frontier with the next
     /// pass's table. Callers serving a single response want this instead.
-    fn snapshot(&self) -> (ChainState, Vec<(u64, u64)>, bool) {
+    fn snapshot(&self) -> (ChainState, Vec<ChainState>, bool) {
         let published = self.published();
         (
             published.frontier,
@@ -218,9 +227,12 @@ impl ChainCheckpoints {
         ));
         out.push_str(&format!("  \"truncated\": {truncated},\n"));
         out.push_str("  \"checkpoints\": [");
-        for (i, (n, h)) in checkpoints.iter().enumerate() {
+        for (i, checkpoint) in checkpoints.iter().enumerate() {
             out.push_str(if i == 0 { "\n" } else { ",\n" });
-            out.push_str(&format!("    {{ \"n\": {n}, \"h\": \"{h:#018x}\" }}"));
+            out.push_str(&format!(
+                "    {{ \"n\": {}, \"h\": \"{:#018x}\" }}",
+                checkpoint.n, checkpoint.h
+            ));
         }
         if !checkpoints.is_empty() {
             out.push('\n');
@@ -246,8 +258,9 @@ impl ChainCheckpoints {
 pub struct ChainReport {
     /// The replica's furthest `(n, h)`, reported every poll.
     pub frontier: ChainState,
-    /// Retained checkpoints, oldest first.
-    pub checkpoints: Vec<(u64, u64)>,
+    /// Retained checkpoints, oldest first. Each is one `ChainState`, not a
+    /// loose height and hash -- see [`ChainCheckpoints::table`].
+    pub checkpoints: Vec<ChainState>,
 }
 
 /// Hashes travel as hex strings so a 64-bit value survives any JSON reader
@@ -269,7 +282,16 @@ pub fn parse_chain(body: &str) -> Option<ChainReport> {
     let checkpoints = json["checkpoints"]
         .as_array()?
         .iter()
-        .filter_map(|entry| Some((entry["n"].as_u64()?, parse_hash(&entry["h"])?)))
+        .filter_map(|entry| {
+            // Both halves come from the same JSON object, and the only
+            // thing this can build is a whole `ChainState` -- there is no
+            // intermediate at which an `n` and an `h` from different
+            // entries could meet.
+            Some(ChainState {
+                n: entry["n"].as_u64()?,
+                h: parse_hash(&entry["h"])?,
+            })
+        })
         .collect();
     Some(ChainReport {
         frontier,
@@ -315,7 +337,7 @@ impl ChainFolder {
         for command in node.applied_from(self.state.n) {
             self.state.apply(&command);
             if self.state.n.is_multiple_of(self.every) {
-                sink.record(self.state.n, self.state.h);
+                sink.record(self.state);
             }
         }
         sink.set_frontier(self.state);
@@ -342,7 +364,7 @@ mod tests {
         for command in commands {
             folder.state.apply(command);
             if folder.state.n.is_multiple_of(folder.every) {
-                sink.record(folder.state.n, folder.state.h);
+                sink.record(folder.state);
             }
         }
         sink.set_frontier(folder.state);
@@ -414,7 +436,7 @@ mod tests {
 
         let (checkpoints, truncated) = sink.checkpoints();
         assert_eq!(
-            checkpoints.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            checkpoints.iter().map(|c| c.n).collect::<Vec<_>>(),
             vec![4, 8],
             "only multiples of the spacing may be published"
         );
@@ -431,11 +453,11 @@ mod tests {
 
         // Ground truth: fold the same prefix independently.
         let (checkpoints, _) = sink.checkpoints();
-        for (n, h) in checkpoints {
-            let expected = ChainState::from_log(&commands[..n as usize]);
+        for checkpoint in checkpoints {
+            let n = checkpoint.n;
             assert_eq!(
-                (n, h),
-                (expected.n, expected.h),
+                checkpoint,
+                ChainState::from_log(&commands[..n as usize]),
                 "checkpoint at n={n} must equal the chain over the first {n} commands"
             );
         }
@@ -454,7 +476,7 @@ mod tests {
         assert_eq!(checkpoints.len(), CHECKPOINT_RING_CAPACITY);
         assert!(truncated, "dropping history must be disclosed, not silent");
         assert_eq!(
-            checkpoints.last().map(|(n, _)| *n),
+            checkpoints.last().map(|c| c.n),
             Some(CHECKPOINT_RING_CAPACITY as u64 + 10),
             "the newest checkpoint is always retained"
         );
@@ -505,7 +527,7 @@ mod tests {
             "the retained checkpoints must survive the round trip"
         );
         assert!(
-            report.checkpoints.iter().any(|(_, h)| *h != 0),
+            report.checkpoints.iter().any(|c| c.h != 0),
             "a round trip of all-zero hashes would prove nothing about the hex encoding"
         );
     }

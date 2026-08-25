@@ -330,22 +330,25 @@ pub fn samples_from_chain(
     replica: NodeId,
     observed_at: u64,
     frontier: ChainState,
-    checkpoints: &[(u64, u64)],
+    checkpoints: &[ChainState],
     emitted_through: &mut u64,
 ) -> Vec<Sample> {
     let mut samples = Vec::with_capacity(checkpoints.len() + 1);
-    for &(n, h) in checkpoints {
-        if n > *emitted_through {
+    for &checkpoint in checkpoints {
+        if checkpoint.n > *emitted_through {
             samples.push(Sample {
                 replica,
                 observed_at,
-                state: ChainState { n, h },
+                // Moved whole. This function never assembles a state from
+                // a separate height and hash, so it cannot pair one
+                // replica's `n` with another position's `h` (#73).
+                state: checkpoint,
                 // A cross-process source sees hashes, never the commands
                 // behind them, so the observer's per-transition log stays
                 // empty here. Documented rather than faked.
                 command_digest: None,
             });
-            *emitted_through = n;
+            *emitted_through = checkpoint.n;
         }
     }
     samples.push(Sample {
@@ -371,6 +374,12 @@ mod tests {
         )
     }
 
+    /// A checkpoint, built the only way one can be: both halves named
+    /// together at the point of construction.
+    fn cp(n: u64, h: u64) -> ChainState {
+        ChainState { n, h }
+    }
+
     fn put(client: u32, key: u32, value: i64) -> Command {
         Command::Put {
             client: ClientId(client),
@@ -387,7 +396,7 @@ mod tests {
             NodeId(1),
             10,
             ChainState { n: 5, h: 0xaa },
-            &[(2, 0x22), (4, 0x44)],
+            &[cp(2, 0x22), cp(4, 0x44)],
             &mut cursor,
         );
         assert_eq!(
@@ -402,7 +411,7 @@ mod tests {
             NodeId(1),
             20,
             ChainState { n: 5, h: 0xaa },
-            &[(2, 0x22), (4, 0x44)],
+            &[cp(2, 0x22), cp(4, 0x44)],
             &mut cursor,
         );
         assert_eq!(
