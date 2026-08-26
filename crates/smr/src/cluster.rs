@@ -61,7 +61,7 @@ use queso_sim::trace::Trace;
 use queso_sim::Kernel;
 
 use crate::command::{ClientId, Command, Key, Value};
-use crate::replica::{LeaderPolicy, OpId, OpRecord, QueuedOp, ReplicaState, SmrNode};
+use crate::replica::{Durable, LeaderPolicy, OpId, OpRecord, QueuedOp, ReplicaState, SmrNode};
 use crate::tuning::EpochTuner;
 
 /// Drives the multi-slot replicated log + KV application across a fixed set
@@ -608,6 +608,18 @@ impl SmrCluster {
             .recorders
             .get(&slot)
             .map(|r| r.peek())
+    }
+
+    /// An owned snapshot of `replica`'s durable state.
+    ///
+    /// Exists so a test can put a *populated* [`Durable`] through the real
+    /// on-disk round trip. `queso-net`'s persistence tests could previously
+    /// only round-trip `Durable::default()` -- an empty blob -- because
+    /// nothing outside this crate could build one with recorders and an
+    /// applied log in it. An empty round trip does not test the fidelity a
+    /// restart actually depends on.
+    pub fn durable_snapshot(&self, replica: NodeId) -> Durable {
+        self.states[&replica].borrow().durable.clone()
     }
 
     /// The kernel's recorded trace so far (for determinism/reproducibility
