@@ -5,3 +5,6 @@
 /target/
 **/*.rs.bk
 Cargo.lock.orig
+
+# Failing-seed cluster state kept by `queso-soak` for post-mortem (#73).
+/soak-failures/

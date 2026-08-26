@@ -364,7 +364,10 @@ no schedule.
   across n=3 and n=5, 8 seeds x 180s each. Seeds advance with the run number rather than
   repeating, so a nightly that stays green is covering new fault sequences instead of
   re-testing one fixed set; `workflow_dispatch` with `first_seed` re-runs a window that
-  failed. **Its first run earned its keep**: seeds 8/13/14 at n=3 and seed 8 at n=5 came
+  failed. Failing seeds now keep their cluster state (`soak-failures/seed-<n>`,
+  uploaded as a CI artifact) so a divergence report can be adjudicated against the
+  replicas' durable applied logs rather than argued about — see #73.
+  **Its first run earned its keep**: seeds 8/13/14 at n=3 and seed 8 at n=5 came
   back `VACUOUS: scheduled kills 14, injected kills 13` on runs whose verdict was
   `0 divergence(s), 0 stall(s)`. Not a Queso bug — the anti-vacuity accounting counted one
   expected kill per scheduled `Crash` window, while `reconcile` kills on the crashed-set
