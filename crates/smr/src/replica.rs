@@ -481,6 +481,32 @@ impl SmrNode {
         }
     }
 
+    /// This replica's recorder (ISR) state at `slot`, or `None` if it holds
+    /// none for that slot.
+    ///
+    /// `None` is a real answer, not an absence of one: recorders are created
+    /// lazily, the first time some proposer touches that slot on this
+    /// replica, so a replica can have *applied* a slot while holding no
+    /// recorder for it (its own attempt decided it, and no remote proposer
+    /// ever sent it a `record` there). A caller must keep "no recorder" and
+    /// "a recorder that has recorded nothing" apart -- they mean different
+    /// things about what this replica witnessed.
+    ///
+    /// A pure, cheap read of already-tracked state -- no logic change --
+    /// added (issue #84) so a post-mortem over a preserved `Durable` can
+    /// read the ISR state P12 exists to protect, without reaching into
+    /// [`Durable`]'s otherwise-`pub(crate)` fields. Mirrors
+    /// [`Self::applied_from`], and is the single-node counterpart of
+    /// [`crate::cluster::SmrCluster::recorder_summary`].
+    pub fn recorder_summary(&self, slot: u64) -> Option<queso_consensus::isr::IsrSummary<Command>> {
+        self.state
+            .borrow()
+            .durable
+            .recorders
+            .get(&slot)
+            .map(|r| r.peek())
+    }
+
     /// An owned snapshot of this replica's current [`Durable`] state --
     /// bookkeeping only, no logic change (a plain `Clone` of the shared
     /// `Rc<RefCell<_>>`'s durable half). See [`Self::from_durable`] and
