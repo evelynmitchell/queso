@@ -132,10 +132,14 @@ jobs:
       # every replica's durable snapshot, which contains its applied log.
       # That is the only thing that can settle whether a reported
       # divergence is a real Agreement violation or an artifact of the
-      # observability path (issue #73) -- recompute each replica's chain
-      # from its log and compare at the disputed slot. Three occurrences
-      # were reported before this existed, and every one of them deleted
-      # its own evidence.
+      # observability path (issue #73). Three occurrences were reported
+      # before this existed, and every one of them deleted its own evidence.
+      #
+      # The soak now adjudicates each preserved seed inline, so the log
+      # above already carries the verdict and this artifact is for
+      # re-checking it rather than for reaching it -- which matters,
+      # because an artifact has to be noticed and downloaded before it
+      # expires, and the log does not.
       - name: Upload soak log and preserved cluster state
         if: failure()
         uses: actions/upload-artifact@v4
@@ -156,10 +160,18 @@ jobs:
             {
               echo "n=${{ matrix.replicas }}: **FAILED** — see the uploaded artifact."
               echo ""
-              echo 'It carries each failing seed'"'"'s cluster state under `soak-failures/seed-<n>/`:'
-              echo 'every replica'"'"'s durable snapshot, which contains its applied log. To settle'
-              echo 'whether a reported divergence is real, recompute each replica'"'"'s chain from'
-              echo 'its own log and compare at the disputed slot (issue #73).'"
+              echo 'The job log above already carries the adjudication: for every preserved'
+              echo 'seed the soak recomputes each replica'"'"'s chain from its own durable applied'
+              echo 'log, compares the logs to each other, and checks every hash the observer'
+              echo 'reported against the log of the replica it was attributed to (issue #73).'
+              echo 'Logs that agree mean the divergence came from the observability path; logs'
+              echo 'that differ at a slot mean a real Agreement violation.'
+              echo ""
+              echo 'The artifact carries the same state under `soak-failures/seed-<n>/` so the'
+              echo 'adjudication can be re-run by hand, against a build of your choosing:'
+              echo '```'
+              echo 'cargo run -p queso-soak --bin queso-postmortem -- soak-failures/seed-<n>'
+              echo '```'
               echo ""
               echo 'Re-run this exact window:'
               echo '```'

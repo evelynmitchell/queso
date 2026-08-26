@@ -132,7 +132,23 @@ pub struct Observer {
     /// witness every later sample at that `n` is checked against.
     witnesses: BTreeMap<u64, (NodeId, BlockHash)>,
     replicas: BTreeMap<NodeId, ReplicaView>,
-    divergences: Vec<Divergence>,
+    /// Keyed by `(n, the replica that disagreed)`, not a `Vec`.
+    ///
+    /// A divergence is a *fact about a replica at a height*, not an event
+    /// that happens again every time somebody looks. The chain source
+    /// re-reports a replica's frontier on every poll (deliberately -- see
+    /// [`crate::source::samples_from_chain`], liveness needs it), and a
+    /// frontier that lands on a checkpoint boundary is reported twice in
+    /// the same poll, once from the table and once as the frontier. With a
+    /// `Vec` each of those pushed another copy: issue #73's report says
+    /// `2 divergence(s)` and then prints the same two lines, which reads as
+    /// two independent confirmations of a safety violation and is nothing
+    /// of the kind. Keying makes the duplicate unrepresentable rather than
+    /// filtered.
+    ///
+    /// The first observation wins, so `observed_at` stays the earliest time
+    /// the disagreement was visible.
+    divergences: BTreeMap<(u64, NodeId), Divergence>,
     comparisons: u64,
     samples: u64,
     transition_cap: usize,
@@ -150,7 +166,7 @@ impl Observer {
         Self {
             witnesses: BTreeMap::new(),
             replicas: BTreeMap::new(),
-            divergences: Vec::new(),
+            divergences: BTreeMap::new(),
             comparisons: 0,
             samples: 0,
             transition_cap: 4096,
@@ -177,12 +193,14 @@ impl Observer {
                 if witness_replica != sample.replica {
                     self.comparisons += 1;
                     if witness_hash != sample.state.h {
-                        self.divergences.push(Divergence {
-                            n: sample.state.n,
-                            first: (witness_replica, witness_hash),
-                            other: (sample.replica, sample.state.h),
-                            observed_at: sample.observed_at,
-                        });
+                        self.divergences
+                            .entry((sample.state.n, sample.replica))
+                            .or_insert(Divergence {
+                                n: sample.state.n,
+                                first: (witness_replica, witness_hash),
+                                other: (sample.replica, sample.state.h),
+                                observed_at: sample.observed_at,
+                            });
                     }
                 }
             }
@@ -226,14 +244,22 @@ impl Observer {
         }
     }
 
-    /// Every divergence detected so far, in detection order. Empty means
-    /// the safety property has held across everything observed.
-    pub fn divergences(&self) -> &[Divergence] {
-        &self.divergences
+    /// Every distinct divergence detected so far, ordered by `n` and then
+    /// by the replica that disagreed. Empty means the safety property has
+    /// held across everything observed.
+    ///
+    /// One entry per `(n, disagreeing replica)`: re-observing a replica
+    /// that has already been found to disagree at some height adds nothing
+    /// and is not counted again. Contrast [`Self::comparisons`], which
+    /// counts *observations* -- how much looking the verdict rests on.
+    pub fn divergences(&self) -> Vec<Divergence> {
+        self.divergences.values().copied().collect()
     }
 
     /// How many times a sample was actually *checked against* another
-    /// replica's hash at the same `n`.
+    /// replica's hash at the same `n`. Counts every observation, including
+    /// repeat looks at an unchanged frontier -- unlike
+    /// [`Self::divergences`], which counts distinct facts.
     ///
     /// This is the observer's anti-vacuity counter: a run that produced no
     /// divergences but also zero comparisons has proven nothing, and tests
@@ -349,7 +375,7 @@ impl Observer {
             );
         }
 
-        for divergence in &self.divergences {
+        for divergence in self.divergences.values() {
             let _ = writeln!(
                 out,
                 "\nDIVERGENCE at n={} (detected at {}):\n  {} showed 0x{:016x}\n  {} showed 0x{:016x}",
@@ -435,6 +461,56 @@ mod tests {
         assert!(observer.divergences().is_empty());
         // 3 replicas per n, 5 values of n: 2 cross-replica comparisons each.
         assert_eq!(observer.comparisons(), 10);
+    }
+
+    /// The chain source re-reports a replica's frontier on every poll, and
+    /// a frontier sitting on a checkpoint boundary is reported twice in one
+    /// poll. A replica that has been found to disagree at some `n` is
+    /// therefore re-observed disagreeing at that same `n` over and over --
+    /// which is the same fact, not new evidence. Issue #73's report says
+    /// `2 divergence(s)` and then prints the same two lines; that reads as
+    /// corroboration and is not.
+    ///
+    /// Falsifier: push into a `Vec` instead of keying by
+    /// `(n, disagreeing replica)` and this reports 4.
+    #[test]
+    fn re_observing_a_disagreement_does_not_multiply_it() {
+        let mut observer = Observer::new();
+        observer.observe(sample(0, 1, 7, 0xaaaa));
+        for at in 2..6 {
+            observer.observe(sample(1, at, 7, 0xbbbb));
+        }
+
+        let divergences = observer.divergences();
+        assert_eq!(divergences.len(), 1, "one fact, however often it is seen");
+        assert_eq!(
+            divergences[0].observed_at, 2,
+            "the earliest sighting is the one that dates it"
+        );
+        // The looking still counts: `comparisons` measures how much
+        // evidence the verdict rests on, which is a different question.
+        assert_eq!(observer.comparisons(), 4);
+        assert_eq!(observer.render_report().matches("DIVERGENCE at").count(), 1);
+    }
+
+    /// Two replicas disagreeing with the witness at one height are two
+    /// separate facts about two separate replicas, and collapsing them
+    /// would hide one.
+    ///
+    /// Falsifier: key the divergence map by `n` alone and this reports 1.
+    #[test]
+    fn two_replicas_disagreeing_at_one_height_are_two_divergences() {
+        let mut observer = Observer::new();
+        observer.observe(sample(0, 1, 7, 0xaaaa));
+        observer.observe(sample(1, 2, 7, 0xbbbb));
+        observer.observe(sample(2, 3, 7, 0xcccc));
+
+        let divergences = observer.divergences();
+        assert_eq!(divergences.len(), 2);
+        assert_eq!(
+            divergences.iter().map(|d| d.other.0).collect::<Vec<_>>(),
+            vec![node(1), node(2)]
+        );
     }
 
     #[test]
