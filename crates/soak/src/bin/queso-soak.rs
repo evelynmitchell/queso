@@ -21,12 +21,14 @@
 //! is a narrowed search -- re-run it, and you are re-running the same fault
 //! sequence rather than a fresh one.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
 
 use queso_soak::cluster::{ClusterConfig, RealCluster};
+use queso_soak::evidence::retain_evidence;
 use queso_soak::schedule::ScheduleConfig;
 use queso_soak::soak::{Soak, SoakConfig, SoakReport};
 
@@ -63,6 +65,20 @@ struct Args {
     /// Keep going after a seed fails, to find out how many of them do.
     #[arg(long)]
     keep_going: bool,
+
+    /// Where a failing seed's cluster state is preserved (issue #73).
+    ///
+    /// Each seed runs against `<dir>/seed-<n>`. A clean seed's directory is
+    /// deleted; a failing one is kept, because the replicas' durable
+    /// snapshots are the only thing that can settle whether a reported
+    /// divergence is a real Agreement violation or an artifact of the
+    /// observability path.
+    ///
+    /// **Each seed's directory is recreated from scratch**, so a re-run of
+    /// the same seed removes the previous attempt's evidence first. Point
+    /// this somewhere the soak owns.
+    #[arg(long, default_value = "soak-failures")]
+    failure_dir: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -78,9 +94,24 @@ fn main() -> ExitCode {
     }
 
     let mut failures: Vec<u64> = Vec::new();
+    let mut preserved: Vec<PathBuf> = Vec::new();
     for seed in args.first_seed..args.first_seed + args.seeds {
         println!("=== seed {seed} ===");
-        match run_seed(&args, seed) {
+
+        // Created here rather than inside `run_seed` so it outlives a
+        // harness error too: a seed whose cluster failed to boot is worth
+        // a post-mortem as much as one that diverged.
+        let data_dir = args.failure_dir.join(format!("seed-{seed}"));
+        if let Err(e) = fresh_dir(&data_dir) {
+            eprintln!(
+                "seed {seed}: could not prepare {}: {e:#}",
+                data_dir.display()
+            );
+            return ExitCode::FAILURE;
+        }
+
+        let outcome = run_seed(&args, seed, &data_dir);
+        let failed = match outcome {
             Ok((report, config)) => {
                 print!("{}", report.render());
                 // `problems`, not `is_clean`: a seed whose run observed
@@ -88,27 +119,53 @@ fn main() -> ExitCode {
                 // vacuous run as clean is the single worst thing a soak
                 // can do, because it is indistinguishable from success.
                 let problems = report.problems(&config);
+                for problem in &problems {
+                    println!("  {problem}");
+                }
                 if !problems.is_empty() {
-                    for problem in &problems {
-                        println!("  {problem}");
-                    }
                     println!("{}", report.schedule.render());
                     println!("{}", report.observer_report);
                     failures.push(seed);
-                    if !args.keep_going {
-                        break;
-                    }
                 }
+                !problems.is_empty()
             }
             Err(e) => {
                 // A harness failure is not a Queso failure, and reporting
                 // it as one would be the worst possible signal from a soak.
                 eprintln!("seed {seed}: harness error, not a verdict: {e:#}");
-                if !args.keep_going {
-                    return ExitCode::FAILURE;
-                }
+                true
             }
+        };
+
+        match retain_evidence(&data_dir, failed) {
+            Ok(Some(path)) => {
+                println!("  evidence kept: {}", path.display());
+                preserved.push(path);
+            }
+            Ok(None) => {}
+            // Worth shouting about but not worth abandoning the run for:
+            // the remaining seeds can still find something.
+            Err(e) => eprintln!(
+                "seed {seed}: could not preserve {}: {e:#}",
+                data_dir.display()
+            ),
         }
+
+        if failed && !args.keep_going {
+            break;
+        }
+    }
+
+    if !preserved.is_empty() {
+        println!();
+        println!("preserved cluster state for post-mortem:");
+        for path in &preserved {
+            println!("  {}", path.display());
+        }
+        println!(
+            "each holds every replica's durable snapshot, which carries the applied log -- \
+             the only thing that can settle whether a reported divergence is real (issue #73)"
+        );
     }
 
     if failures.is_empty() {
@@ -120,7 +177,24 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_seed(args: &Args, seed: u64) -> anyhow::Result<(SoakReport, SoakConfig)> {
+/// An empty directory at `path`, replacing whatever was there.
+///
+/// A re-run of a seed should not inherit the previous attempt's files --
+/// a stale `node-0.err` beside a fresh snapshot is worse than no evidence,
+/// because it reads as evidence.
+fn fresh_dir(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    std::fs::create_dir_all(path)
+}
+
+fn run_seed(
+    args: &Args,
+    seed: u64,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<(SoakReport, SoakConfig)> {
     let duration_ms = args.duration_secs * 1_000;
     let config = SoakConfig {
         fault_seed: seed,
@@ -154,8 +228,7 @@ fn run_seed(args: &Args, seed: u64) -> anyhow::Result<(SoakReport, SoakConfig)> 
         submit_timeout: Duration::from_secs(4),
     };
 
-    let data_dir = tempfile::tempdir()?;
-    let mut cluster = RealCluster::start(cluster_config, data_dir.path())?;
+    let mut cluster = RealCluster::start(cluster_config, data_dir)?;
     cluster.await_ready(Duration::from_secs(45))?;
 
     let soak = Soak::new(config.clone());

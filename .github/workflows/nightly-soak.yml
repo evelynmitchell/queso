@@ -122,15 +122,28 @@ jobs:
             --keep-going \
             2>&1 | tee "soak-n${{ matrix.replicas }}.log"
 
+      # Two things, and the second is the one that matters.
+      #
       # The log carries the rendered fault schedule and the observer report
-      # for every failing seed -- which is the whole reproduction story, and
-      # is lost when a run's logs age out.
-      - name: Upload soak log
+      # for every failing seed -- the reproduction story, lost when a run's
+      # logs age out.
+      #
+      # `soak-failures/` carries each failing seed's whole cluster state:
+      # every replica's durable snapshot, which contains its applied log.
+      # That is the only thing that can settle whether a reported
+      # divergence is a real Agreement violation or an artifact of the
+      # observability path (issue #73) -- recompute each replica's chain
+      # from its log and compare at the disputed slot. Three occurrences
+      # were reported before this existed, and every one of them deleted
+      # its own evidence.
+      - name: Upload soak log and preserved cluster state
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: soak-log-n${{ matrix.replicas }}-run${{ github.run_number }}
-          path: soak-n${{ matrix.replicas }}.log
+          name: soak-evidence-n${{ matrix.replicas }}-run${{ github.run_number }}
+          path: |
+            soak-n${{ matrix.replicas }}.log
+            soak-failures/
           retention-days: 30
 
       - name: Record the outcome
@@ -141,7 +154,12 @@ jobs:
             echo "n=${{ matrix.replicas }}: clean and non-vacuous" >> "$GITHUB_STEP_SUMMARY"
           else
             {
-              echo "n=${{ matrix.replicas }}: **FAILED** — see the uploaded log."
+              echo "n=${{ matrix.replicas }}: **FAILED** — see the uploaded artifact."
+              echo ""
+              echo 'It carries each failing seed'"'"'s cluster state under `soak-failures/seed-<n>/`:'
+              echo 'every replica'"'"'s durable snapshot, which contains its applied log. To settle'
+              echo 'whether a reported divergence is real, recompute each replica'"'"'s chain from'
+              echo 'its own log and compare at the disputed slot (issue #73).'"
               echo ""
               echo 'Re-run this exact window:'
               echo '```'

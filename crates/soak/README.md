@@ -125,7 +125,20 @@ cargo run --release -p queso-soak --bin queso-soak -- --seeds 20 --duration-secs
 The `queso-soak` binary is the long mode proper: it runs a seed range, prints
 each schedule and report, and exits non-zero if any seed found a violation
 **or produced a vacuous run** — so it works as a nightly job as readily as a
-manual hunt. It *is* one: `.github/workflows/nightly-soak.yml` runs it at
+manual hunt.
+
+**A failing seed keeps its cluster state.** Each seed runs against
+`<--failure-dir>/seed-<n>` (default `soak-failures/`); a clean seed's
+directory is deleted, a failing one is kept and its path printed. That
+directory holds every replica's durable snapshot, and a snapshot carries the
+replica's `applied_log` — which is the only thing that can settle whether a
+reported divergence is a real Agreement violation or an artifact of the
+observability path: recompute each replica's chain from its own log and
+compare at the disputed slot. Issue #73 collected three divergence reports
+before this existed, and every one of them deleted its own evidence. Note
+that each seed's directory is recreated from scratch, so re-running a seed
+discards the previous attempt's evidence first — and that with log
+compaction deferred (#46), a preserved 180s seed is a few MB per replica. It *is* one: `.github/workflows/nightly-soak.yml` runs it at
 07:00 UTC daily over n=3 and n=5, 8 seeds x 180s each, uploading the log as
 an artifact on failure. The seed window advances with the run number rather
 than repeating, so a green nightly means new fault sequences came back clean

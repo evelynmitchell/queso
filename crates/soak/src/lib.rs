@@ -19,6 +19,9 @@
 //! - [`proxy`] -- the out-of-process nemesis: a TCP turbulence proxy
 //!   between peers, so a "partition" breaks real connections rather than
 //!   dropping already-decoded application frames.
+//! - [`evidence`] -- keeping a failed seed's data dir around, so a
+//!   divergence report can be adjudicated against the replicas' durable
+//!   applied logs instead of argued about (issue #73).
 //! - [`cluster`] -- [`cluster::RealCluster`], which implements
 //!   `queso_conformance::CobTarget` over spawned `queso-node` processes, so
 //!   the 9.1 observers work unchanged against them.
@@ -38,6 +41,7 @@
 //! and it is why 9.1's deterministic harness stays as it is rather than
 //! being replaced by this.
 pub mod cluster;
+pub mod evidence;
 pub mod proxy;
 pub mod schedule;
 pub mod soak;
