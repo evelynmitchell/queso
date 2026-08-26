@@ -22,6 +22,11 @@
 //! - [`evidence`] -- keeping a failed seed's data dir around, so a
 //!   divergence report can be adjudicated against the replicas' durable
 //!   applied logs instead of argued about (issue #73).
+//! - [`postmortem`] -- doing that adjudication: recomputing each replica's
+//!   chain from its preserved applied log, comparing the logs to each
+//!   other, and checking every hash the observer reported against the log
+//!   of the replica it was attributed to. The soak runs it on any preserved
+//!   seed, so a job log alone says whether a divergence was real.
 //! - [`cluster`] -- [`cluster::RealCluster`], which implements
 //!   `queso_conformance::CobTarget` over spawned `queso-node` processes, so
 //!   the 9.1 observers work unchanged against them.
@@ -42,6 +47,7 @@
 //! being replaced by this.
 pub mod cluster;
 pub mod evidence;
+pub mod postmortem;
 pub mod proxy;
 pub mod schedule;
 pub mod soak;

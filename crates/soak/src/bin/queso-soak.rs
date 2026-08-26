@@ -29,6 +29,7 @@ use clap::Parser;
 
 use queso_soak::cluster::{ClusterConfig, RealCluster};
 use queso_soak::evidence::retain_evidence;
+use queso_soak::postmortem::{claims_from, Claim, Postmortem};
 use queso_soak::schedule::ScheduleConfig;
 use queso_soak::soak::{Soak, SoakConfig, SoakReport};
 
@@ -111,6 +112,7 @@ fn main() -> ExitCode {
         }
 
         let outcome = run_seed(&args, seed, &data_dir);
+        let mut reported: Vec<Claim> = Vec::new();
         let failed = match outcome {
             Ok((report, config)) => {
                 print!("{}", report.render());
@@ -127,6 +129,9 @@ fn main() -> ExitCode {
                     println!("{}", report.observer_report);
                     failures.push(seed);
                 }
+                // Both sides of every reported divergence, to be checked
+                // against the replicas' own applied logs below.
+                reported = claims_from(&report.divergences);
                 !problems.is_empty()
             }
             Err(e) => {
@@ -140,6 +145,7 @@ fn main() -> ExitCode {
         match retain_evidence(&data_dir, failed) {
             Ok(Some(path)) => {
                 println!("  evidence kept: {}", path.display());
+                adjudicate(&path, &reported);
                 preserved.push(path);
             }
             Ok(None) => {}
@@ -166,6 +172,7 @@ fn main() -> ExitCode {
             "each holds every replica's durable snapshot, which carries the applied log -- \
              the only thing that can settle whether a reported divergence is real (issue #73)"
         );
+        println!("re-read one with: cargo run -p queso-soak --bin queso-postmortem -- <dir>");
     }
 
     if failures.is_empty() {
@@ -175,6 +182,33 @@ fn main() -> ExitCode {
         println!("FAILED seeds: {failures:?}");
         ExitCode::FAILURE
     }
+}
+
+/// Adjudicate a preserved seed against its own durable applied logs, in
+/// the run log, while the run is still going.
+///
+/// This is the whole point of preserving them, brought forward: the nightly
+/// uploads the data dirs as an artifact, but an artifact has to be found,
+/// downloaded and reasoned about by somebody who noticed the failure, and
+/// it expires. The verdict costs milliseconds and belongs next to the
+/// report it settles -- so a job log alone says whether a divergence was a
+/// real Agreement violation or the observability path talking to itself.
+///
+/// Failures here are reported and stepped over. This is commentary on a
+/// verdict that has already been reached; it must never become a second way
+/// for the soak to fall over.
+fn adjudicate(data_dir: &std::path::Path, reported: &[Claim]) {
+    let postmortem = match Postmortem::open(data_dir) {
+        Ok(postmortem) => postmortem,
+        Err(e) => {
+            eprintln!(
+                "  post-mortem unavailable for {}: {e:#}",
+                data_dir.display()
+            );
+            return;
+        }
+    };
+    print!("{}", postmortem.render(reported));
 }
 
 /// An empty directory at `path`, replacing whatever was there.
