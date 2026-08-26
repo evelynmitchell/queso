@@ -381,6 +381,7 @@ In keeping with the project's design principle of not overclaiming:
 - [`docs/deploy-flyio.md`](docs/deploy-flyio.md) — fly.io deployment runbook.
 - [`docs/compare-etcd.md`](docs/compare-etcd.md) — Queso-vs-etcd comparison methodology and results.
 - [`docs/STATUS.md`](docs/STATUS.md) — current status and gap analysis.
+- [`docs/investigating-with-logs.md`](docs/investigating-with-logs.md) — what to keep, when to add logging, and what flags are for; written after a reported safety violation went five occurrences without being settled because each one deleted its own evidence.
 - [`spec/README.md`](spec/README.md) — the TLA+ formal models and their TLC results.
 - Each crate has its own `README.md` / module docs with deeper design notes.
 
