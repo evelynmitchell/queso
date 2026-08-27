@@ -436,10 +436,21 @@ fn best_of<V: Ord>(iter: impl Iterator<Item = Option<Proposal<V>>>) -> Option<Pr
 /// **That source is now closed at the source**: `begin_catch_up` passes
 /// `leader: None`, so a probe can never attach `H`
 /// (`crates/smr/tests/restart_agreement.rs::a_catch_up_probe_never_carries_the_reserved_priority`).
-/// This check stays as defence in depth, and is why the property holds
-/// whatever a future call site does with the leader argument -- see
-/// `no_two_quorums_can_fast_decide_different_values`, which establishes it
-/// by enumerating every state rather than by trusting any call site.
+/// This check stays as a necessary narrowing of the blast radius, but it is
+/// **not** a recovery from a violated invariant, and "defence in depth"
+/// oversold it (issue #92). What it guarantees, exhaustively
+/// (`no_two_quorums_can_fast_decide_different_values`), is that no *mixed*
+/// quorum ever decides -- and any two uniform quorums share a recorder, so
+/// no two **fast** decisions can ever disagree. What it cannot do is make a
+/// second `H`-tagged proposal safe: a quorum uniformly holding the
+/// Ord-*lesser* of two `H` proposals passes this check and fast-decides it,
+/// while every `best`/max in the ordinary machinery prefers the Ord-greater
+/// one and converges there -- "nothing can beat `H`" is false the moment two
+/// proposals carry it, because one of them beats the other.
+/// `tests/two_h_proposals.rs` enumerates exactly when that splits the slot.
+/// The load-bearing guarantee is the invariant [`Proposer::new`] documents
+/// -- at most one distinct `H`-tagged proposal per slot -- enforced at the
+/// call sites, not here.
 ///
 /// This check used to be a `debug_assert!`, which is compiled out of a
 /// release build -- so in exactly the binary the nightly soak runs, a mixed
