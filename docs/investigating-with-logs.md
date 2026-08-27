@@ -113,7 +113,7 @@ one missing field is worth more than every additional hash: with it, three
 occurrences would have shown at a glance that the disputed value is always the
 challenger's live frontier against an ahead replica's checkpoint. Without it,
 recovering that took cross-referencing frontier tables by hand, occurrence by
-occurrence. **See the open gap in §7.**
+occurrence. **See the open gap in §8.**
 
 **Log the gap between intent and action.** The soak counts injections
 *performed* against what the traversed schedule *asked for*, per fault kind.
@@ -192,19 +192,108 @@ their own truncation. Do the same.
 
 ---
 
-## 6. Checklist for the next unexplained failure
+## 6. Sample the system, or enumerate the state?
 
-1. What observation would settle this? Name it before doing anything else.
-2. Does it survive the run? If not, make it survive. That is now the task.
-3. Is what I am reading evidence of the system, or of the observer?
-4. For each hypothesis I discard: evidence, or reasoning? Write down which.
-5. What is the actual failure rate? Measure it; do not assert it.
-6. What did this run throw away?
-7. If I do exactly this for another week, could I conclude? If not, stop.
+Every unexplained failure gets attacked one of two ways. **Sampling**: run the
+whole system many times under turbulence until it misbehaves again.
+**Enumeration**: identify the function that produced the wrong answer and check
+every input it can receive.
+
+Sampling is what you reach for when you do not know where the defect is. It is
+also slow, expensive, and may have *no power at all* to find the thing you are
+looking for — a fact you will not discover by doing more of it.
+
+#83 was sampled for three nights: 32 soak seed-runs, roughly thirteen hours of
+turbulence, four occurrences, cause unsettled. The defect was a pure function
+of **eight states**. Enumerating them took 32 evaluations and under a
+millisecond, and yielded not just "there is a bug" but the exact combination
+that triggers it.
+
+Two tells said "enumerate" from early on. Neither was read.
+
+### An invariant fingerprint measures the state space
+
+By the second occurrence there was a table, and every row of it was identical:
+always node 0, always its own catch-up probe, always `seq == slot`, always
+alone. That was read as *consistent, therefore the bug is real* — true, and
+nearly useless.
+
+What it actually says is this: **a rare race over a large space produces varied
+symptoms. An invariant fingerprint means the outcome is fully determined by a
+small amount of state.** Five identical signatures was a measurement of how big
+the space was, sitting in a table that had already been drawn.
+
+*Ask of every repeated failure: how much do the occurrences differ from each
+other? If the answer is "not at all", stop sampling and go find the function.*
+
+### The vocabulary picks the method before you do
+
+Everything written about #83 used sampling language: rate, seed, window,
+reproduce, arm, power. That vocabulary carries a model — *the space is large,
+so sample it* — and every move it suggests is a sampling move: more seeds,
+longer runs, another arm. The enumeration move is not rejected from inside that
+frame; it is **invisible**. Nobody chose the model. It arrived with the word.
+
+It was worse here because "seed" means three incompatible things in this
+repository — a frozen simulator corpus, a nightly window that advances, and a
+soak schedule that does *not* reproduce its own failures (see
+`docs/what-each-test-establishes.md` §1). One word for all three concealed that
+the soak seed was never going to reproduce anything, which is the assumption
+the entire hunt rested on.
+
+*When every sentence about a problem uses the vocabulary of one method, say the
+other method's name out loud once and see whether it applies.*
+
+### The question that was missing
+
+This document already asked "what observation would settle this?" — an evidence
+question, and a good one. It never asked:
+
+> **What function computed the wrong answer, and is the state it reads
+> bounded?**
+
+For #83: `fast_path_value`, and yes. Bounded state means the property is
+*decidable*, not merely testable, and a decided property needs no rate, no
+window, and no luck.
+
+### When sampling is still right
+
+Enumeration needs a suspect. The soak keeps its place precisely because it
+finds the failures nobody has thought to enumerate, and because it exercises
+the real network, real threads and real disk that no enumeration models — the
+simulator structurally cannot reproduce a durability gap, and #83 was found by
+the soak, not by reasoning.
+
+So: **the soak is a discovery instrument, not an adjudication one.** Once it
+has told you *where* to look, stop running it and go read the function. The
+mistake was not sampling first. It was continuing to sample after the sample
+had already said everything it could.
 
 ---
 
-## 7. Open gap
+## 7. Checklist for the next unexplained failure
+
+0. **What function computed the wrong answer, and is the state it reads
+   bounded?** If bounded, enumerate it — do not sample the system around it.
+   (§6)
+1. **How much do the occurrences differ from each other?** Not at all means the
+   space is small. Vary a lot means you are genuinely searching. (§6)
+2. What observation would settle this? Name it before doing anything else.
+3. Does it survive the run? If not, make it survive. That is now the task.
+4. Is what I am reading evidence of the system, or of the observer?
+5. For each hypothesis I discard: evidence, or reasoning? Write down which.
+6. What is the actual failure rate? **Measure it; do not assert it** — and
+   before running an experiment, write down the trial count that rate implies.
+   Without both numbers a clean result means nothing.
+7. Has my instrument ever detected this? A run of it that finds nothing on a
+   configuration known to fail is a measurement of the instrument, not a
+   reassurance about the system.
+8. What did this run throw away?
+9. If I do exactly this for another week, could I conclude? If not, stop.
+
+---
+
+## 8. Open gap
 
 `queso_conformance::observer::Sample` carries no provenance. A sample from a
 replica's checkpoint table and one from its live frontier are indistinguishable
@@ -215,7 +304,7 @@ every occurrence so far.
 
 ---
 
-## 8. Retention
+## 9. Retention
 
 Failure artifacts are kept for **30 days** (`nightly-soak.yml`). That is
 deliberate and sufficient for the nightly cadence: a failure gets several
