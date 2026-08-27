@@ -50,7 +50,7 @@ whether its power to detect what it was built for has actually been measured.
 | instrument | question | pass licenses | fail licenses | detection power |
 |---|---|---|---|---|
 | `proposer::fast_path_uniformity_tests` | can the fast path decide two values at one slot? | **no, exhaustively** — every state × every quorum, n ∈ {3,5,7} | a bare Agreement violation | **1.0** — the state space is finite and fully enumerated |
-| `restart_agreement.rs::a_restarted_leaders_catch_up_probe_carries_the_reserved_priority` | can one leader attach `H` twice at a slot? | precondition present (24/24) | probe no longer carries `H` | **measured**: mutation takes it 24/24 → 0/24 |
+| `restart_agreement.rs::a_catch_up_probe_never_carries_the_reserved_priority` | can a learner win a slot outright? | no probe carries `H`, on any of 24 seeds | a probe can win a slot — #83's mechanism is back | **measured**: reverting `begin_catch_up` fails it 24/24 |
 | `net/tests/persist_fidelity.rs` | does a populated `Durable` survive the disk round trip? | not a serialization gap | recorder/applied state is lost on restart | **measured**: clearing recorders in `from_durable` fails it |
 | `restart_agreement.rs` (3 divergence tests, 60 scenarios) | does a restarted leader diverge? | *these 60 frozen schedules* do not diverge | a reproduction, in the simulator | **measured at zero** for #83 — see below |
 | `restart_agreement.rs::the_mixed_h_state_was_not_observed_by_this_snapshot` | is the mixed-`H` state visible in the sim? | not observed — **not** "unreachable" | reproduce #83 here rather than in the soak | **unknown, likely low**: post-hoc `F[S]` snapshot, not a trace |
@@ -187,3 +187,30 @@ Once it has told you *where* to look, stop running it and go read the function.
 - **A test asserting an absence must say what it cannot see.** See
   `the_mixed_h_state_was_not_observed_by_this_snapshot`, whose name is the
   claim and whose docs carry the limits.
+
+---
+
+## 6. A tripwire test, and what happened to it
+
+`a_restarted_leaders_catch_up_probe_carries_the_reserved_priority` was written
+to assert behaviour believed to be **wrong**: that a restarted leader's probe
+carries `H`. That is an odd thing to pin, and it earned its place twice over.
+
+First, it made the mixed-`H` quorum a reachable state rather than a
+hypothetical, which is what stopped
+`no_two_quorums_can_fast_decide_different_values` from guarding nothing.
+
+Second, its failure message named its own successor:
+
+> *"if the latter, #83's fix has landed and this test should be inverted, not
+> relaxed"*
+
+When `begin_catch_up` was changed to pass `leader: None`, it failed on 24/24
+seeds and said so. It is now
+`a_catch_up_probe_never_carries_the_reserved_priority`, asserting the
+opposite, with the same measured power in the other direction.
+
+**When you find behaviour you believe is wrong but are not ready to change,
+pin it — and write the failure message to the person who will change it.** A
+characterisation test that says what its own red means costs one paragraph and
+converts a future surprise into a confirmation.

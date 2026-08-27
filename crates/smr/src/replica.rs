@@ -714,12 +714,39 @@ impl SmrNode {
         }
         let slot = st.durable.next_slot;
         let command = catch_up_probe(slot);
-        let leader = self.leader_policy.leader_for(slot);
+        // **`None`, never the slot's leader -- issue #83.**
+        //
+        // A catch-up probe is a *learning* operation: it exists to discover
+        // what this slot already decided while we were down. It has no
+        // business on the §4.2.5 fast path, and handing it the leader hint
+        // was actively unsafe.
+        //
+        // Passing `leader_for(slot)` here meant that when *this* replica is
+        // the slot's leader, its probe went out at priority `H` -- because a
+        // fresh `Proposer` starts at `FIRST_ROUND_STEP`, so
+        // `Proposer::begin_step`'s `is_fast_path_round` was true. A leader
+        // that crashed with an in-flight client proposal at slot `k` and
+        // restarted would therefore attach `H` to a *second, different*
+        // value at `k`. `F[4]` is write-once per recorder, so recorders that
+        // saw the pre-crash proposal kept it while recorders that did not
+        // took the probe -- and a quorum could then be uniformly `H` while
+        // carrying two different values, which is exactly the premise
+        // `queso_consensus::proposer::fast_path_value`'s safety argument
+        // rests on. See that function's docs, and `crates/smr/tests/
+        // restart_agreement.rs`.
+        //
+        // Nothing is lost by learning instead of racing. `fast_path_value`
+        // is **not** leader-specific: a probe built with `None` still
+        // fast-decides in one round trip whenever the real leader's
+        // `H`-proposal is uniformly present in its quorum, which is the
+        // common catch-up case. All this gives up is the probe's ability to
+        // *win* a slot with an unbeatable priority -- something a learner
+        // should never have been able to do.
         let mut proposer = Proposer::new(
             ctx.self_id(),
             self.total_replicas,
             command.clone(),
-            leader,
+            None,
             slot,
         );
         if let Some(delay) = self.leader_policy.delay_for(slot, ctx.self_id()) {

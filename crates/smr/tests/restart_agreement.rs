@@ -309,25 +309,22 @@ fn is_catch_up_probe(command: &Command) -> bool {
     matches!(command, Command::Get { client, .. } if client.0 == u32::MAX)
 }
 
-/// Every `(replica, slot)` recorder currently holding an `H`-priority
-/// proposal, as `(slot, value, origin)`.
+/// Every proposal currently visible in any recorder's `first`, as
+/// `(slot, priority, value, origin)`.
 ///
 /// `IsrSummary::first` is `F[S]` at the recorder's *current* step, not
 /// specifically `F[4]`. So this is a post-hoc snapshot, not a trace: once a
 /// slot advances past round 1 everywhere, whatever `F[4]` held is no longer
-/// visible here. It can therefore establish that an `H`-tagged proposal
-/// exists, but **not** that one never existed — see
-/// `the_mixed_h_state_was_not_observed_by_this_snapshot` for what that
-/// costs.
-fn live_h_proposals(cluster: &SmrCluster, upto: u64) -> Vec<(u64, Command, NodeId)> {
+/// visible here. It can establish that a proposal of some shape exists, but
+/// never that one never existed — see
+/// `the_mixed_h_state_was_not_observed_by_this_snapshot` for what that costs.
+fn live_proposals(cluster: &SmrCluster, upto: u64) -> Vec<(u64, u64, Command, NodeId)> {
     let mut found = Vec::new();
     for &replica in cluster.replicas() {
         for slot in 0..upto {
             if let Some(summary) = cluster.recorder_summary(replica, slot) {
                 if let Some(proposal) = summary.first {
-                    if proposal.priority == H {
-                        found.push((slot, proposal.value, proposal.origin));
-                    }
+                    found.push((slot, proposal.priority, proposal.value, proposal.origin));
                 }
             }
         }
@@ -337,7 +334,7 @@ fn live_h_proposals(cluster: &SmrCluster, upto: u64) -> Vec<(u64, Command, NodeI
 
 /// Run the standard leader-crash scenario and return every `H` proposal
 /// left visible in recorder state afterwards.
-fn h_proposals_after_leader_restarts(seed: u64) -> Vec<(u64, Command, NodeId)> {
+fn proposals_after_leader_restarts(seed: u64) -> Vec<(u64, u64, Command, NodeId)> {
     let adversary = ContentObliviousAdversary::new(1, 8).with_drop_probability(0.15);
     let mut cluster = SmrCluster::new_with_leader(
         seed,
@@ -370,75 +367,89 @@ fn h_proposals_after_leader_restarts(seed: u64) -> Vec<(u64, Command, NodeId)> {
         .max()
         .unwrap_or(0)
         + 8;
-    live_h_proposals(&cluster, upto)
+    live_proposals(&cluster, upto)
 }
 
-/// **A restarted leader's catch-up probe carries the reserved priority `H`.**
+/// **A catch-up probe never carries the reserved priority `H`** (issue #83).
 ///
-/// This is the precondition for the input
-/// `queso_consensus::proposer::fast_path_value` now refuses, and without it
-/// that refusal would be guarding a state nothing can produce.
+/// This test was originally the inverse: it pinned that a restarted leader's
+/// probe *did* carry `H`, and existed as a tripwire so that the fix would be
+/// visible when it landed. The fix has landed — `SmrNode::begin_catch_up`
+/// now builds the probe's `Proposer` with `leader: None` — so the assertion
+/// is inverted, as that tripwire's own docs instructed.
 ///
-/// The path: `SmrNode::begin_catch_up` builds the probe's `Proposer` with
-/// `leader_policy.leader_for(slot)` — the same leader hint an ordinary
-/// client proposal gets — and a fresh `Proposer` starts at
-/// `FIRST_ROUND_STEP`. `Proposer::begin_step`'s `is_fast_path_round` is
-/// therefore true for a leader proposing its own probe, and §4.2.5 attaches
-/// `H`. So a leader that crashes with an in-flight proposal at slot `k` and
-/// restarts issues a **second, differently-valued** `H` proposal at `k`.
+/// # Why the probe must not carry it
 ///
-/// `Proposer::leader`'s docs anticipate two *different* replicas each
-/// attaching `H`. This is the same replica, twice, at one slot — which the
-/// docs did not anticipate and the type system does not prevent.
+/// A catch-up probe is a *learning* operation: it asks what a slot already
+/// decided while this replica was down. Handing it the slot's leader hint
+/// meant a fresh `Proposer` starting at `FIRST_ROUND_STEP` with
+/// `is_fast_path_round` true, so a leader that crashed with an in-flight
+/// client proposal at slot `k` and restarted attached `H` to a **second,
+/// different** value at `k`. `F[4]` is write-once per recorder, so a quorum
+/// could end up uniformly `H` while carrying two different values — which is
+/// exactly the premise `fast_path_value`'s safety argument rests on.
 ///
-/// # This test is a tripwire for the fix
+/// `Proposer::leader`'s docs anticipated two *different* replicas each
+/// believing they lead. This was the same replica, twice, at one slot.
 ///
-/// The candidate fix for #83 is that a catch-up probe must never carry `H`:
-/// it is a *learning* operation, not a proposal, and has no business on the
-/// fast path. When that lands, this test goes red. **That is correct and
-/// intended** — invert it to assert the probe is never `H`, and treat the
-/// red as confirmation the fix reached the path it was aimed at.
+/// # Nothing was given up but the ability to win
+///
+/// `fast_path_value` is not leader-specific, so a probe built with `None`
+/// still fast-decides in a single round trip whenever the real leader's
+/// `H`-proposal is uniformly present in its quorum — the ordinary catch-up
+/// case. The three divergence scenarios above assert `decided_probes > 0`,
+/// and still pass: probes go on reaching decisions through the leaderless
+/// machinery. What the probe can no longer do is *win* a slot with an
+/// unbeatable priority, which a learner should never have been able to do.
+///
+/// Falsifier, run: restoring `leader_policy.leader_for(slot)` in
+/// `begin_catch_up` fails this on 24/24 seeds.
 #[test]
-fn a_restarted_leaders_catch_up_probe_carries_the_reserved_priority() {
+fn a_catch_up_probe_never_carries_the_reserved_priority() {
     let mut seeds_with_probe = 0usize;
+    let mut seeds_with_h = 0usize;
     let mut probes = 0usize;
+
     for seed in 0..24u64 {
-        let found = h_proposals_after_leader_restarts(seed);
+        let found = proposals_after_leader_restarts(seed);
 
-        // Anti-vacuity: `H` must be present at all, or "we found no
-        // H-tagged probe" would just mean the scenario produced no fast
-        // path to look at.
-        assert!(
-            !found.is_empty(),
-            "seed {seed}: no H-priority proposal anywhere in recorder state, so the leader \
-             fast path never armed and this seed proves nothing about probes"
-        );
-
-        let seed_probes = found
-            .iter()
-            .filter(|(_, command, _)| is_catch_up_probe(command))
-            .count();
-        for (slot, command, origin) in found.iter().filter(|(_, c, _)| is_catch_up_probe(c)) {
-            assert_eq!(
-                *origin,
-                NodeId(0),
-                "seed {seed}: an H-tagged catch-up probe at slot {slot} originated at \
-                 {origin}, which is not the configured leader -- H is never drawn \
-                 randomly, so only a leader can attach it ({command:?})"
+        for (slot, priority, command, origin) in &found {
+            assert!(
+                !(*priority == H && is_catch_up_probe(command)),
+                "seed {seed}: a catch-up probe at slot {slot} carries the reserved \
+                 priority H (origin {origin}, {command:?}) -- only a genuine client \
+                 proposal from the slot's leader may, and a probe that can win a slot \
+                 is what broke Agreement in #83"
             );
         }
+
+        // Anti-vacuity, both halves. "No H-tagged probe" is trivially true
+        // of a run with no probes in it, and equally trivially true of a run
+        // where nothing carries `H` at all because the fast path never armed.
+        let seed_probes = found
+            .iter()
+            .filter(|(_, _, command, _)| is_catch_up_probe(command))
+            .count();
         if seed_probes > 0 {
             seeds_with_probe += 1;
             probes += seed_probes;
+        }
+        if found.iter().any(|(_, priority, _, _)| *priority == H) {
+            seeds_with_h += 1;
         }
     }
 
     assert!(
         seeds_with_probe >= 12,
-        "only {seeds_with_probe}/24 seeds left an H-tagged catch-up probe visible \
-         (measured: 24/24, {probes} probes). Far fewer means either the scenario stopped \
-         restarting the leader into catch-up, or the probe stopped carrying H -- if the \
-         latter, #83's fix has landed and this test should be inverted, not relaxed"
+        "only {seeds_with_probe}/24 seeds left any catch-up probe visible in recorder \
+         state ({probes} probes) -- with too few probes around, \"no probe carries H\" \
+         is a statement about an empty set"
+    );
+    assert!(
+        seeds_with_h >= 12,
+        "only {seeds_with_h}/24 seeds had any H-priority proposal at all, so the leader \
+         fast path is barely arming -- this test would pass by the absence of H rather \
+         than by probes declining to use it"
     );
 }
 
@@ -461,10 +472,13 @@ fn a_restarted_leaders_catch_up_probe_carries_the_reserved_priority() {
 fn the_mixed_h_state_was_not_observed_by_this_snapshot() {
     let mut mixed = Vec::new();
     for seed in 0..24u64 {
-        let found = h_proposals_after_leader_restarts(seed);
+        let found = proposals_after_leader_restarts(seed);
         let mut by_slot: std::collections::BTreeMap<u64, std::collections::BTreeSet<String>> =
             std::collections::BTreeMap::new();
-        for (slot, command, origin) in found {
+        for (slot, priority, command, origin) in found {
+            if priority != H {
+                continue;
+            }
             by_slot
                 .entry(slot)
                 .or_default()

@@ -421,17 +421,25 @@ fn best_of<V: Ord>(iter: impl Iterator<Item = Option<Proposal<V>>>) -> Option<Pr
 /// that is a bare Agreement violation with no intersection argument left to
 /// appeal to.
 ///
-/// `Proposer::leader`'s docs name one way to break it: two replicas each
+/// `Proposer::leader`'s docs named one way to break it: two replicas each
 /// believing they are the leader. That is not the only way. **One replica
 /// can attach `H` to two different values at the same slot at two different
-/// times** -- `queso_smr`'s `SmrNode::begin_catch_up` builds its catch-up
-/// probe's proposer with the slot's leader hint, exactly as a client
-/// proposal does, so a leader that crashes with an in-flight proposal at
-/// slot `k` and restarts issues a *second*, differently-valued `H` proposal
-/// at `k`. A recorder's `F[4]` is write-once, so recorders that saw the
-/// pre-crash proposal keep it while recorders that did not take the probe,
-/// and the two proposers' quorums can then be uniformly `H` on different
-/// values.
+/// times.** `queso_smr`'s `SmrNode::begin_catch_up` used to build its
+/// catch-up probe's proposer with the slot's leader hint, exactly as a
+/// client proposal does, so a leader that crashed with an in-flight proposal
+/// at slot `k` and restarted issued a *second*, differently-valued `H`
+/// proposal at `k`. A recorder's `F[4]` is write-once, so recorders that saw
+/// the pre-crash proposal kept it while recorders that did not took the
+/// probe, and the two proposers' quorums could then be uniformly `H` on
+/// different values.
+///
+/// **That source is now closed at the source**: `begin_catch_up` passes
+/// `leader: None`, so a probe can never attach `H`
+/// (`crates/smr/tests/restart_agreement.rs::a_catch_up_probe_never_carries_the_reserved_priority`).
+/// This check stays as defence in depth, and is why the property holds
+/// whatever a future call site does with the leader argument -- see
+/// `no_two_quorums_can_fast_decide_different_values`, which establishes it
+/// by enumerating every state rather than by trusting any call site.
 ///
 /// This check used to be a `debug_assert!`, which is compiled out of a
 /// release build -- so in exactly the binary the nightly soak runs, a mixed
@@ -475,12 +483,11 @@ pub struct Proposer<V> {
     /// between two disjoint groups that each satisfy a "live-relative"
     /// majority.
     total_replicas: usize,
-    /// The slot's designated leader, if any (§4.2.5). Every [`Proposer`]
-    /// instance for the same slot must be constructed with the *same*
-    /// value here -- see `Proposer::new`'s docs -- otherwise more than one
-    /// replica could believe itself the leader and attach `H` to more than
-    /// one distinct proposal, which is exactly the premise
-    /// [`fast_path_value`]'s `debug_assert!` guards against.
+    /// The slot's designated leader, if any (§4.2.5). Setting this is what
+    /// entitles a proposer to attach `H`, so it must only be `Some(self_id)`
+    /// for a proposal allowed to win the slot outright. See
+    /// `Proposer::new`'s docs for the invariant it carries, and for why
+    /// "the same value everywhere" was the wrong way to state it.
     leader: Option<NodeId>,
     /// `s`: the threshold logical clock step, `4*round + phase`.
     step: u64,
@@ -530,12 +537,35 @@ impl<V: Ord + Clone> Proposer<V> {
     /// (from a `KICKOFF_TIMER` callback) to begin round 1, phase 0.
     ///
     /// `leader` designates the slot's fast-path leader (§4.2.5), or `None`
-    /// for a purely leaderless slot (Phase 2 behavior, unchanged). **Every
-    /// proposer for the same slot must be built with the same `leader`
-    /// value** -- this is a cluster-construction invariant (see
-    /// `crate::concrete::ConcreteCluster::new_with_leader`, which enforces
-    /// it by passing one shared value to every `Proposer::new` call), not
-    /// something this constructor can check on its own.
+    /// for a purely leaderless slot (Phase 2 behavior, unchanged).
+    ///
+    /// # The invariant this argument carries
+    ///
+    /// What must hold for [`fast_path_value`]'s safety argument is: **at
+    /// most one distinct `H`-tagged proposal may ever exist for a slot.**
+    /// This constructor cannot check that, and no single call site can
+    /// guarantee it.
+    ///
+    /// It used to be stated here as "every proposer for the same slot must
+    /// be built with the same `leader` value". That is sufficient for the
+    /// case it had in mind -- two *different* replicas each believing they
+    /// lead -- and issue #83 showed it is neither necessary nor enough. Not
+    /// enough, because one replica can build two proposers for one slot at
+    /// different times, both with the same (correct) leader value, carrying
+    /// different values: a leader crashing mid-proposal and restarting into
+    /// catch-up did exactly that. Not necessary, because passing `None`
+    /// where a leader exists only ever attaches *fewer* `H` proposals, which
+    /// cannot break the invariant.
+    ///
+    /// So `None` is the right argument for any proposer that must not be
+    /// able to win a slot outright -- see `queso_smr`'s
+    /// `SmrNode::begin_catch_up`, which passes it for exactly that reason. A
+    /// `None`-built proposer still *checks* the fast path and still
+    /// fast-decides on a uniform `H` quorum; it simply never creates one.
+    ///
+    /// `crate::concrete::ConcreteCluster::new_with_leader` passes one shared
+    /// value to every `Proposer::new` call, which satisfies the invariant
+    /// for its single-slot clusters.
     /// `slot` is attached verbatim to every outgoing `record` request and
     /// checked on every incoming reply (see [`Proposer::slot`]'s field
     /// docs); single-slot callers (this crate's own Phase 2/3 tests and
