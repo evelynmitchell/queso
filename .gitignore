@@ -6,5 +6,8 @@
 **/*.rs.bk
 Cargo.lock.orig
 
-# Failing-seed cluster state kept by `queso-soak` for post-mortem (#73).
-/soak-failures/
+# Failing-seed cluster state kept for post-mortem (#73): by `queso-soak`
+# at the repo root, and by `crates/soak`'s tests under that crate's
+# directory (cargo runs a test with its package as the working directory) --
+# hence unanchored (#92).
+soak-failures/

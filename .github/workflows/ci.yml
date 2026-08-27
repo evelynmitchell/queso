@@ -73,6 +73,27 @@ jobs:
       - name: real-process scenarios and the bounded soak
         run: cargo test -p queso-soak -- --ignored --skip a_long_soak_over_many_seeds --nocapture
 
+      # A failing soak must not destroy its own evidence. The one divergence
+      # this job has ever reported (issue #92, on a post-#88 build) left
+      # nothing to adjudicate: the tests ran their cluster in a tempdir the
+      # panic unwind deleted, and this job -- unlike nightly-soak.yml -- kept
+      # no artifact. The tests now preserve a failing seed's cluster state
+      # under `crates/soak/soak-failures/` and adjudicate it in the log
+      # (see `sustained_soak.rs`); this step carries the state out, so the
+      # verdict can be re-checked against a build of your choosing:
+      #
+      #   cargo run -p queso-soak --bin queso-postmortem -- <dir>/seed-<n>
+      - name: Upload preserved cluster state
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-soak-evidence-run${{ github.run_id }}
+          path: crates/soak/soak-failures/
+          retention-days: 30
+          # The antithesis step below can also fail this job, without
+          # producing preserved state -- that is not worth a second failure.
+          if-no-files-found: ignore
+
       # Phase 9.3 (#54): the Antithesis test template, exercised without
       # Antithesis. Boots a real cluster, runs each Test Composer command as
       # its own process, and checks every property was reached and
