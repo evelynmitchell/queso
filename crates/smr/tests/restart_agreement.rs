@@ -22,6 +22,30 @@
 //! participating, repeatedly, mid-workload, with a fixed leader — and by
 //! default the victim *is* the leader, matching the soak.
 //!
+//! # These divergence tests have measured-zero detection power for #83
+//!
+//! Read before trusting their green. The three `never_diverges` tests below
+//! were written to reproduce #83 and **did not**: sixty scenarios, a leader
+//! crash-restarted mid-workload with the fast path armed, catch-up probes
+//! verifiably reaching decisions in every one — and no reproduction, ever.
+//! That is a measurement, not an impression.
+//!
+//! So they are regression pins, and only that. Their passing does not mean
+//! "restart is safe", and a future investigation must not count them as
+//! having ruled anything out: an instrument with zero measured sensitivity to
+//! a target contributes zero evidence about that target, however many
+//! scenarios it runs. #83 was settled instead by enumerating
+//! `fast_path_value`'s bounded state space directly — 32 evaluations, under a
+//! millisecond — after three nights of soak had not settled it. See
+//! `docs/what-each-test-establishes.md`.
+//!
+//! The two tests at the bottom of this file are different: both have measured
+//! power, one positive and one explicitly unknown, and each says so.
+//!
+//! Note also that the seed loops here are **frozen corpora, not samples**.
+//! `for seed in 0..24u64` runs the same twenty-four schedules on every CI run
+//! forever; the count is a runtime budget, not evidence of breadth.
+//!
 //! # Anti-vacuity
 //!
 //! A crash-restart test proves nothing if the victim had nothing to lose.

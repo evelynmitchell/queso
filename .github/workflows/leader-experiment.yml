@@ -29,9 +29,24 @@
 # A divergence is the *expected outcome* of the experiment, not an error, so
 # a failing soak must not paint the run red. What it must never do instead is
 # quietly succeed: the verdict job reports what was found, including "neither
-# arm diverged", which is **inconclusive** rather than clean -- the window's
-# observed rate is roughly two seeds in eight, so a run with no divergence at
-# all is well within chance and settles nothing.
+# arm diverged", which is **inconclusive** rather than clean.
+#
+# # This experiment is underpowered at the default seed count
+#
+# The measured n=3 rate is 4 divergent seeds in 32 (~12.5%, 95% CI roughly
+# [3.5%, 29%]) -- see `docs/what-each-test-establishes.md` for the tally. An
+# earlier revision of this file asserted "roughly two seeds in eight", which
+# was the worst single night rather than the rate.
+#
+# At p = 0.125 an eight-seed arm comes back empty **34% of the time**, so the
+# default below has only a ~66% chance of producing a usable signal. Run 1 of
+# this workflow returned nothing from either arm; that was the design, not bad
+# luck. For a decisive run raise `seeds` to 24 (~96% per arm, ~75 min) and
+# raise `timeout-minutes` with it. At the low end of the confidence interval
+# even 24 seeds is 42% likely to come back empty.
+#
+# Prefer enumerating the state to sampling the system wherever the decision
+# under test is a pure function of bounded state -- that is what settled #83.
 name: Leader confound experiment (#83)
 
 on:
@@ -40,13 +55,18 @@ on:
       first_seed:
         description: >-
           First seed. Defaults to the window that produced two n=3
-          divergences under leader 0 (run 9, seeds 72-79). Pinned, never
-          auto-advanced -- a fresh window has no known rate to compare
-          against.
+          divergences under leader 0 (run 9, seeds 72-79) -- though note the
+          soak seed fixes the fault schedule, not the interleaving, so this
+          window is not reliably reproducible: it came back clean in run 1 of
+          this workflow. Pinned rather than auto-advanced only so runs stay
+          comparable.
         required: false
         default: "72"
       seeds:
-        description: "Seeds per arm"
+        description: >-
+          Seeds per arm. 8 gives only ~66% power at the measured ~12.5%
+          rate; use 24 (~96%, ~75 min) for a decisive run, and raise the
+          job's timeout-minutes with it.
         required: false
         default: "8"
       duration_secs:
@@ -204,9 +224,12 @@ jobs:
             if [ "${a0:-none}" = "none" ] && [ "${a1:-none}" = "none" ]; then
               echo "**INCONCLUSIVE.** Neither arm produced a divergence."
               echo ""
-              echo "This is not a clean result. The chosen window diverged in roughly two"
-              echo "seeds out of eight when it was measured, so a run with none at all is"
-              echo "well within chance. Re-run, or widen the window."
+              echo "This is not a clean result, and at this seed count it is the most"
+              echo "likely one. The measured n=3 rate is 4 seeds in 32 (~12.5%), so an"
+              echo "eight-seed arm comes back empty about 34% of the time -- both arms"
+              echo "empty is ordinary. Re-run with seeds=24 (~96% power per arm, ~75 min,"
+              echo "and raise timeout-minutes to match) rather than reading anything into"
+              echo "this."
             elif [ "${a1:-none}" != "none" ] && [ "${a1}" != "n0" ]; then
               echo "**The divergence followed the leader.** Under leader n1 the replica that"
               echo "applied its own catch-up probe was \`${a1}\`, not n0."
@@ -225,8 +248,9 @@ jobs:
             else
               echo "**Partial.** The leader-n0 arm diverged (\`${a0}\`) but the leader-n1 arm did not."
               echo ""
-              echo "Suggestive, not decisive: one clean arm at this rate is ordinary luck."
-              echo "Re-run before concluding the fast path is implicated."
+              echo "Suggestive, not decisive: at the measured ~12.5% per-seed rate one"
+              echo "clean eight-seed arm happens 34% of the time. Re-run with seeds=24"
+              echo "before concluding the fast path is implicated."
             fi
             echo ""
             echo "Evidence for both arms is uploaded as \`leader-experiment-n{0,1}-run${{ github.run_number }}\`."

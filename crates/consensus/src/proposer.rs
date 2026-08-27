@@ -1022,6 +1022,7 @@ mod fast_path_uniformity_tests {
     //! controls, which is what controls are for.
 
     use super::*;
+    use std::collections::BTreeSet;
 
     /// A reply reporting `first = Some(proposal)` at round 1.
     fn reply_with(value: &str, priority: u64, origin: u32) -> RecordResponse<String> {
@@ -1128,6 +1129,135 @@ mod fast_path_uniformity_tests {
             "two distinct H-attaching origins means more than one replica believes it \
              is the leader -- the premise is broken even when the values happen to match"
         );
+    }
+
+    /// **Exhaustive.** Over every assignment of `F[4]` across `n` recorders
+    /// and every quorum that could form from them, no two quorums may
+    /// fast-decide different values. This is Agreement itself, checked
+    /// directly on the fast path rather than hunted for in a soak.
+    ///
+    /// # Why this is finite, and why that matters
+    ///
+    /// `fast_path_value` is a pure function of a response map. The only axis
+    /// that can break Lemma C.10 is *which value each recorder holds in
+    /// `F[4]`*, so the input space that matters is `|alphabet|^n` states
+    /// times the quorums over them — 32 evaluations at n=3, 512 at n=5. The
+    /// whole space fits in a millisecond.
+    ///
+    /// Issue #83 was hunted for three nights across 32 soak seed-runs at a
+    /// measured ~12.5% per-seed rate, which turned up four occurrences and
+    /// settled nothing. The defect was always inside a space of eight
+    /// states. **When the decision is a pure function of bounded state,
+    /// enumerate the state instead of sampling the system.**
+    ///
+    /// # The failure combination, exactly
+    ///
+    /// Under the old permissive body the decided value was `first_reply`'s —
+    /// the lowest `NodeId` in the map, since `BTreeMap` iterates in key
+    /// order. A quorum of size `>= q` drawn from `0..n` has lowest member
+    /// `i` for any `i <= n - q`, so the set of values the fast path could
+    /// return was exactly `{ F[i] : i <= n - q }`.
+    ///
+    /// Divergence was therefore possible **iff `F[4]` was not uniform across
+    /// recorders `0 ..= n - q`** — the first two node ids at n=3, the first
+    /// three at n=5. Enumerated: 4 of 8 states diverge at n=3, 24 of 32 at
+    /// n=5. Note that the majority-intersection argument does *not* save
+    /// this: any two quorums do share a recorder, but the old rule could
+    /// return a value that recorder did not hold.
+    ///
+    /// All values here carry the same `origin`, which is the #83 case
+    /// faithfully: both `H` proposals come from the *same* leader, once
+    /// before its crash and once as its catch-up probe after.
+    ///
+    /// Falsifier, run: with the permissive body restored this fails on the
+    /// first mixed state at n=3 with `decided = {"a", "b"}`.
+    #[test]
+    fn no_two_quorums_can_fast_decide_different_values() {
+        // Two `H`-priority values (the leader's two proposals) plus one
+        // ordinary leaderless draw, so mixed H/non-H quorums are covered too.
+        let alphabet: [(u64, &str); 3] = [(H, "a"), (H, "b"), (7, "leaderless")];
+
+        for n in [3usize, 5, 7] {
+            let q = n / 2 + 1;
+            let mut states = 0usize;
+            let mut states_that_decide = 0usize;
+            let mut mixed_h_states = 0usize;
+            let mut assignment = vec![0usize; n];
+
+            loop {
+                states += 1;
+                let first_movers = n - q + 1;
+                let h_values: BTreeSet<&str> = (0..first_movers)
+                    .map(|i| alphabet[assignment[i]])
+                    .filter(|(prio, _)| *prio == H)
+                    .map(|(_, value)| value)
+                    .collect();
+                if h_values.len() > 1 {
+                    mixed_h_states += 1;
+                }
+
+                let mut decided = BTreeSet::new();
+                for mask in 0u32..(1u32 << n) {
+                    if (mask.count_ones() as usize) < q {
+                        continue;
+                    }
+                    let responses: BTreeMap<NodeId, RecordResponse<String>> = (0..n)
+                        .filter(|i| mask & (1 << i) != 0)
+                        .map(|i| {
+                            let (priority, value) = alphabet[assignment[i]];
+                            (NodeId(i as u32), reply_with(value, priority, 0))
+                        })
+                        .collect();
+                    if let Some(value) = fast_path_value(&responses) {
+                        decided.insert(value);
+                    }
+                }
+                if !decided.is_empty() {
+                    states_that_decide += 1;
+                }
+                assert!(
+                    decided.len() <= 1,
+                    "n={n}: recorder state {assignment:?} lets two quorums fast-decide \
+                     different values {decided:?} -- that is a bare Agreement violation"
+                );
+
+                // Odometer over the alphabet.
+                let mut i = 0;
+                loop {
+                    if i == n {
+                        break;
+                    }
+                    assignment[i] += 1;
+                    if assignment[i] < alphabet.len() {
+                        break;
+                    }
+                    assignment[i] = 0;
+                    i += 1;
+                }
+                if i == n {
+                    break;
+                }
+            }
+
+            assert_eq!(
+                states,
+                alphabet.len().pow(n as u32),
+                "n={n}: the odometer did not visit every state"
+            );
+            // Anti-vacuity, both directions. The property is trivially true
+            // of a function that never decides, and trivially true of a
+            // state space with no mixed-H states in it.
+            assert!(
+                states_that_decide > 0,
+                "n={n}: no state fast-decided at all, so Agreement held vacuously"
+            );
+            assert!(
+                mixed_h_states > 0,
+                "n={n}: no state had two different H values among recorders 0..={}, \
+                 so the hazard this test exists for was never present",
+                n - q
+            );
+        }
     }
 
     /// A quorum with one non-`H` reply never fast-decided and still must
