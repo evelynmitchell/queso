@@ -41,6 +41,14 @@ on:
           seed-window step). Set it to re-run a night that failed.
         required: false
         default: ""
+      leader:
+        description: >-
+          Which replica gets the leader fast path (default 0). For #83:
+          re-run a failing seed window with a different leader to separate
+          "the diverging replica is the leader" from "the diverging replica
+          is node 0" -- indistinguishable while this is fixed at 0.
+        required: false
+        default: "0"
 
 # A manual dispatch while a scheduled run is still going would otherwise
 # put two soaks on the same runner pool competing for CPU -- which is
@@ -119,6 +127,7 @@ jobs:
             --first-seed "${{ steps.window.outputs.first_seed }}" \
             --duration-secs "${{ inputs.duration_secs || '180' }}" \
             --replicas "${{ matrix.replicas }}" \
+            --leader "${{ inputs.leader || '0' }}" \
             --keep-going \
             2>&1 | tee "soak-n${{ matrix.replicas }}.log"
 
@@ -178,7 +187,8 @@ jobs:
               echo "gh workflow run nightly-soak.yml \\"
               echo "  -f first_seed=${{ steps.window.outputs.first_seed }} \\"
               echo "  -f seeds=${{ steps.window.outputs.seeds }} \\"
-              echo "  -f duration_secs=${{ inputs.duration_secs || '180' }}"
+              echo "  -f duration_secs=${{ inputs.duration_secs || '180' }} \\"
+              echo "  -f leader=${{ inputs.leader || '0' }}"
               echo '```'
               echo ""
               echo 'The seed reproduces the *turbulence*, not the failure —'

@@ -57,6 +57,19 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     replicas: usize,
 
+    /// Which replica gets the §4.2.5 leader fast path.
+    ///
+    /// Exposed for #83. Every occurrence of that Agreement violation so far
+    /// has been node 0 applying its own restart catch-up probe at a slot the
+    /// majority decided differently -- and node 0 is also, in every run so
+    /// far, the leader. Those two explanations are indistinguishable while
+    /// the leader is hard-coded: re-running a failing seed window with a
+    /// different leader separates them. If the divergence follows the
+    /// leader, the probe carrying the leader's reserved priority `H` is
+    /// implicated; if it stays on node 0, that is a red herring.
+    #[arg(long, default_value_t = 0)]
+    leader: u32,
+
     /// Chain checkpoint spacing. Denser sampling means more cross-replica
     /// comparisons and a less vacuous safety verdict; 9.1 measured
     /// frontier-only sampling collapsing 20 comparisons to 2.
@@ -90,6 +103,16 @@ fn main() -> ExitCode {
              the schedule would be empty and every verdict vacuous",
             args.replicas,
             args.replicas.saturating_sub(1) / 2
+        );
+        return ExitCode::FAILURE;
+    }
+
+    if args.leader as usize >= args.replicas {
+        eprintln!(
+            "--leader {} is not a replica of a {}-node cluster (ids are 0..{})",
+            args.leader,
+            args.replicas,
+            args.replicas - 1
         );
         return ExitCode::FAILURE;
     }
@@ -256,7 +279,7 @@ fn run_seed(
 
     let cluster_config = ClusterConfig {
         replicas: args.replicas,
-        leader: 0,
+        leader: args.leader,
         checkpoint_every: args.checkpoint_every,
         tick_ms: 5,
         submit_timeout: Duration::from_secs(4),
@@ -266,6 +289,14 @@ fn run_seed(
     cluster.await_ready(Duration::from_secs(45))?;
 
     let soak = Soak::new(config.clone());
+    // Recorded per seed, not just in the invocation: a preserved failure has
+    // to say which replica held the fast path, or a later reader cannot tell
+    // a leader-correlated divergence from a node-0-correlated one -- the
+    // exact question this flag exists to answer.
+    println!(
+        "cluster: {} replicas, leader n{}",
+        args.replicas, args.leader
+    );
     println!("{}", soak.schedule().render());
     Ok((soak.run(&mut cluster), config))
 }
