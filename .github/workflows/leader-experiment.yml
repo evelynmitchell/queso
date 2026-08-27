@@ -1,0 +1,237 @@
+# The leader confound experiment for issue #83.
+#
+# #83 has five adjudicated occurrences with one signature: node 0 applies its
+# own restart catch-up probe at a slot the majority decided differently. Node
+# 0 is also the leader in every one of those runs, so two explanations fit
+# the evidence equally well:
+#
+#   * the diverging replica is the **leader**, and its catch-up probe carries
+#     the leader's reserved priority `H` (`begin_catch_up` builds the probe's
+#     proposer with the leader hint, exactly like a client proposal); or
+#   * the diverging replica is **node 0**, for reasons particular to node 0's
+#     place in the fault schedule and the workload.
+#
+# That is a confound in the data, not a gap in the reasoning. This workflow
+# runs both arms -- leader 0 and leader 1 -- over the *same* seed window, at
+# the same time, on the same runner pool, and reports which replica diverged
+# in each.
+#
+# # Why this is a separate workflow rather than a nightly dispatch
+#
+# The nightly advances its seed window automatically and defaults the leader
+# to 0. Dispatching it for this experiment means remembering three inputs,
+# and forgetting any one of them silently produces a run that cannot answer
+# the question -- which has already happened once. Here the window is pinned
+# by default and both arms always run.
+#
+# # This workflow does not fail on a divergence
+#
+# A divergence is the *expected outcome* of the experiment, not an error, so
+# a failing soak must not paint the run red. What it must never do instead is
+# quietly succeed: the verdict job reports what was found, including "neither
+# arm diverged", which is **inconclusive** rather than clean -- the window's
+# observed rate is roughly two seeds in eight, so a run with no divergence at
+# all is well within chance and settles nothing.
+name: Leader confound experiment (#83)
+
+on:
+  workflow_dispatch:
+    inputs:
+      first_seed:
+        description: >-
+          First seed. Defaults to the window that produced two n=3
+          divergences under leader 0 (run 9, seeds 72-79). Pinned, never
+          auto-advanced -- a fresh window has no known rate to compare
+          against.
+        required: false
+        default: "72"
+      seeds:
+        description: "Seeds per arm"
+        required: false
+        default: "8"
+      duration_secs:
+        description: "Seconds of turbulence per seed"
+        required: false
+        default: "180"
+      replicas:
+        description: >-
+          Replicas per cluster. The known-rate window was measured at n=3.
+        required: false
+        default: "3"
+
+# Deliberately its own group, not `nightly-soak`: the two arms must run
+# concurrently so they see the same runner-pool conditions, and CPU
+# contention is part of what makes this bug appear.
+concurrency: leader-experiment
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: /home/runner/.cargo
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  arm:
+    name: leader n${{ matrix.leader }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      matrix:
+        leader: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+
+      - name: cargo build --release
+        run: cargo build --release --all
+
+      # `continue-on-error`, not `|| true`: a divergence is the outcome under
+      # test. The step's own conclusion is read back below so the report can
+      # distinguish "the soak found something" from "the soak fell over".
+      - name: Soak with leader n${{ matrix.leader }}
+        id: soak
+        continue-on-error: true
+        run: |
+          ./target/release/queso-soak \
+            --seeds "${{ inputs.seeds || '8' }}" \
+            --first-seed "${{ inputs.first_seed || '72' }}" \
+            --duration-secs "${{ inputs.duration_secs || '180' }}" \
+            --replicas "${{ inputs.replicas || '3' }}" \
+            --leader "${{ matrix.leader }}" \
+            --keep-going \
+            --failure-dir soak-failures \
+            2>&1 | tee "soak-leader${{ matrix.leader }}.log"
+
+      # Extract the one fact the experiment turns on: which replica applied a
+      # catch-up probe at a slot where the logs differ. `queso-soak`'s inline
+      # post-mortem prints that as, e.g.
+      #
+      #     n0 vs n1: DIFFER at slot 4199
+      #       n0 applied Get { client: ClientId(4294967295), seq: 4199, ... }
+      #
+      # so the replica named on the ClientId(4294967295) line is the one that
+      # applied its own probe. `|| true` on every grep is deliberate: no match
+      # is a real, expected result here, not a failure.
+      - name: Extract the finding
+        if: always()
+        shell: bash
+        run: |
+          log="soak-leader${{ matrix.leader }}.log"
+          out="finding-leader${{ matrix.leader }}.txt"
+
+          divergences=$(grep -c 'DIFFER at slot' "$log" || true)
+          # `xargs` rather than `tr '\n' ' '`: the latter leaves a trailing
+          # space, and a value that compares equal to "n0" in one place and
+          # "n0 " in another is exactly how a verdict silently takes the wrong
+          # branch.
+          probe_replicas=$(grep -oE 'n[0-9]+ applied Get \{ client: ClientId\(4294967295\)' "$log" \
+            | grep -oE '^n[0-9]+' | sort -u | xargs || true)
+          failed_seeds=$(grep -oE 'FAILED seeds: \[[^]]*\]' "$log" | tail -1 || true)
+          confirmed=$(grep -c 'CONFIRMED by its applied log' "$log" || true)
+
+          {
+            echo "leader=n${{ matrix.leader }}"
+            echo "soak_step_outcome=${{ steps.soak.outcome }}"
+            echo "diverging_slot_pairs=${divergences:-0}"
+            echo "probe_appliers=${probe_replicas:-none}"
+            echo "confirmed_claims=${confirmed:-0}"
+            echo "failed_seeds=${failed_seeds:-none}"
+          } > "$out"
+
+          cat "$out"
+
+      - name: Upload this arm's evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leader-experiment-n${{ matrix.leader }}-run${{ github.run_number }}
+          path: |
+            soak-leader${{ matrix.leader }}.log
+            finding-leader${{ matrix.leader }}.txt
+            soak-failures/
+          retention-days: 30
+
+      - name: Upload this arm's finding
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finding-n${{ matrix.leader }}-run${{ github.run_number }}
+          path: finding-leader${{ matrix.leader }}.txt
+          retention-days: 30
+
+  verdict:
+    name: verdict
+    needs: arm
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect both arms
+        uses: actions/download-artifact@v4
+        with:
+          pattern: finding-n*-run${{ github.run_number }}
+          merge-multiple: true
+
+      # The whole point of the workflow: say what the comparison showed, and
+      # say plainly when it showed nothing. "No divergence" is inconclusive
+      # here, not clean -- the window's rate is about two seeds in eight, so
+      # an empty run is ordinary luck and settles nothing.
+      - name: Report
+        shell: bash
+        run: |
+          get() { grep "^$2=" "finding-leader$1.txt" 2>/dev/null | cut -d= -f2- || true; }
+
+          a0=$(get 0 probe_appliers); a1=$(get 1 probe_appliers)
+          d0=$(get 0 diverging_slot_pairs); d1=$(get 1 diverging_slot_pairs)
+          s0=$(get 0 failed_seeds); s1=$(get 1 failed_seeds)
+
+          {
+            echo "# Leader confound experiment (#83)"
+            echo ""
+            echo "Window: first_seed=${{ inputs.first_seed || '72' }}, seeds=${{ inputs.seeds || '8' }}, duration=${{ inputs.duration_secs || '180' }}s, n=${{ inputs.replicas || '3' }}"
+            echo ""
+            echo "| arm | differing slot-pairs | replicas that applied their own catch-up probe | failed seeds |"
+            echo "|---|---|---|---|"
+            echo "| leader n0 | ${d0:-?} | ${a0:-none} | ${s0:-none} |"
+            echo "| leader n1 | ${d1:-?} | ${a1:-none} | ${s1:-none} |"
+            echo ""
+            if [ "${a0:-none}" = "none" ] && [ "${a1:-none}" = "none" ]; then
+              echo "**INCONCLUSIVE.** Neither arm produced a divergence."
+              echo ""
+              echo "This is not a clean result. The chosen window diverged in roughly two"
+              echo "seeds out of eight when it was measured, so a run with none at all is"
+              echo "well within chance. Re-run, or widen the window."
+            elif [ "${a1:-none}" != "none" ] && [ "${a1}" != "n0" ]; then
+              echo "**The divergence followed the leader.** Under leader n1 the replica that"
+              echo "applied its own catch-up probe was \`${a1}\`, not n0."
+              echo ""
+              echo "That implicates the leader fast path: \`begin_catch_up\` gives the probe"
+              echo "the leader's reserved priority \`H\`, so a restarted leader's probe can win"
+              echo "a slot instead of learning it. The fix to evaluate is that a catch-up"
+              echo "probe must never carry \`H\`."
+            elif [ "${a1:-none}" != "none" ]; then
+              echo "**The divergence stayed on n0** even with the leader moved to n1."
+              echo ""
+              echo "That exonerates the fast path: the leader correlation across the earlier"
+              echo "occurrences was coincidence, and the cause is something particular to"
+              echo "node 0 -- its place in the fault schedule, or the workload's replica"
+              echo "choice. Look there instead."
+            else
+              echo "**Partial.** The leader-n0 arm diverged (\`${a0}\`) but the leader-n1 arm did not."
+              echo ""
+              echo "Suggestive, not decisive: one clean arm at this rate is ordinary luck."
+              echo "Re-run before concluding the fast path is implicated."
+            fi
+            echo ""
+            echo "Evidence for both arms is uploaded as \`leader-experiment-n{0,1}-run${{ github.run_number }}\`."
+            echo "Each failing seed's cluster state is under \`soak-failures/seed-<n>/\`, and the"
+            echo "log already carries the inline post-mortem adjudication."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          cat "$GITHUB_STEP_SUMMARY"
