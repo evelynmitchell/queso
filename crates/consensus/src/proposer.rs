@@ -412,13 +412,36 @@ fn best_of<V: Ord>(iter: impl Iterator<Item = Option<Proposal<V>>>) -> Option<Pr
 /// decision and a leaderless decision for the same slot can therefore never
 /// disagree: they are the same value by construction, not by coincidence.
 ///
-/// The `debug_assert!` below is a defense-in-depth structural check of
-/// the "only the leader ever sends `H`, so all `H`-tagged replies in one
-/// quorum must be identical" premise -- it should be unreachable in a
-/// correct build (a single, consistently-configured leader per slot -- see
-/// `Proposer::new`) but a violation here would mean an agreement-threatening
-/// bug, not a benign race, so it is worth catching early in debug/test
-/// builds rather than trusting the premise silently.
+/// # The uniformity check is load-bearing, not decorative (issue #83)
+///
+/// Every word of the argument above rests on one premise: *all* `H`-tagged
+/// replies in a quorum carry the **same** proposal. Break that and the
+/// argument collapses immediately -- two proposers, each holding an all-`H`
+/// quorum carrying a *different* value, would each fast-decide its own, and
+/// that is a bare Agreement violation with no intersection argument left to
+/// appeal to.
+///
+/// `Proposer::leader`'s docs name one way to break it: two replicas each
+/// believing they are the leader. That is not the only way. **One replica
+/// can attach `H` to two different values at the same slot at two different
+/// times** -- `queso_smr`'s `SmrNode::begin_catch_up` builds its catch-up
+/// probe's proposer with the slot's leader hint, exactly as a client
+/// proposal does, so a leader that crashes with an in-flight proposal at
+/// slot `k` and restarts issues a *second*, differently-valued `H` proposal
+/// at `k`. A recorder's `F[4]` is write-once, so recorders that saw the
+/// pre-crash proposal keep it while recorders that did not take the probe,
+/// and the two proposers' quorums can then be uniformly `H` on different
+/// values.
+///
+/// This check used to be a `debug_assert!`, which is compiled out of a
+/// release build -- so in exactly the binary the nightly soak runs, a mixed
+/// quorum silently returned whichever value `BTreeMap` iteration yielded
+/// first (the lowest `NodeId`'s). Refusing the fast path instead is always
+/// safe and never costs correctness: the proposer simply falls through to
+/// the ordinary leaderless machinery, which is proven safe on its own terms
+/// and reaches the same decision the intersection argument above describes.
+/// The only thing given up is one round trip, in a situation that should
+/// never arise.
 fn fast_path_value<V: Ord + Clone>(responses: &BTreeMap<NodeId, RecordResponse<V>>) -> Option<V> {
     let mut replies = responses.values();
     let first_reply = replies.next()?.first.as_ref()?;
@@ -427,13 +450,10 @@ fn fast_path_value<V: Ord + Clone>(responses: &BTreeMap<NodeId, RecordResponse<V
     }
     for resp in responses.values() {
         match &resp.first {
-            Some(p) if p.priority == H => {
-                debug_assert!(
-                    p == first_reply,
-                    "two distinct H-priority proposals seen in one quorum -- H must be \
-                     attached by exactly one consistently-configured leader"
-                );
-            }
+            // Two *distinct* `H`-priority proposals in one quorum mean the
+            // premise is broken. Decline the fast path rather than pick one
+            // of them: see this function's docs.
+            Some(p) if p.priority == H && p == first_reply => {}
             _ => return None,
         }
     }
@@ -965,4 +985,164 @@ impl<V: Ord + Clone> Proposer<V> {
 /// kernel's single seeded PRNG stream via `ctx`.
 fn draw_priority<V>(ctx: &mut dyn Ctx<ConcreteMsg<V>>) -> u64 {
     ctx.rng().gen_range(1..H)
+}
+
+#[cfg(test)]
+mod fast_path_uniformity_tests {
+    //! Issue #83: [`fast_path_value`] must refuse a quorum whose replies are
+    //! all `H`-priority but do **not** all carry the same proposal.
+    //!
+    //! # Why these live here and not in `tests/`
+    //!
+    //! [`fast_path_value`] is private, and deliberately so. Reaching it from
+    //! an integration test means driving a whole cluster into the split
+    //! state, which is precisely the rare, timing-dependent event issue #83
+    //! spent five occurrences failing to reproduce on demand. The check
+    //! itself is a pure function of a response map, so it can be pinned
+    //! exactly, deterministically, in three lines of setup.
+    //!
+    //! # Why a `debug_assert!` was not good enough
+    //!
+    //! The guard this replaces was a `debug_assert!`. `Cargo.toml` sets no
+    //! `[profile.release]` override, so `debug_assertions` is off in the
+    //! `--release` binary the nightly soak builds -- the guard did not exist
+    //! in the only build where the bug had ever been observed. A test of a
+    //! `debug_assert!` is therefore *structurally incapable* of covering the
+    //! failing configuration: it passes in `cargo test` (debug) while the
+    //! shipped artifact stays broken. These tests pass in both profiles
+    //! because the check is now ordinary control flow.
+    //!
+    //! Falsifier, run: restoring the old permissive body -- accepting any
+    //! `Some(p) if p.priority == H` and returning `first_reply.value` --
+    //! fails three of the five. `a_mixed_h_quorum_does_not_fast_decide`
+    //! yields `Some("from-the-leaders-first-proposal")`,
+    //! `the_refusal_does_not_depend_on_node_id_order` yields
+    //! `Some("value-a")` and `same_value_from_two_origins_is_still_refused`
+    //! yields `Some("agreed-value")`. The two that still pass are the
+    //! controls, which is what controls are for.
+
+    use super::*;
+
+    /// A reply reporting `first = Some(proposal)` at round 1.
+    fn reply_with(value: &str, priority: u64, origin: u32) -> RecordResponse<String> {
+        RecordResponse {
+            slot: 7,
+            req_step: FIRST_ROUND_STEP,
+            step: FIRST_ROUND_STEP,
+            first: Some(Proposal {
+                value: value.to_string(),
+                priority,
+                origin: NodeId(origin),
+            }),
+            prior_agg: None,
+        }
+    }
+
+    fn quorum(
+        replies: impl IntoIterator<Item = (u32, RecordResponse<String>)>,
+    ) -> BTreeMap<NodeId, RecordResponse<String>> {
+        replies
+            .into_iter()
+            .map(|(id, resp)| (NodeId(id), resp))
+            .collect()
+    }
+
+    /// The control: a genuinely uniform all-`H` quorum still fast-decides.
+    ///
+    /// Without this, every other test here could pass because the function
+    /// had been broken into never fast-deciding at all -- the fast path is
+    /// an optimization, so silently disabling it costs no other test a
+    /// failure. This is the assertion that makes the rest non-vacuous.
+    #[test]
+    fn a_uniform_h_quorum_still_fast_decides() {
+        let q = quorum([
+            (0, reply_with("the-leaders-proposal", H, 0)),
+            (1, reply_with("the-leaders-proposal", H, 0)),
+        ]);
+        assert_eq!(
+            fast_path_value(&q).as_deref(),
+            Some("the-leaders-proposal"),
+            "the §4.2.5 fast path must still fire on the case it exists for"
+        );
+    }
+
+    /// The bug. Both replies are `H`; they carry different values.
+    ///
+    /// This is the shape a restarted leader produces: `n0` proposed a client
+    /// command at slot `k` with `H`, crashed before a majority recorded it,
+    /// came back, and `begin_catch_up` re-proposed at `k` -- with `H` again,
+    /// but carrying a catch-up probe instead.
+    #[test]
+    fn a_mixed_h_quorum_does_not_fast_decide() {
+        let q = quorum([
+            (0, reply_with("from-the-leaders-first-proposal", H, 0)),
+            (1, reply_with("from-the-leaders-catch-up-probe", H, 0)),
+        ]);
+        assert_eq!(
+            fast_path_value(&q),
+            None,
+            "an all-H quorum carrying two different values breaks Lemma C.10's premise; \
+             deciding either one of them is an Agreement violation, so the fast path \
+             must decline"
+        );
+    }
+
+    /// Same two proposals, both node-id assignments.
+    ///
+    /// The old body returned `first_reply.value` -- the value from the
+    /// *lowest `NodeId`* in the map, since `BTreeMap` iterates in key order.
+    /// So two proposers holding the same pair of `H` proposals but reaching
+    /// quorum over differently-numbered recorders would decide differently.
+    /// That asymmetry *is* the divergence; pinning both orderings is what
+    /// shows the refusal does not merely relabel it.
+    #[test]
+    fn the_refusal_does_not_depend_on_node_id_order() {
+        let one_way = quorum([
+            (0, reply_with("value-a", H, 0)),
+            (1, reply_with("value-b", H, 0)),
+        ]);
+        let other_way = quorum([
+            (0, reply_with("value-b", H, 0)),
+            (1, reply_with("value-a", H, 0)),
+        ]);
+        assert_eq!(fast_path_value(&one_way), None);
+        assert_eq!(fast_path_value(&other_way), None);
+    }
+
+    /// Values equal, but proposed by different origins.
+    ///
+    /// `Proposal`'s equality covers `origin` too, so this is refused as
+    /// well. That is the conservative direction -- a slot where two replicas
+    /// both believe they lead is exactly the misconfiguration
+    /// `Proposer::leader`'s docs warn about, and declining the round trip is
+    /// the right response to it even though the two agree on the value here.
+    #[test]
+    fn same_value_from_two_origins_is_still_refused() {
+        let q = quorum([
+            (0, reply_with("agreed-value", H, 0)),
+            (1, reply_with("agreed-value", H, 2)),
+        ]);
+        assert_eq!(
+            fast_path_value(&q),
+            None,
+            "two distinct H-attaching origins means more than one replica believes it \
+             is the leader -- the premise is broken even when the values happen to match"
+        );
+    }
+
+    /// A quorum with one non-`H` reply never fast-decided and still must
+    /// not: this pins that the new early return did not widen acceptance.
+    #[test]
+    fn a_quorum_with_any_non_h_reply_does_not_fast_decide() {
+        let leader_last = quorum([
+            (0, reply_with("leaderless-draw", 42, 1)),
+            (1, reply_with("the-leaders-proposal", H, 0)),
+        ]);
+        let leader_first = quorum([
+            (0, reply_with("the-leaders-proposal", H, 0)),
+            (1, reply_with("leaderless-draw", 42, 1)),
+        ]);
+        assert_eq!(fast_path_value(&leader_last), None);
+        assert_eq!(fast_path_value(&leader_first), None);
+    }
 }

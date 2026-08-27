@@ -33,6 +33,7 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use queso_consensus::H;
 use queso_sim::ids::NodeId;
 use queso_sim::scheduler::{ContentObliviousAdversary, SchedulerKind};
 use queso_smr::{ClientId, Command, SmrCluster};
@@ -272,4 +273,189 @@ fn a_repeatedly_restarted_leader_never_diverges_n5() {
     for seed in 0..12u64 {
         scenario(5, seed, seed.wrapping_mul(41) + 3, NodeId(0), NodeId(0), 2);
     }
+}
+
+// ---------------------------------------------------------------------
+// The precondition behind `fast_path_value`'s uniformity check.
+// ---------------------------------------------------------------------
+
+/// Is this the restart catch-up probe (`CATCH_UP_CLIENT`, private to
+/// `queso_smr::replica`)?
+fn is_catch_up_probe(command: &Command) -> bool {
+    matches!(command, Command::Get { client, .. } if client.0 == u32::MAX)
+}
+
+/// Every `(replica, slot)` recorder currently holding an `H`-priority
+/// proposal, as `(slot, value, origin)`.
+///
+/// `IsrSummary::first` is `F[S]` at the recorder's *current* step, not
+/// specifically `F[4]`. So this is a post-hoc snapshot, not a trace: once a
+/// slot advances past round 1 everywhere, whatever `F[4]` held is no longer
+/// visible here. It can therefore establish that an `H`-tagged proposal
+/// exists, but **not** that one never existed — see
+/// `the_mixed_h_state_was_not_observed_by_this_snapshot` for what that
+/// costs.
+fn live_h_proposals(cluster: &SmrCluster, upto: u64) -> Vec<(u64, Command, NodeId)> {
+    let mut found = Vec::new();
+    for &replica in cluster.replicas() {
+        for slot in 0..upto {
+            if let Some(summary) = cluster.recorder_summary(replica, slot) {
+                if let Some(proposal) = summary.first {
+                    if proposal.priority == H {
+                        found.push((slot, proposal.value, proposal.origin));
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Run the standard leader-crash scenario and return every `H` proposal
+/// left visible in recorder state afterwards.
+fn h_proposals_after_leader_restarts(seed: u64) -> Vec<(u64, Command, NodeId)> {
+    let adversary = ContentObliviousAdversary::new(1, 8).with_drop_probability(0.15);
+    let mut cluster = SmrCluster::new_with_leader(
+        seed,
+        SchedulerKind::Oblivious(Box::new(adversary)),
+        3,
+        Some(NodeId(0)),
+    );
+    let workload_seed = seed.wrapping_mul(31) + 1;
+    warm_up(&mut cluster, NodeId(0), workload_seed);
+    for cycle in 0..2u64 {
+        cluster.crash(NodeId(0));
+        run_workload(
+            &mut cluster,
+            workload_seed.wrapping_mul(7).wrapping_add(cycle),
+            6,
+            100 + cycle * 100,
+        );
+        cluster.restart(NodeId(0));
+        run_workload(
+            &mut cluster,
+            workload_seed.wrapping_mul(13).wrapping_add(cycle),
+            6,
+            500 + cycle * 100,
+        );
+    }
+    let upto = cluster
+        .replicas()
+        .iter()
+        .map(|&r| cluster.next_slot(r))
+        .max()
+        .unwrap_or(0)
+        + 8;
+    live_h_proposals(&cluster, upto)
+}
+
+/// **A restarted leader's catch-up probe carries the reserved priority `H`.**
+///
+/// This is the precondition for the input
+/// `queso_consensus::proposer::fast_path_value` now refuses, and without it
+/// that refusal would be guarding a state nothing can produce.
+///
+/// The path: `SmrNode::begin_catch_up` builds the probe's `Proposer` with
+/// `leader_policy.leader_for(slot)` — the same leader hint an ordinary
+/// client proposal gets — and a fresh `Proposer` starts at
+/// `FIRST_ROUND_STEP`. `Proposer::begin_step`'s `is_fast_path_round` is
+/// therefore true for a leader proposing its own probe, and §4.2.5 attaches
+/// `H`. So a leader that crashes with an in-flight proposal at slot `k` and
+/// restarts issues a **second, differently-valued** `H` proposal at `k`.
+///
+/// `Proposer::leader`'s docs anticipate two *different* replicas each
+/// attaching `H`. This is the same replica, twice, at one slot — which the
+/// docs did not anticipate and the type system does not prevent.
+///
+/// # This test is a tripwire for the fix
+///
+/// The candidate fix for #83 is that a catch-up probe must never carry `H`:
+/// it is a *learning* operation, not a proposal, and has no business on the
+/// fast path. When that lands, this test goes red. **That is correct and
+/// intended** — invert it to assert the probe is never `H`, and treat the
+/// red as confirmation the fix reached the path it was aimed at.
+#[test]
+fn a_restarted_leaders_catch_up_probe_carries_the_reserved_priority() {
+    let mut seeds_with_probe = 0usize;
+    let mut probes = 0usize;
+    for seed in 0..24u64 {
+        let found = h_proposals_after_leader_restarts(seed);
+
+        // Anti-vacuity: `H` must be present at all, or "we found no
+        // H-tagged probe" would just mean the scenario produced no fast
+        // path to look at.
+        assert!(
+            !found.is_empty(),
+            "seed {seed}: no H-priority proposal anywhere in recorder state, so the leader \
+             fast path never armed and this seed proves nothing about probes"
+        );
+
+        let seed_probes = found
+            .iter()
+            .filter(|(_, command, _)| is_catch_up_probe(command))
+            .count();
+        for (slot, command, origin) in found.iter().filter(|(_, c, _)| is_catch_up_probe(c)) {
+            assert_eq!(
+                *origin,
+                NodeId(0),
+                "seed {seed}: an H-tagged catch-up probe at slot {slot} originated at \
+                 {origin}, which is not the configured leader -- H is never drawn \
+                 randomly, so only a leader can attach it ({command:?})"
+            );
+        }
+        if seed_probes > 0 {
+            seeds_with_probe += 1;
+            probes += seed_probes;
+        }
+    }
+
+    assert!(
+        seeds_with_probe >= 12,
+        "only {seeds_with_probe}/24 seeds left an H-tagged catch-up probe visible \
+         (measured: 24/24, {probes} probes). Far fewer means either the scenario stopped \
+         restarting the leader into catch-up, or the probe stopped carrying H -- if the \
+         latter, #83's fix has landed and this test should be inverted, not relaxed"
+    );
+}
+
+/// The companion negative result, recorded so it is not re-derived.
+///
+/// Scanning the same 24 scenarios for a slot where two recorders hold `H`
+/// with *different* proposals — the exact input `fast_path_value` refuses —
+/// finds none. That is **not** evidence the state is unreachable, and this
+/// test does not assert that it is. `IsrSummary::first` is `F[S]` at the
+/// recorder's current step, so a mixed `F[4]` that has since been
+/// superseded everywhere is invisible to this snapshot; and `Kernel::restart`
+/// reuses the same heap-resident node, so the sim's restart is gentler than
+/// a real one in ways `crates/net/tests/persist_fidelity.rs` documents.
+///
+/// What it does assert is that the count is *zero*, so that if a future
+/// change makes the mixed state common this test goes red and says so. A
+/// silent drift from "never observed" to "routine" is the kind of thing
+/// that stayed invisible through five occurrences of #83.
+#[test]
+fn the_mixed_h_state_was_not_observed_by_this_snapshot() {
+    let mut mixed = Vec::new();
+    for seed in 0..24u64 {
+        let found = h_proposals_after_leader_restarts(seed);
+        let mut by_slot: std::collections::BTreeMap<u64, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for (slot, command, origin) in found {
+            by_slot
+                .entry(slot)
+                .or_default()
+                .insert(format!("{origin} {command:?}"));
+        }
+        for (slot, values) in by_slot {
+            if values.len() > 1 {
+                mixed.push((seed, slot, values));
+            }
+        }
+    }
+    assert!(
+        mixed.is_empty(),
+        "the mixed-H state is now observable in the simulator, which it was not when this \
+         test was written -- this is a *result*, not a regression: reproduce #83 from these \
+         scenarios rather than from the soak. Found: {mixed:?}"
+    );
 }
