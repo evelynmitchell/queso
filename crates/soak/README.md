@@ -147,6 +147,14 @@ rather than one fixed set being re-tested forever; dispatch the workflow with
 stopping at the first. `--replicas 5` is worth a run of its own; `f = 2` is
 the first size where two nodes may be faulted at once.
 
+The sustained-soak *tests* follow the same evidence contract as the binary
+(since #92, which found the one CI divergence this suite has reported was
+unadjudicable — the tests had run their cluster in a tempdir that the panic
+unwind deleted): a failing run keeps its cluster state under
+`crates/soak/soak-failures/seed-<n>`, adjudicates it in the test output via
+the same post-mortem the binary uses, and CI's soak job uploads the
+directory as an artifact on failure. A clean run removes it.
+
 **No real-process scenario runs under `cargo test`.** They are all
 `#[ignore]`d and run in [their own CI job](../../.github/workflows/ci.yml),
 which is the shape [#56] asks for: a bounded variant on every commit, plus a

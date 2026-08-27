@@ -32,9 +32,12 @@
 //! They all make the same claims. The bounded one just makes them about
 //! less turbulence, which is a statement about cost, not about confidence.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use queso_soak::cluster::{ClusterConfig, RealCluster};
+use queso_soak::evidence::retain_evidence;
+use queso_soak::postmortem::{claims_from, Postmortem};
 use queso_soak::schedule::ScheduleConfig;
 use queso_soak::soak::{Soak, SoakConfig};
 
@@ -114,11 +117,33 @@ fn soak_config(fault_seed: u64, duration_ms: u64, replicas: usize) -> SoakConfig
     }
 }
 
+/// An empty directory at `path`, replacing whatever was there -- the same
+/// contract as the `queso-soak` binary's, for the same reason: a re-run
+/// must not inherit a previous attempt's files, because stale evidence
+/// beside fresh evidence reads as evidence.
+fn fresh_dir(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    std::fs::create_dir_all(path)
+}
+
 fn run_one(fault_seed: u64, duration_ms: u64, replicas: usize) {
     let config = soak_config(fault_seed, duration_ms, replicas);
-    let data_dir = tempfile::tempdir().expect("tempdir");
+
+    // Not a tempdir. A tempdir deletes itself during panic unwind -- which
+    // is precisely when the cluster state matters. The one divergence this
+    // suite has ever reported in CI (issue #92, on a post-#88 build) is
+    // permanently unadjudicable because the unwind destroyed the replicas'
+    // durable applied logs before anything could read them. So a failing
+    // run keeps its state under `soak-failures/seed-<n>` -- the `queso-soak`
+    // binary's convention, which CI uploads -- and a clean run removes it.
+    let data_dir = PathBuf::from("soak-failures").join(format!("seed-{fault_seed}"));
+    fresh_dir(&data_dir).expect("prepare evidence dir");
+
     let mut cluster =
-        RealCluster::start(cluster_config(replicas), data_dir.path()).expect("boot cluster");
+        RealCluster::start(cluster_config(replicas), &data_dir).expect("boot cluster");
     cluster.await_ready(Duration::from_secs(45)).expect("ready");
 
     let soak = Soak::new(config.clone());
@@ -128,6 +153,33 @@ fn run_one(fault_seed: u64, duration_ms: u64, replicas: usize) {
 
     let report = soak.run(&mut cluster);
     eprintln!("{}", report.render());
+
+    // The nodes must be down before their durable snapshots are preserved
+    // or read; dropping the cluster kills them.
+    drop(cluster);
+
+    let failed = !report.problems(&config).is_empty();
+    match retain_evidence(&data_dir, failed) {
+        Ok(Some(path)) => {
+            // Adjudicate in the job log while the run is still legible: the
+            // observer's claim says two replicas *reported* different blocks;
+            // only their durable applied logs can say whether they *applied*
+            // different commands (issue #73). An artifact has to be noticed
+            // and downloaded before it expires; the log does not.
+            eprintln!("evidence kept: {}", path.display());
+            match Postmortem::open(&path) {
+                Ok(postmortem) => {
+                    eprint!("{}", postmortem.render(&claims_from(&report.divergences)));
+                }
+                Err(e) => eprintln!("post-mortem unavailable for {}: {e:#}", path.display()),
+            }
+        }
+        Ok(None) => {}
+        // Commentary on a verdict already reached -- it must never become a
+        // second way for the test to fall over.
+        Err(e) => eprintln!("could not preserve {}: {e:#}", data_dir.display()),
+    }
+
     report.assert_meaningful(&config);
 }
 
