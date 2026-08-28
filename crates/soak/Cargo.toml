@@ -23,6 +23,12 @@ description = "Phase 9.2: drive the Chain-of-Blocks conformance workload against
 [dependencies]
 queso-chain = { path = "../chain" }
 queso-conformance = { path = "../conformance" }
+# For the post-mortem's recorder (ISR) reading (issue #84): `IsrSummary`
+# and `Proposal` are the types `SmrNode::recorder_summaries` hands back,
+# and `H` is what lets the report print the reserved priority as "H"
+# rather than as u64::MAX -- the form every #83-family fingerprint is
+# written in.
+queso-consensus = { path = "../consensus" }
 queso-net = { path = "../net" }
 queso-sim = { path = "../sim" }
 queso-smr = { path = "../smr" }

@@ -859,6 +859,7 @@ dependencies = [
  "clap",
  "queso-chain",
  "queso-conformance",
+ "queso-consensus",
  "queso-net",
  "queso-sim",
  "queso-smr",

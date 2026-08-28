@@ -144,4 +144,37 @@ fn the_durable_logs_corroborate_every_hash_the_observer_saw() {
         ),
         "a hash off by one bit was still confirmed -- the check is not checking"
     );
+
+    // Issue #84: the recorder (ISR) state made it to disk and back. The
+    // unit tests can only fabricate summaries; this proves the real
+    // driver's snapshots carry real recorders and the loader reads them --
+    // the calibration run for the instrument that adjudicates the next
+    // #83-shaped occurrence.
+    for log in postmortem.logs() {
+        assert!(
+            !log.recorders.is_empty(),
+            "replica {} preserved no recorder state at all -- either the run \
+             never exercised its recorder (implausible on a healthy cluster) \
+             or the loader dropped it:\n{}",
+            log.replica,
+            postmortem.render(&claims)
+        );
+    }
+    let (&probe_slot, _) = postmortem
+        .logs()
+        .next()
+        .expect("three logs were asserted above")
+        .recorders
+        .iter()
+        .next_back()
+        .expect("non-empty was asserted above");
+    let text = postmortem.render_with_slot(&claims, Some(probe_slot));
+    assert!(
+        text.contains("recorder (ISR) state around slot"),
+        "forcing a slot must render the recorder section:\n{text}"
+    );
+    assert!(
+        text.contains("step="),
+        "the section must show at least one real ISR summary:\n{text}"
+    );
 }
