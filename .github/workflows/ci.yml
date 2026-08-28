@@ -35,6 +35,51 @@ jobs:
       - name: cargo test
         run: cargo test --all
 
+  # The abstract TLA+ model, checked rather than pasted (issue #78). ~20s
+  # of TLC, so it fits the commit gate; the concrete model (~15 min) runs
+  # on a schedule in tlc-nightly.yml -- same per-PR/nightly split, and the
+  # same jar-vendoring and exact-count rationale documented there.
+  #
+  # The exact-count assertion is the load-bearing half: a model or config
+  # edit that silently shrank the state space would still pass every
+  # invariant, and its green would mean nothing. "Generated" as well as
+  # "distinct" is pinned -- measured identical across 2 and 4 workers and
+  # two TLC builds (2.19 and 2026.08.21); see spec/README.md.
+  tlc-abstract:
+    name: "TLC: abstract model"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      EXPECTED: "3681792 states generated, 106704 distinct states found, 0 states left on queue"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Model-check QuePaxaAbstract
+        run: |
+          java -XX:+UseParallelGC -cp spec/tla2tools.jar tlc2.TLC \
+            -workers 4 -config spec/QuePaxaAbstract.cfg spec/QuePaxaAbstract.tla \
+            2>&1 | tee tlc-abstract.log
+
+      - name: Assert the run is complete, correct, and the recorded size
+        run: |
+          grep -q "Model checking completed. No error has been found." tlc-abstract.log || {
+            echo "::error::TLC found an error or did not complete -- see the log above for the trace."
+            exit 1
+          }
+          grep -qF "$EXPECTED" tlc-abstract.log || {
+            echo "::error::TLC completed clean but the state space is not the recorded one."
+            echo "Expected: $EXPECTED"
+            echo "Got:      $(grep -E 'states generated, .* distinct states found' tlc-abstract.log | tail -1)"
+            echo "If the model/config changed deliberately, update this job's EXPECTED"
+            echo "and the pasted output in spec/README.md together. If not, this is a finding."
+            exit 1
+          }
+
   # The real-process suite gets a job of its own rather than a place in
   # `cargo test --all`. Every scenario boots real `queso-node` processes and
   # spends most of its wall clock asleep waiting for real timers, so folding

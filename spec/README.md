@@ -228,10 +228,12 @@ containment property that mentions them is Assert-checked at that moment).
 
 ## How to run TLC
 
-From the repository root (any TLA+ distribution's `tla2tools.jar` works):
+From the repository root, with the vendored jar (any TLA+ distribution's
+`tla2tools.jar` also works -- see "Checked in CI" below for why one is
+vendored and which build it is):
 
 ```
-java -XX:+UseParallelGC -cp <path-to>/tla2tools.jar tlc2.TLC \
+java -XX:+UseParallelGC -cp spec/tla2tools.jar tlc2.TLC \
      -workers 4 -config spec/QuePaxaAbstract.cfg spec/QuePaxaAbstract.tla
 ```
 
@@ -577,10 +579,11 @@ nothing observes a not-yet-started proposer).
 
 ## How to run TLC
 
-From the repository root (any TLA+ distribution's `tla2tools.jar`):
+From the repository root, with the vendored jar (see "Checked in CI" at
+the end of this file):
 
 ```
-java -XX:+UseParallelGC -cp <path-to>/tla2tools.jar tlc2.TLC \
+java -XX:+UseParallelGC -cp spec/tla2tools.jar tlc2.TLC \
      -workers auto -config spec/QuePaxaConcrete.cfg spec/QuePaxaConcrete.tla
 ```
 
@@ -667,3 +670,50 @@ non-trivial executions:
   *action* property, its violation also confirms action properties are
   genuinely enforced under the `SYMMETRY` declaration.
 
+
+## Checked in CI (issue #78)
+
+Until #78, everything above the two "Completed TLC output" blocks was a
+claim and the blocks themselves were paste -- nothing re-ran TLC, so a
+model or config edit that broke an invariant, or silently shrank the
+state space, would have left this file reading as reassurance. Both
+models are now checked mechanically:
+
+- **Abstract** (`tlc-abstract` job in `ci.yml`): every push and pull
+  request, ~20s.
+- **Concrete** (`tlc-nightly.yml`): daily at 05:00 UTC (offset from the
+  07:00 nightly soak), ~15 minutes, plus `workflow_dispatch`.
+
+Each job asserts two things, deliberately separate: `Model checking
+completed. No error has been found.` (a violation fails here, with the
+counterexample trace in the job log), and the **exact final state-count
+line** reproduced above -- `3681792 states generated, 106704 distinct
+states found, 0 states left on queue` for the abstract model,
+`165876224 states generated, 13323585 distinct states found, 0 states
+left on queue` for the concrete one. The count assertion is the
+load-bearing half: a state space that silently changed shape can pass
+every invariant, and its green would mean nothing. A deliberate model
+change updates the workflow's `EXPECTED` and this file's pasted output
+together; an undeliberate mismatch is a finding.
+
+Pinning "generated" as well as "distinct" rests on a measurement, not an
+assumption: the counts came back identical across 2 and 4 workers and
+across two TLC builds (2.19 of 2024-08-08, which produced the pasted
+outputs above, and 2026.08.21.155922, the vendored jar). If a future
+TLC build ever varies the generated count, relax the assertion to the
+distinct count and record why here.
+
+### Why `tla2tools.jar` is vendored
+
+`spec/tla2tools.jar` (sha256
+`eabd140a70f49eb9305a3bd3f3df944eddf87e5a90d329789085f8953a80533a`,
+reports itself as `TLC2 Version 2026.08.21.155922 (rev: 9787e65)`) is
+committed rather than downloaded in CI because the upstream release
+asset is a **rolling build**: the same
+`tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar` URL served TLC
+2.19 in 2024 and the 2026 build above today, so a download can neither
+be pinned durably by checksum nor trusted to keep reproducing the
+recorded counts. The vendored jar is, by construction, the build that
+reproduced them. Upgrading it is deliberate: swap the jar, re-run both
+models, and update the recorded outputs and checksums in the same
+commit.

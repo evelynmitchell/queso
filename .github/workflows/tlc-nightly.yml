@@ -1,0 +1,85 @@
+# The concrete TLA+ model, checked on a timer.
+#
+# `ci.yml`'s `tlc-abstract` job checks the abstract model on every commit
+# (~20s). This workflow is the other half of issue #78: the concrete
+# (Algorithm 4 / ISR) model is ~13.3M distinct states and ~15 minutes of
+# TLC, which is the wrong shape for a commit gate but exactly right for a
+# schedule -- the same split the testing plan prescribes for the DST soak.
+#
+# Until #78, both models' TLC results existed only as output pasted into
+# `spec/README.md` -- a claim, not a check. A model or config edit that
+# broke an invariant, or silently shrank the state space, would have left
+# the pasted numbers reading as reassurance. Now the numbers are asserted:
+# the run must complete with no error AND reproduce the exact recorded
+# state counts, so both a violation and a silently changed state space go
+# red.
+#
+# The jar is vendored at `spec/tla2tools.jar` rather than downloaded:
+# upstream's release asset is a rolling build (the same URL served TLC
+# 2.19 in 2024 and a 2026 build today), so a download can neither be
+# pinned durably nor trusted to reproduce the recorded counts. The
+# vendored jar is by construction the one that did. See spec/README.md.
+name: TLC concrete model
+
+on:
+  schedule:
+    # 05:00 UTC daily -- offset from the 07:00 nightly soak so the two
+    # long workflows never compete for the runner pool.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+env:
+  # The exact final line of a correct, complete run. "Generated" as well
+  # as "distinct" is pinned: measured identical across 2 and 4 workers and
+  # two TLC builds (2.19 and 2026.08.21) -- see spec/README.md. If this
+  # line ever changes because the model or config deliberately changed,
+  # update it together with the pasted output in spec/README.md; a change
+  # you did not make deliberately is the finding.
+  EXPECTED: "165876224 states generated, 13323585 distinct states found, 0 states left on queue"
+
+jobs:
+  tlc-concrete:
+    name: "TLC: concrete model (exhaustive)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Model-check QuePaxaConcrete
+        run: |
+          java -XX:+UseParallelGC -cp spec/tla2tools.jar tlc2.TLC \
+            -workers auto -config spec/QuePaxaConcrete.cfg spec/QuePaxaConcrete.tla \
+            2>&1 | tee tlc-concrete.log
+
+      # Two assertions, deliberately separate: "no error" catches an
+      # invariant/property violation (the log above carries the
+      # counterexample trace); the exact-count line catches a state space
+      # that silently changed shape while still passing -- the failure
+      # mode that makes a green meaningless.
+      - name: Assert the run is complete, correct, and the recorded size
+        run: |
+          grep -q "Model checking completed. No error has been found." tlc-concrete.log || {
+            echo "::error::TLC found an error or did not complete -- see the log above for the trace."
+            exit 1
+          }
+          grep -qF "$EXPECTED" tlc-concrete.log || {
+            echo "::error::TLC completed clean but the state space is not the recorded one."
+            echo "Expected: $EXPECTED"
+            echo "Got:      $(grep -E 'states generated, .* distinct states found' tlc-concrete.log | tail -1)"
+            echo "If the model/config changed deliberately, update this workflow's EXPECTED"
+            echo "and the pasted output in spec/README.md together. If not, this is a finding."
+            exit 1
+          }
+
+      - name: Upload the full TLC log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlc-concrete-log-run${{ github.run_number }}
+          path: tlc-concrete.log
+          retention-days: 30

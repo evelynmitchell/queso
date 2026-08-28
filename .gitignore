@@ -11,3 +11,7 @@ Cargo.lock.orig
 # directory (cargo runs a test with its package as the working directory) --
 # hence unanchored (#92).
 soak-failures/
+
+# TLC's on-disk state fingerprint scratch, written to the CWD by local
+# model-checking runs (spec/README.md "How to run TLC").
+/states/
