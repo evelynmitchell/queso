@@ -84,8 +84,16 @@ jobs:
       - name: Configure Pages
         uses: actions/configure-pages@v5
         with:
-          # Creates the Pages site on first run so no manual settings
-          # step is needed; a no-op once it exists.
+          # Tries to create the Pages site if it does not exist yet. This
+          # CANNOT succeed with the default GITHUB_TOKEN -- site creation
+          # needs administration:write, which workflow tokens are never
+          # granted, and run 1 failed here with exactly that error
+          # ("Resource not accessible by integration"). The one-time
+          # manual step is: Settings -> Pages -> Build and deployment ->
+          # Source: "GitHub Actions". Once the site exists this step only
+          # reads it, and enablement is a no-op; it is kept so the error
+          # on a fresh fork points here instead of failing later in
+          # deploy-pages with less context.
           enablement: true
 
       - name: Upload site artifact
