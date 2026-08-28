@@ -507,6 +507,28 @@ impl SmrNode {
             .map(|r| r.peek())
     }
 
+    /// Every recorder this replica holds, summarized, keyed by slot -- the
+    /// bulk sibling of [`Self::recorder_summary`], with the same
+    /// justification (issue #84): a post-mortem rehydrates a preserved
+    /// [`Durable`] once and needs the whole map, because which slots even
+    /// *have* recorders is part of the evidence -- a per-slot accessor
+    /// cannot enumerate them, and "no recorder for slot k" must come from
+    /// the map's keys, not from a caller guessing which slots to probe.
+    ///
+    /// A bookkeeping clone of small per-slot summaries, paid once at
+    /// post-mortem load time -- never on any protocol path.
+    pub fn recorder_summaries(
+        &self,
+    ) -> std::collections::BTreeMap<u64, queso_consensus::isr::IsrSummary<Command>> {
+        self.state
+            .borrow()
+            .durable
+            .recorders
+            .iter()
+            .map(|(&slot, r)| (slot, r.peek()))
+            .collect()
+    }
+
     /// An owned snapshot of this replica's current [`Durable`] state --
     /// bookkeeping only, no logic change (a plain `Clone` of the shared
     /// `Rc<RefCell<_>>`'s durable half). See [`Self::from_durable`] and

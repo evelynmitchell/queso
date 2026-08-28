@@ -55,6 +55,14 @@ struct Args {
     /// that replica's own applied log.
     #[arg(long = "claim", value_parser = parse_claim)]
     claims: Vec<Claim>,
+
+    /// Focus the recorder (ISR) section on this slot instead of the
+    /// auto-selected disputed one (issue #84). Without it, the section
+    /// covers the earliest slot at which the applied logs differ, falling
+    /// back to the observer's disputed height when they agree; with it, a
+    /// slot can be interrogated by hand.
+    #[arg(long)]
+    slot: Option<u64>,
 }
 
 /// `<replica>@<n>=<hex>`, parsed whole. Both halves of the `(n, h)` pair
@@ -95,7 +103,7 @@ fn main() -> ExitCode {
         }
     };
 
-    print!("{}", postmortem.render(&args.claims));
+    print!("{}", postmortem.render_with_slot(&args.claims, args.slot));
 
     let pairs = postmortem.pairs();
     if pairs

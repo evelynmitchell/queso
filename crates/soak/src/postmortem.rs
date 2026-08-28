@@ -47,21 +47,35 @@ use std::path::{Path, PathBuf};
 
 use queso_chain::{command_digest, BlockHash, ChainState};
 use queso_conformance::observer::Divergence;
+use queso_consensus::isr::IsrSummary;
+use queso_consensus::{Proposal, H};
 use queso_net::persist::Store;
 use queso_sim::ids::NodeId;
 use queso_smr::{Command, SmrNode};
 
-/// One replica's durable applied log, recovered from a preserved data dir.
+/// One replica's durable evidence, recovered from a preserved data dir:
+/// its applied log, plus its per-slot recorder (ISR) state.
 ///
 /// `commands[i]` is the command this replica applied at slot `i`; slots are
 /// gap-free (P7), so the index *is* the slot and the chain over
 /// `commands[..k]` is exactly this replica's `(k, h)` chain state.
+///
+/// `recorders` (issue #84) is the state the applied log cannot speak for:
+/// what this replica's recorder had durably registered per slot -- the ISR
+/// `(S, F, A_p)` summary P12 exists to protect. It is what distinguishes
+/// "the decision was lost after being recorded" from "the recorder never
+/// durably saw the step" on the next #83-shaped occurrence. Absence of a
+/// slot key is itself evidence (this replica's recorder was never touched
+/// there) and is kept distinct from an absent snapshot -- see
+/// [`RecorderView`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedLog {
     /// Which replica this log belongs to, from its snapshot filename.
     pub replica: NodeId,
     /// The applied commands, in slot order.
     pub commands: Vec<Command>,
+    /// Per-slot recorder (ISR) summaries, keyed by slot.
+    pub recorders: BTreeMap<u64, IsrSummary<Command>>,
 }
 
 impl AppliedLog {
@@ -74,13 +88,14 @@ impl AppliedLog {
         let Some((durable, _max_tick)) = Store::new(data_dir, replica)?.load()? else {
             return Ok(None);
         };
-        // `Durable::applied_log` is `pub(crate)` to `queso-smr`; rehydrating
-        // the node is the supported way to read it back, and costs nothing
+        // `Durable`'s fields are `pub(crate)` to `queso-smr`; rehydrating
+        // the node is the supported way to read them back, and costs nothing
         // beyond the clone the load already did.
         let node = SmrNode::from_durable(1, None, durable);
         Ok(Some(Self {
             replica,
             commands: node.applied_from(0),
+            recorders: node.recorder_summaries(),
         }))
     }
 
@@ -205,6 +220,45 @@ pub enum ClaimVerdict {
     NoLog,
 }
 
+/// What a replica's preserved evidence says about its recorder at one slot
+/// (issue #84).
+///
+/// Three outcomes, deliberately unmergeable -- collapsing the middle two is
+/// the easy accident this type exists to prevent: "this replica had no
+/// record of the slot" and "this replica recorded nothing at the slot" mean
+/// different things about what it witnessed, and neither may borrow the
+/// other's rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecorderView {
+    /// A recorder exists for the slot, and this is its durable ISR summary.
+    Summary(IsrSummary<Command>),
+    /// The snapshot exists but holds no recorder for this slot: recorders
+    /// are created lazily on the first `record` RPC, so this replica's
+    /// recorder was never durably touched there. Meaningful in itself --
+    /// on the #83 fingerprint it is what "no trace of the earlier step"
+    /// looks like.
+    NoRecorder,
+    /// No snapshot was preserved for this replica at all, so there is no
+    /// evidence either way -- the recorder analogue of
+    /// [`ClaimVerdict::NoLog`].
+    NoSnapshot,
+}
+
+/// Why [`Postmortem::disputed_slot`] chose the slot it chose -- rendered
+/// into the report so a reader knows what question the recorder section is
+/// answering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotChoice {
+    /// The earliest slot at which any pair of applied logs differs. The
+    /// chain carries a difference forward, so later slots are consequences.
+    EarliestDivergence,
+    /// The logs agree everywhere they overlap, so the observer's disputed
+    /// height is used instead -- the divergence came from the observability
+    /// path, and the recorders are read precisely because nothing else is
+    /// wrong.
+    ObserverClaim,
+}
+
 /// Both sides of every reported divergence, as claims to check against the
 /// preserved logs.
 ///
@@ -285,6 +339,49 @@ impl Postmortem {
         out
     }
 
+    /// What `replica`'s preserved evidence says about its recorder at
+    /// `slot` -- see [`RecorderView`] for the three distinct answers.
+    pub fn recorder_at(&self, replica: NodeId, slot: u64) -> RecorderView {
+        let Some(log) = self.logs.get(&replica) else {
+            return RecorderView::NoSnapshot;
+        };
+        match log.recorders.get(&slot) {
+            Some(summary) => RecorderView::Summary(summary.clone()),
+            None => RecorderView::NoRecorder,
+        }
+    }
+
+    /// The slot whose recorder state the report should focus on, and why
+    /// (issue #84): the earliest slot at which any pair of applied logs
+    /// differs, because the chain carries a difference forward and a later
+    /// slot is a consequence -- falling back to the smallest disputed
+    /// height the observer claimed when the logs agree, since that
+    /// combination means the divergence came from the observability path.
+    /// `None` when there is neither: nothing is disputed, so there is no
+    /// slot to interrogate.
+    ///
+    /// The observer's `n` is a chain *height* (commands applied), so the
+    /// last command it covers sits at slot `n - 1`; the divergence between
+    /// heights `n-1` and `n` was introduced by that slot's command.
+    pub fn disputed_slot(&self, claims: &[Claim]) -> Option<(u64, SlotChoice)> {
+        let earliest = self
+            .pairs()
+            .into_iter()
+            .filter_map(|(_, _, verdict)| match verdict {
+                PairVerdict::Differ { slot, .. } => Some(slot),
+                _ => None,
+            })
+            .min();
+        if let Some(slot) = earliest {
+            return Some((slot, SlotChoice::EarliestDivergence));
+        }
+        claims
+            .iter()
+            .map(|claim| claim.n.saturating_sub(1))
+            .min()
+            .map(|slot| (slot, SlotChoice::ObserverClaim))
+    }
+
     /// Check one observer claim against the preserved logs.
     pub fn check(&self, claim: Claim) -> ClaimVerdict {
         let Some(log) = self.logs.get(&claim.replica) else {
@@ -302,8 +399,17 @@ impl Postmortem {
     }
 
     /// A human-readable adjudication: what was recovered, what the pairwise
-    /// comparison found, and how each claim fared.
+    /// comparison found, how each claim fared, and -- when anything is
+    /// disputed -- each replica's recorder (ISR) state around the disputed
+    /// slot (issue #84).
     pub fn render(&self, claims: &[Claim]) -> String {
+        self.render_with_slot(claims, None)
+    }
+
+    /// [`Self::render`], with the recorder section forced onto `slot`
+    /// instead of the auto-selected disputed slot -- what
+    /// `queso-postmortem --slot` uses to interrogate a slot by hand.
+    pub fn render_with_slot(&self, claims: &[Claim], slot: Option<u64>) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
 
@@ -369,32 +475,109 @@ impl Postmortem {
             }
         }
 
-        if claims.is_empty() {
-            return out;
+        if !claims.is_empty() {
+            let _ = writeln!(out, "\nobserver claims, against those logs:");
+            for &claim in claims {
+                let verdict = self.check(claim);
+                let _ = write!(
+                    out,
+                    "  {} at n={} showed 0x{:016x}: ",
+                    claim.replica, claim.n, claim.h
+                );
+                let _ = match verdict {
+                    ClaimVerdict::Confirmed => writeln!(out, "CONFIRMED by its applied log"),
+                    ClaimVerdict::Contradicted { recomputed } => writeln!(
+                        out,
+                        "CONTRADICTED -- its applied log folds to 0x{recomputed:016x} there, so \
+                         this sample did not come from the log"
+                    ),
+                    ClaimVerdict::ShortLog { log_len } => writeln!(
+                        out,
+                        "NO EVIDENCE -- its preserved log is only {log_len} slot(s) long"
+                    ),
+                    ClaimVerdict::NoLog => {
+                        writeln!(out, "NO EVIDENCE -- no snapshot was preserved")
+                    }
+                };
+            }
         }
-        let _ = writeln!(out, "\nobserver claims, against those logs:");
-        for &claim in claims {
-            let verdict = self.check(claim);
-            let _ = write!(
-                out,
-                "  {} at n={} showed 0x{:016x}: ",
-                claim.replica, claim.n, claim.h
-            );
-            let _ = match verdict {
-                ClaimVerdict::Confirmed => writeln!(out, "CONFIRMED by its applied log"),
-                ClaimVerdict::Contradicted { recomputed } => writeln!(
+
+        // The recorder (ISR) section (issue #84): rendered whenever a slot
+        // is in dispute (or forced by the caller), because the applied logs
+        // settle *whether* replicas diverged and the recorders are what can
+        // say *why* -- the decision lost after being recorded, or never
+        // durably recorded at all.
+        let focus = slot
+            .map(|s| (s, None))
+            .or_else(|| self.disputed_slot(claims).map(|(s, why)| (s, Some(why))));
+        if let Some((slot, why)) = focus {
+            let _ = match why {
+                None => writeln!(
                     out,
-                    "CONTRADICTED -- its applied log folds to 0x{recomputed:016x} there, so this \
-                     sample did not come from the log"
+                    "\nrecorder (ISR) state around slot {slot} (as requested):"
                 ),
-                ClaimVerdict::ShortLog { log_len } => writeln!(
+                Some(SlotChoice::EarliestDivergence) => writeln!(
                     out,
-                    "NO EVIDENCE -- its preserved log is only {log_len} slot(s) long"
+                    "\nrecorder (ISR) state around slot {slot} (the earliest slot at which the \
+                     applied logs differ):"
                 ),
-                ClaimVerdict::NoLog => writeln!(out, "NO EVIDENCE -- no snapshot was preserved"),
+                Some(SlotChoice::ObserverClaim) => writeln!(
+                    out,
+                    "\nrecorder (ISR) state around slot {slot} (from the observer's disputed \
+                     height -- the applied logs agree, so the divergence came from the \
+                     observability path):"
+                ),
             };
+
+            // Every replica anything names: the preserved ones, plus any a
+            // claim mentions -- so a replica that left no snapshot renders
+            // as exactly that, rather than silently vanishing from the
+            // section.
+            let mut replicas: BTreeSet<NodeId> = self.logs.keys().copied().collect();
+            replicas.extend(claims.iter().map(|c| c.replica));
+
+            for s in slot.saturating_sub(RECORDER_WINDOW)..=slot.saturating_add(RECORDER_WINDOW) {
+                let _ = writeln!(out, "  slot {s}:");
+                for &replica in &replicas {
+                    let _ = match self.recorder_at(replica, s) {
+                        RecorderView::Summary(summary) => writeln!(
+                            out,
+                            "    {replica}: step={} first={} prior_agg={}",
+                            summary.step,
+                            render_proposal(&summary.first),
+                            render_proposal(&summary.prior_agg),
+                        ),
+                        RecorderView::NoRecorder => writeln!(
+                            out,
+                            "    {replica}: no recorder -- its recorder was never durably \
+                             touched at this slot"
+                        ),
+                        RecorderView::NoSnapshot => writeln!(
+                            out,
+                            "    {replica}: NO EVIDENCE -- no snapshot was preserved"
+                        ),
+                    };
+                }
+            }
         }
         out
+    }
+}
+
+/// How many slots either side of the disputed one the recorder section
+/// covers. A window, not just the slot itself, because #83's mechanism
+/// lived in the relationship between a slot and its neighbours (a probe at
+/// the restart frontier, the pre-crash decision one step earlier).
+const RECORDER_WINDOW: u64 = 2;
+
+/// A proposal as the recorder section prints it: `nil` for none, and the
+/// reserved maximum priority as `H` -- the form every #83-family
+/// fingerprint is written in, and unreadable as `18446744073709551615`.
+fn render_proposal(p: &Option<Proposal<Command>>) -> String {
+    match p {
+        None => "nil".to_string(),
+        Some(p) if p.priority == H => format!("<prio=H from={} {:?}>", p.origin, p.value),
+        Some(p) => format!("<prio={} from={} {:?}>", p.priority, p.origin, p.value),
     }
 }
 
@@ -440,6 +623,23 @@ mod tests {
         AppliedLog {
             replica: NodeId(replica),
             commands,
+            recorders: BTreeMap::new(),
+        }
+    }
+
+    fn summary(step: u64, first: Option<Proposal<Command>>) -> IsrSummary<Command> {
+        IsrSummary {
+            step,
+            first,
+            prior_agg: None,
+        }
+    }
+
+    fn proposal(priority: u64, origin: u32, command: Command) -> Proposal<Command> {
+        Proposal {
+            value: command,
+            priority,
+            origin: NodeId(origin),
         }
     }
 
@@ -662,6 +862,138 @@ mod tests {
             }),
             ClaimVerdict::NoLog
         );
+    }
+
+    /// Issue #84's anti-vacuity requirement, at the type and at the text:
+    /// "a recorder exists and says X", "no recorder for that slot", and
+    /// "no snapshot for that replica" are three different answers, and the
+    /// report must keep them apart -- a missing recorder rendering as an
+    /// empty one would make "this replica had no record of the slot"
+    /// indistinguishable from "this replica recorded nothing at the slot".
+    ///
+    /// Falsifier: have `recorder_at` return
+    /// `Summary(IsrSummary::default())`-ish for an absent slot key (or
+    /// `NoRecorder` for an absent snapshot) and the respective assertion
+    /// fails.
+    #[test]
+    fn a_missing_recorder_a_missing_snapshot_and_a_recorder_are_three_answers() {
+        let mut with_recorder = log(0, run(4));
+        with_recorder
+            .recorders
+            .insert(2, summary(8, Some(proposal(7, 0, put(0, 2, 0, 2)))));
+        let pm = Postmortem::from_logs(vec![with_recorder, log(1, run(4))]);
+
+        assert!(matches!(
+            pm.recorder_at(NodeId(0), 2),
+            RecorderView::Summary(_)
+        ));
+        assert_eq!(pm.recorder_at(NodeId(0), 3), RecorderView::NoRecorder);
+        assert_eq!(pm.recorder_at(NodeId(9), 2), RecorderView::NoSnapshot);
+
+        // And the report says three different things. Forcing slot 2 so the
+        // section renders even though the logs agree; naming n9 in a claim
+        // so its absent snapshot is in scope.
+        let claim = Claim {
+            replica: NodeId(9),
+            n: 3,
+            h: 0,
+        };
+        let text = pm.render_with_slot(&[claim], Some(2));
+        assert!(text.contains("n0: step=8"), "{text}");
+        assert!(
+            text.contains("n1: no recorder -- its recorder was never durably touched"),
+            "{text}"
+        );
+        assert!(
+            text.contains("n9: NO EVIDENCE -- no snapshot was preserved"),
+            "{text}"
+        );
+    }
+
+    /// The earliest divergent slot outranks the observer's claim: the chain
+    /// carries a difference forward, so the claimed height is downstream of
+    /// the cause.
+    ///
+    /// Falsifier: consult claims before pairs in `disputed_slot` and this
+    /// reports slot 6 (the claim's n=7 minus one).
+    #[test]
+    fn the_recorder_focus_is_the_earliest_divergent_slot_not_the_claimed_height() {
+        let mut theirs = run(8);
+        theirs[3] = put(9, 3, 0, 300);
+        let pm = Postmortem::from_logs(vec![log(0, run(8)), log(1, theirs)]);
+        let claim = Claim {
+            replica: NodeId(0),
+            n: 7,
+            h: 0,
+        };
+        assert_eq!(
+            pm.disputed_slot(&[claim]),
+            Some((3, SlotChoice::EarliestDivergence))
+        );
+    }
+
+    /// When the logs agree, the observer's disputed height is the only slot
+    /// worth interrogating -- and the report must say the divergence came
+    /// from the observability path, because that is what agreement plus a
+    /// disputed claim means. The observer's `n` is a height; the command
+    /// that introduced the disputed state sits at slot `n - 1`.
+    #[test]
+    fn agreeing_logs_fall_back_to_the_observers_height_and_say_why() {
+        let pm = Postmortem::from_logs(vec![log(0, run(8)), log(1, run(8))]);
+        let claim = Claim {
+            replica: NodeId(0),
+            n: 5,
+            h: 0xdead,
+        };
+        assert_eq!(
+            pm.disputed_slot(&[claim]),
+            Some((4, SlotChoice::ObserverClaim))
+        );
+        let text = pm.render(&[claim]);
+        assert!(
+            text.contains("the divergence came from the observability path"),
+            "{text}"
+        );
+    }
+
+    /// Nothing disputed, nothing to interrogate: the section must be absent
+    /// rather than rendered around some arbitrary slot -- a recorder dump on
+    /// every clean adjudication would bury the verdicts that matter.
+    #[test]
+    fn a_clean_adjudication_renders_no_recorder_section() {
+        let pm = Postmortem::from_logs(vec![log(0, run(8)), log(1, run(8))]);
+        assert_eq!(pm.disputed_slot(&[]), None);
+        assert!(!pm.render(&[]).contains("recorder (ISR) state"));
+    }
+
+    /// The window covers the disputed slot's neighbourhood (#83's mechanism
+    /// lived between a slot and its neighbours), clamped at slot 0 rather
+    /// than underflowing.
+    #[test]
+    fn the_recorder_window_spans_the_disputed_slot_and_clamps_at_zero() {
+        let pm = Postmortem::from_logs(vec![log(0, run(8))]);
+        let text = pm.render_with_slot(&[], Some(1));
+        for s in 0..=3 {
+            assert!(
+                text.contains(&format!("slot {s}:")),
+                "missing slot {s}: {text}"
+            );
+        }
+        assert!(!text.contains("slot 4:"), "{text}");
+    }
+
+    /// The reserved maximum priority renders as `H`, the form every
+    /// #83-family fingerprint is written in -- not as u64::MAX's twenty
+    /// digits.
+    #[test]
+    fn the_reserved_priority_renders_as_h() {
+        let mut mine = log(0, run(4));
+        mine.recorders
+            .insert(2, summary(4, Some(proposal(H, 0, put(0, 2, 0, 2)))));
+        let pm = Postmortem::from_logs(vec![mine]);
+        let text = pm.render_with_slot(&[], Some(2));
+        assert!(text.contains("prio=H"), "{text}");
+        assert!(!text.contains("18446744073709551615"), "{text}");
     }
 
     /// The loader against real files written by the real `Store`.
