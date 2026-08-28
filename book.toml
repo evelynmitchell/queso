@@ -1,0 +1,26 @@
+# mdbook configuration for the narrative docs site (issue #80).
+#
+# The book's source IS `docs/` -- the same files the README links to and
+# GitHub renders. Nothing is copied or duplicated: `docs/SUMMARY.md` gives
+# them an order and a sidebar, and `docs/spec.md` is a one-line include
+# shim so `spec/README.md` can stay canonical next to the .tla files it
+# documents. Build locally with `mdbook build` (output lands in `book/`,
+# gitignored); CI does the same in .github/workflows/pages.yml with a
+# pinned mdbook release.
+
+[book]
+title = "Queso"
+description = "A formally-checked implementation of the QuePaxa consensus algorithm"
+authors = ["Evelyn Mitchell"]
+src = "docs"
+language = "en"
+
+[build]
+build-dir = "book"
+
+[output.html]
+git-repository-url = "https://github.com/evelynmitchell/queso"
+edit-url-template = "https://github.com/evelynmitchell/queso/edit/main/docs/{path}"
+# The site is served under /queso/book/ on GitHub Pages; this only affects
+# generated absolute URLs (the 404 page), navigation stays relative.
+site-url = "/queso/book/"

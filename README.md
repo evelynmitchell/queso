@@ -374,6 +374,13 @@ In keeping with the project's design principle of not overclaiming:
 
 ## Documentation
 
+Everything below is also published as a website —
+<https://evelynmitchell.github.io/queso/> — with these documents rendered
+as a book and the full rustdoc API reference beside them. This README
+stays canonical — the site links back rather than restating it — and the
+site is rebuilt from `docs/` and rustdoc on every push to `main` (see
+`.github/workflows/pages.yml`).
+
 - [`docs/00-project-outline.md`](docs/00-project-outline.md) — master outline: goals, principles, phased roadmap, milestones.
 - [`docs/01-backgrounder.md`](docs/01-backgrounder.md) — white-paper backgrounder on the consensus problem space, QuePaxa, and Meerkat, with references.
 - [`docs/02-properties.md`](docs/02-properties.md) — the full property model (invariants, anti-properties, assumptions).

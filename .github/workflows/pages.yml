@@ -1,0 +1,105 @@
+# Publish the docs site to GitHub Pages (issue #80).
+#
+# Three pieces, assembled into one artifact and deployed with
+# actions/deploy-pages -- no gh-pages branch to keep in sync:
+#
+#   /       site/index.html -- a small landing page with two doors
+#   /book/  mdbook render of docs/ (+ spec/README.md via an include shim)
+#   /api/   cargo doc --workspace --no-deps
+#
+# Publishing only `main` is deliberate (the simplest thing that works at
+# this stage), and rustdoc arrives here already gated warning-free by
+# ci.yml's cargo doc step (issue #79), so broken intra-doc links cannot
+# reach readers through a green main.
+#
+# mdbook is a pinned release binary with a sha256 check, for the same
+# reason spec/tla2tools.jar is vendored (see spec/README.md): an
+# unpinned "latest" makes the build's behavior a function of when it
+# ran. Bump the version and hash together, deliberately.
+
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; let an in-flight deploy finish rather than
+# cancelling it, so the site never lands in a half-written state.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  MDBOOK_VERSION: 0.4.52
+  MDBOOK_SHA256: c0b903f01dd8f4edc644372ad2b80b1fdddd12552d37b6a098657cbd8eddd768
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Install mdbook (pinned)
+        run: |
+          curl -sSL -o mdbook.tar.gz \
+            "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${MDBOOK_SHA256}  mdbook.tar.gz" | sha256sum -c -
+          tar -xzf mdbook.tar.gz mdbook
+
+      - name: mdbook build
+        run: ./mdbook build
+
+      - name: Assemble site
+        run: |
+          mkdir _site
+          cp site/index.html _site/
+          cp -r book _site/book
+          cp -r target/doc _site/api
+          # rustdoc leaves no index.html at its root; give /api/ a
+          # redirect so a trimmed URL lands somewhere instead of a 404.
+          cat > _site/api/index.html <<'EOF'
+          <!DOCTYPE html>
+          <meta charset="utf-8">
+          <meta http-equiv="refresh" content="0; url=queso_consensus/">
+          <a href="queso_consensus/">Redirecting to the queso-consensus API docs…</a>
+          EOF
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          # Creates the Pages site on first run so no manual settings
+          # step is needed; a no-op once it exists.
+          enablement: true
+
+      - name: Upload site artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

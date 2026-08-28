@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<!-- Landing page for the GitHub Pages site (issue #80). Deliberately
+     small: what Queso is, then two doors. The repository README stays
+     the canonical front door -- this page links, it does not restate. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Queso — a formally-checked QuePaxa consensus implementation</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fdfcf9; --fg: #24292f; --muted: #57606a;
+    --card: #ffffff; --border: #d0d7de; --accent: #b5541c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181d; --fg: #d4d8de; --muted: #8b949e;
+      --card: #1d2026; --border: #30363d; --accent: #e8925a;
+    }
+  }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 44rem; margin: 0 auto; padding: 3rem 1.25rem 4rem; }
+  h1 { font-size: 2rem; margin: 0 0 .25rem; }
+  h1 span { color: var(--accent); }
+  .tagline { color: var(--muted); margin: 0 0 1.5rem; }
+  a { color: var(--accent); }
+  .doors { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+           gap: 1rem; margin: 2rem 0; }
+  .door { display: block; background: var(--card); border: 1px solid var(--border);
+          border-radius: 8px; padding: 1rem 1.25rem; text-decoration: none;
+          color: var(--fg); }
+  .door:hover { border-color: var(--accent); }
+  .door strong { display: block; font-size: 1.15rem; color: var(--accent);
+                 margin-bottom: .25rem; }
+  .door small { color: var(--muted); }
+  h2 { font-size: 1.15rem; margin: 2.25rem 0 .5rem; }
+  ul.crates { list-style: none; padding: 0; margin: 0; }
+  ul.crates li { padding: .3rem 0; border-bottom: 1px solid var(--border); }
+  ul.crates li:last-child { border-bottom: none; }
+  ul.crates code { font-size: .95em; }
+  ul.crates small { color: var(--muted); }
+  footer { margin-top: 3rem; color: var(--muted); font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1><span>Queso</span></h1>
+  <p class="tagline">A formally-checked implementation of the
+  <a href="https://bford.info/pub/os/quepaxa/quepaxa.pdf">QuePaxa</a> consensus
+  algorithm.</p>
+
+  <p>Built ground-up and test-driven in Rust: a deterministic simulation
+  kernel, a single-slot consensus core, multi-slot state-machine
+  replication, and a real-TCP node — with a testing surface that runs
+  from property tests and TLA+ model checking to real-process
+  fault-injection soaks with post-mortem adjudication.</p>
+
+  <p>The <a href="https://github.com/evelynmitchell/queso">repository
+  README</a> is the canonical front door; this site publishes the same
+  documentation in rendered form.</p>
+
+  <div class="doors">
+    <a class="door" href="book/">
+      <strong>Documentation</strong>
+      Design docs, the property model, the testing plan, the TLA+ models,
+      and the status &amp; gap analysis.<br>
+      <small>The narrative half: why things are the way they are.</small>
+    </a>
+    <a class="door" href="api/queso_consensus/">
+      <strong>API reference</strong>
+      Rustdoc for every crate in the workspace.<br>
+      <small>Most of the project's design reasoning lives in these
+      module docs.</small>
+    </a>
+  </div>
+
+  <h2>Crates</h2>
+  <ul class="crates">
+    <li><a href="api/queso_sim/"><code>queso-sim</code></a> —
+      <small>deterministic discrete-event simulation kernel; no consensus logic.</small></li>
+    <li><a href="api/queso_consensus/"><code>queso-consensus</code></a> —
+      <small>abstract single-slot QuePaxa consensus: proposer, recorder, the interval summary register.</small></li>
+    <li><a href="api/queso_smr/"><code>queso-smr</code></a> —
+      <small>multi-slot replicated log driving a linearizable KV store, with crash-recovery and leader tuning.</small></li>
+    <li><a href="api/queso_net/"><code>queso-net</code></a> —
+      <small>the real-I/O node: TCP transport, TLS, durable persistence, the <code>queso-node</code> binary.</small></li>
+    <li><a href="api/queso_chain/"><code>queso-chain</code></a> —
+      <small>the Chain-of-Blocks <code>(n, h)</code> hash chain over an applied command sequence.</small></li>
+    <li><a href="api/queso_conformance/"><code>queso-conformance</code></a> —
+      <small>in-process Chain-of-Blocks conformance workload plus divergence/liveness observers.</small></li>
+    <li><a href="api/queso_soak/"><code>queso-soak</code></a> —
+      <small>real-process soak harness: seeded fault schedules, evidence preservation, post-mortem adjudication.</small></li>
+    <li><a href="api/queso_compare/"><code>queso-compare</code></a> —
+      <small>common workload/metrics harness comparing Queso against etcd/Raft.</small></li>
+    <li><a href="api/queso_antithesis/"><code>queso-antithesis</code></a> —
+      <small>the conformance workload packaged as an Antithesis test template.</small></li>
+  </ul>
+
+  <footer>
+    Published from <code>main</code> by
+    <a href="https://github.com/evelynmitchell/queso/blob/main/.github/workflows/pages.yml">a
+    GitHub Actions workflow</a>; rustdoc is gated warning-free in CI
+    before it ships.
+  </footer>
+</main>
+</body>
+</html>

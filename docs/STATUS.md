@@ -135,7 +135,7 @@ Verified locally by `cargo test -p queso-antithesis -- --ignored` (in CI's real-
 job): a real cluster is driven, every assertion is reached and evaluates as expected,
 `setup_complete` is signalled, and a negative control confirms the liveness properties
 can fail. Not verified: the container build, the registry push, and the run — see
-[`antithesis/README.md`](../antithesis/README.md), which is explicit about which is
+[`antithesis/README.md`](https://github.com/evelynmitchell/queso/blob/main/antithesis/README.md), which is explicit about which is
 which.
 
 ### `crates/soak` — real-process conformance harness and soak (Phase 9.2)
