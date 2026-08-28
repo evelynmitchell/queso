@@ -130,16 +130,16 @@ election), not of how well-tuned the KV layer on top of it is.
 
 `crates/compare` (binary `queso-compare`, library `queso_compare`):
 
-- [`target::KvTarget`](../crates/compare/src/target.rs) -- the one trait a
+- [`target::KvTarget`](https://github.com/evelynmitchell/queso/blob/main/crates/compare/src/target.rs) -- the one trait a
   comparison run is generic over: `async fn put(key: u32, value: i64)`,
   `async fn get(key: u32) -> Option<i64>`.
-- [`queso_target::QuesoTarget`](../crates/compare/src/queso_target.rs) --
+- [`queso_target::QuesoTarget`](https://github.com/evelynmitchell/queso/blob/main/crates/compare/src/queso_target.rs) --
   `KvTarget` over `queso_net::client::Client` (Phase 7.2's own client
   library, unmodified).
-- [`etcd_target::EtcdTarget`](../crates/compare/src/etcd_target.rs) --
+- [`etcd_target::EtcdTarget`](https://github.com/evelynmitchell/queso/blob/main/crates/compare/src/etcd_target.rs) --
   `KvTarget` over etcd's v3 gRPC-gateway JSON/HTTP API (§4 explains why not
   the `etcd-client` gRPC crate).
-- [`workload::run_workload`](../crates/compare/src/workload.rs) -- the
+- [`workload::run_workload`](https://github.com/evelynmitchell/queso/blob/main/crates/compare/src/workload.rs) -- the
   shared closed-/open-loop load generator, structurally a port of
   `crates/net/src/bin/queso-bench.rs`'s own loop, generic over any
   `KvTarget`, reducing into a `queso_net::metrics::Summary`.

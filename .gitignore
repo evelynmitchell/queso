@@ -15,3 +15,7 @@ soak-failures/
 # TLC's on-disk state fingerprint scratch, written to the CWD by local
 # model-checking runs (spec/README.md "How to run TLC").
 /states/
+
+# mdbook's build output (book.toml sets build-dir = "book"); the Pages
+# workflow builds it fresh on every deploy.
+/book/
