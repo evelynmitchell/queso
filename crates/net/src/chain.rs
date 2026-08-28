@@ -259,7 +259,7 @@ pub struct ChainReport {
     /// The replica's furthest `(n, h)`, reported every poll.
     pub frontier: ChainState,
     /// Retained checkpoints, oldest first. Each is one `ChainState`, not a
-    /// loose height and hash -- see [`ChainCheckpoints::table`].
+    /// loose height and hash -- see [`ChainCheckpoints`]'s internal table.
     pub checkpoints: Vec<ChainState>,
 }
 

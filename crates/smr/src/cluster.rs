@@ -14,7 +14,7 @@
 //! [`queso_consensus::proposer::Proposer`], unmodified from Phase 2/3. Two
 //! outcomes are possible once that slot decides:
 //!
-//! - The `get` itself is what won the slot: its result is the [`Kv`] state
+//! - The `get` itself is what won the slot: its result is the `Kv` state
 //!   after applying every slot before it (a `Get` never mutates, so
 //!   "before it" and "up to and including it" are the same state) --
 //!   exactly the value the caller receives.
@@ -28,7 +28,7 @@
 //!
 //! This is the entire mechanism (see `crate::replica::SmrNode::finish_attempt`
 //! for the code) -- there is no special-cased "catch-up RPC" or learner
-//! protocol; it falls out of running an ordinary [`Proposer`] at a slot that
+//! protocol; it falls out of running an ordinary `Proposer` at a slot that
 //! may already be (partially or fully) decided and trusting its existing
 //! majority-intersection safety argument, which was never restricted to
 //! proposers present from a slot's very first step.
@@ -38,11 +38,11 @@
 //! A crashed replica ([`SmrCluster::crash`]) stops responding entirely until
 //! [`SmrCluster::restart`] brings it back. Restarting recovers exactly the
 //! *durable* half of [`crate::replica::ReplicaState`] -- its per-slot
-//! [`Recorder`]s' ISR state (`S, F_c, A_c, A_p`, already `O(1)` per slot,
+//! `Recorder`s' ISR state (`S, F_c, A_c, A_p`, already `O(1)` per slot,
 //! D5), `next_slot`, `applied_log`, and `kv` (see
 //! [`crate::replica::Durable`]'s docs) -- while its volatile half (pending
 //! ops, any in-flight proposer) is dropped, and then rejoins as a learner:
-//! [`crate::replica::SmrNode::on_restart`] drives an internal catch-up probe
+//! `crate::replica::SmrNode::on_restart` drives an internal catch-up probe
 //! through the exact same reads-through-log mechanism described above
 //! before the replica resumes ordinary participation. See that type's docs
 //! for the full recovery sequence and for how the write-before-reply
@@ -338,7 +338,7 @@ impl SmrCluster {
     /// log frontier, applied log, `kv`) is recovered untouched, its
     /// volatile state is dropped, and it rejoins as a learner, catching up
     /// on anything decided while it was down before resuming ordinary
-    /// participation -- see [`crate::replica::SmrNode::on_restart`] for the
+    /// participation -- see `crate::replica::SmrNode::on_restart` for the
     /// exact sequence. Marks `id` live again immediately (matching
     /// `crash`'s bookkeeping), even though it may still be mid-catch-up
     /// under the hood; catch-up is safe to overlap with real traffic
@@ -467,9 +467,9 @@ impl SmrCluster {
     /// Run the kernel forward `ticks` logical ticks from wherever it
     /// currently is.
     ///
-    /// Under [`LeaderPolicy::Tuned`] this advances a tick at a time so the
+    /// Under `LeaderPolicy::Tuned` this advances a tick at a time so the
     /// kernel's leader hint can be re-synced from the tuner as epochs turn
-    /// -- see [`Self::sync_kernel_leader`]. Splitting one `run_until(t)`
+    /// -- see `Self::sync_kernel_leader`. Splitting one `run_until(t)`
     /// into successive `run_until` calls over the same range dispatches
     /// exactly the same events in exactly the same order (the queue is
     /// drained in `(time, seq)` order either way), so this changes nothing

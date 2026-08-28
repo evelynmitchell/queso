@@ -41,22 +41,22 @@
 //! short: *nothing* is dropped automatically -- `on_restart` must actively
 //! clear the volatile half itself). [`SmrNode::on_restart`] is the recovery
 //! entry point: it clears volatile state and kicks off a learner-style
-//! catch-up (see [`SmrNode::begin_catch_up`]) before the replica resumes
+//! catch-up (see `SmrNode::begin_catch_up`) before the replica resumes
 //! ordinary participation.
 //!
 //! Catch-up itself is watched by a quiescence watchdog
-//! ([`SmrNode::on_catch_up_watchdog`], armed by
-//! [`SmrNode::arm_catch_up_watchdog`]): a restarted replica that cannot yet
+//! (`SmrNode::on_catch_up_watchdog`, armed by
+//! `SmrNode::arm_catch_up_watchdog`): a restarted replica that cannot yet
 //! reach a live majority (e.g. it comes back up alone after a full-cluster
 //! crash, or during a long partition) would otherwise drive its catch-up
 //! probe through a [`Proposer`] whose per-step retries are capped and, once
 //! exhausted, never self-resume -- permanently stalling that replica even
 //! after a majority becomes reachable again. The watchdog re-issues a fresh
 //! catch-up attempt at the same frontier slot whenever the current one has
-//! made no progress for a full [`CATCH_UP_WATCHDOG_TICKS`] interval, so the
+//! made no progress for a full `CATCH_UP_WATCHDOG_TICKS` interval, so the
 //! replica keeps retrying (never faster than that interval, so it never
 //! races a genuinely-still-progressing attempt) until it can actually make
-//! progress. See [`SmrNode::on_catch_up_watchdog`]'s docs for why re-issuing
+//! progress. See `SmrNode::on_catch_up_watchdog`'s docs for why re-issuing
 //! is a pure liveness action that never touches ISR/decision/quorum
 //! correctness.
 
@@ -299,7 +299,7 @@ struct CurrentAttempt {
 ///   persist, `Kv` already carries it.
 ///
 /// Everything else in [`ReplicaState`] (the pending-op queue, the in-flight
-/// [`CurrentAttempt`]) is deliberately *not* here: it is a proposer's
+/// `CurrentAttempt`) is deliberately *not* here: it is a proposer's
 /// in-progress conversation with recorders across the network, which a real
 /// crash genuinely loses (the proposer was mid-round-trip, holding
 /// responses only in RAM) -- see [`SmrNode::on_restart`].
@@ -431,7 +431,7 @@ impl SmrNode {
     /// Build a single fresh replica participating in an `n`-replica cluster
     /// (`total_replicas`) with a fixed (or, if `None`, absent) fast-path
     /// leader for every slot -- the exact same per-replica construction
-    /// [`crate::cluster::SmrCluster::build`] performs internally for its
+    /// `crate::cluster::SmrCluster::build` performs internally for its
     /// `Kernel`-driven nodes, just exposed publicly so a non-sim driver
     /// (`queso-net`'s real-network event loop) can build and drive this
     /// same, unmodified [`Node`] implementation over a real transport
@@ -439,7 +439,7 @@ impl SmrNode {
     ///
     /// There is no `id` parameter: nothing in [`SmrNode`] itself stores
     /// this replica's own id -- every callback learns it afresh from
-    /// `ctx.self_id()` (see e.g. [`Self::begin_next_attempt`]), so it is
+    /// `ctx.self_id()` (see e.g. `Self::begin_next_attempt`), so it is
     /// entirely the driver's responsibility (sim `Kernel::add_node`'s key,
     /// or a real driver's own config) to keep a `SmrNode` instance and the
     /// id it is driven under consistent.
@@ -457,7 +457,7 @@ impl SmrNode {
     /// previously [`Self::durable_snapshot`]ted (and, in a real deployment,
     /// persisted-then-reloaded) [`Durable`], as if this replica's process
     /// had never lost that state at all. Every volatile field
-    /// ([`ReplicaState::queue`], the in-flight attempt, the watchdog
+    /// (`ReplicaState::queue`, the in-flight attempt, the watchdog
     /// bookkeeping) starts fresh, exactly like [`Self::new_fixed_leader`] --
     /// a real crash genuinely loses those (see [`Durable`]'s docs).
     ///
@@ -539,7 +539,7 @@ impl SmrNode {
     }
 
     /// This replica's current `next_slot`: the first slot index it has not
-    /// yet applied (see [`Durable::next_slot`]'s docs and this module's
+    /// yet applied (see `Durable::next_slot`'s docs and this module's
     /// docs on the reads-through-log/catch-up design). A pure, cheap read
     /// of already-tracked state -- no logic change -- added (Phase 8.2,
     /// issue #47) so a real driver (`queso-net`'s status/metrics endpoint)
@@ -577,7 +577,7 @@ impl SmrNode {
     }
 
     /// Whether this replica's current in-flight attempt (if any) is its own
-    /// internal restart catch-up probe (see [`Self::begin_catch_up`]) rather
+    /// internal restart catch-up probe (see `Self::begin_catch_up`) rather
     /// than a real client-visible operation. `true` exactly while a catch-up
     /// [`Proposer`] is live -- immediately after [`Self::on_restart`] starts
     /// one, until it decides (or a fresh one replaces it, e.g. the
@@ -591,7 +591,7 @@ impl SmrNode {
     /// about linearizable-read readiness or being fully caught up with the
     /// rest of the cluster (this replica cannot cheaply know that; catch-up
     /// only proves progress up to whatever frontier a majority could show it
-    /// at the time it asked -- see [`Self::begin_catch_up`]'s docs). A
+    /// at the time it asked -- see `Self::begin_catch_up`'s docs). A
     /// replica that was never restarted (a fresh boot, no on-disk snapshot)
     /// never calls `on_restart` at all, so this is `false` for it from the
     /// very first callback.
@@ -608,11 +608,11 @@ impl SmrNode {
     /// Submit `command`, tagged `op_id`, as a fresh client-visible
     /// operation this replica should propose -- mirrors
     /// [`crate::cluster::SmrCluster::submit`]'s enqueue-then-kick logic
-    /// exactly (guard against [`CATCH_UP_CLIENT`], compute a
+    /// exactly (guard against `CATCH_UP_CLIENT`, compute a
     /// monotonic `invoked_at`, record a pending [`OpRecord`], push onto the
     /// queue, and if the replica was idle a moment ago schedule a
     /// zero-delay [`KICKOFF_TIMER`]), so any driver reaches
-    /// [`Self::begin_next_attempt`] through the identical `Node::on_timer`
+    /// `Self::begin_next_attempt` through the identical `Node::on_timer`
     /// path the sim harness already exhaustively tests -- rather than
     /// calling it directly, which would (harmlessly, but needlessly)
     /// diverge from that verified path just because a real driver happens
@@ -1066,7 +1066,7 @@ impl Node<ConcreteMsg<Command>> for SmrNode {
     ///    again, or another -- safe.
     /// 2. Rejoin as a learner (the "recover durable state, or rejoin as a
     ///    learner and catch up" policy `docs/02-properties.md`'s P12 note
-    ///    calls for): [`Self::begin_catch_up`] drives an internal probe
+    ///    calls for): `Self::begin_catch_up` drives an internal probe
     ///    through consecutive slots starting at the *durable* `next_slot`
     ///    until it finds one nothing had decided yet, discovering (and
     ///    applying) anything decided elsewhere while this replica was

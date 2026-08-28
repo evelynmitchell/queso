@@ -26,11 +26,11 @@
 //!
 //! - **Phase 0** (`s mod 4 = 0`, "propose"): draw a fresh random priority
 //!   *per recorder* (§4.2.4 "Proposal randomization" -- yes, literally a
-//!   different priority per recipient; see [`draw_priority`]), *unless*
+//!   different priority per recipient; see `draw_priority`), *unless*
 //!   this is round 1 (`s = 4`) and `self` is the slot's designated leader
 //!   (§4.2.5), in which case every recorder instead gets the reserved
 //!   priority [`H`] verbatim. Either way, once a quorum of replies is in:
-//!   first check the fast-path decision ([`fast_path_value`]) -- if every
+//!   first check the fast-path decision (`fast_path_value`) -- if every
 //!   reply's `first` is `H`-priority, decide right now and skip the rest of
 //!   the round; otherwise set `p <- best_j(f'_j)` over the quorum's
 //!   first-value replies exactly as Phase 2 always did.
@@ -102,12 +102,12 @@
 //!
 //! [`Proposer`] optionally carries a `leader: Option<NodeId>` (set once, at
 //! construction -- see `Proposer::new`). This changes exactly two things,
-//! both confined to round 1 (`s = 4`), both in [`begin_step`] and
-//! [`process_phase`]'s phase-0 arm:
+//! both confined to round 1 (`s = 4`), both in `begin_step` and
+//! `process_phase`'s phase-0 arm:
 //!
 //! 1. If `self` *is* the leader, its phase-0 proposal carries [`H`] (the
 //!    reserved maximum priority) instead of a random draw.
-//! 2. Every proposer -- leader or not -- checks [`fast_path_value`] after
+//! 2. Every proposer -- leader or not -- checks `fast_path_value` after
 //!    gathering its phase-0 quorum: if every reply's `first` is
 //!    `H`-priority, decide immediately, without ever reaching phase 1.
 //!
@@ -122,7 +122,7 @@
 //! C.10, reproduced here because it is the crux of why fast and leaderless
 //! decisions can never disagree):
 //!
-//! - `H` is `u64::MAX`, strictly greater than anything [`draw_priority`]
+//! - `H` is `u64::MAX`, strictly greater than anything `draw_priority`
 //!   can ever produce, and only ever attached by round 1's `leader`. So if
 //!   a quorum `Q` (a genuine majority) all report `first.priority == H`,
 //!   more than `n/2` recorders wrote *the leader's own proposal* into
@@ -157,8 +157,8 @@
 //! always possible in principle -- e.g. delivering the leader's proposal to
 //! every `E` set but no `U` set, or blocking it outright) simply means the
 //! premise of the argument above never triggers *anywhere*, for *any*
-//! proposer: no quorum ever sees all-`H`, so [`fast_path_value`] never
-//! returns `Some`, [`is_leader`]'s branch in `begin_step` never matters to
+//! proposer: no quorum ever sees all-`H`, so `fast_path_value` never
+//! returns `Some`, `is_leader`'s branch in `begin_step` never matters to
 //! the outcome, and the round proceeds exactly as an ordinary leaderless
 //! one -- already proven safe on its own terms, with or without a leader's
 //! proposal in the mix. Either the fast path fires and is provably
@@ -171,16 +171,16 @@
 //! A step's outbound `record` requests (or their replies) can be delayed,
 //! reordered, or dropped by the adversary. [`Proposer`] schedules a retry
 //! timer, `TimerId(s)` (the *current* step number itself, reused as the
-//! timer's identity -- see [`retry_timer_id`]), whenever it begins a step;
+//! timer's identity -- see `retry_timer_id`), whenever it begins a step;
 //! if that timer fires before a quorum has formed, it re-sends only to
 //! recorders that have not yet replied, using the *same* proposal content
-//! recorded for them at [`begin_step`] time (never a freshly-redrawn
-//! priority -- see [`Proposer::sent`]), and reschedules itself. Because the
+//! recorded for them at `begin_step` time (never a freshly-redrawn
+//! priority -- see `Proposer::sent`), and reschedules itself. Because the
 //! timer id is the step number, a stale timer belonging to an
 //! already-superseded step is trivially recognized and ignored (`s.0 !=
 //! self.step`) rather than needing a separate generation counter.
 //!
-//! Retries are **unbounded**, with exponential backoff ([`retry_backoff_delay`])
+//! Retries are **unbounded**, with exponential backoff (`retry_backoff_delay`)
 //! capped at a maximum spacing (issue #13: the previous design, a hard
 //! `MAX_RETRIES_PER_STEP` cap after which a proposer permanently "parked"
 //! itself, could leave a slot stalled forever even after the network
@@ -208,9 +208,9 @@
 //! for where that arithmetic lives; this module only ever sees the final
 //! per-replica delay, not the schedule-construction policy).
 //!
-//! `start` on a hedged proposer does not call [`begin_step`] immediately;
+//! `start` on a hedged proposer does not call `begin_step` immediately;
 //! it arms a one-shot [`HEDGE_TIMER`] for `activation_delay` ticks out.
-//! When that timer fires ([`Proposer::maybe_activate_after_hedge`]), the
+//! When that timer fires (`Proposer::maybe_activate_after_hedge`), the
 //! proposer checks `local_recorder_step` -- a handle to *this replica's own,
 //! co-located* recorder's most-recently-observed ISR step for this slot,
 //! updated by the driver (`crate::concrete::ReplicaNode::on_message`) every
@@ -231,7 +231,7 @@
 //! - Otherwise -- no progress was ever observed, *or* the last-observed
 //!   progress has since stalled (the recorder step did not move further
 //!   between two consecutive checks) -- the proposer activates via
-//!   [`begin_step`], exactly as an unhedged proposer would.
+//!   `begin_step`, exactly as an unhedged proposer would.
 //!
 //! # Why no δ (P15) can cause a permanent stall
 //!
@@ -260,8 +260,8 @@
 //! elapses -- also bounded, trivially.
 //!
 //! One deliberate, safety-motivated limitation worth calling out: a
-//! recorder's step never advances past round 1's first step ([`FIRST_ROUND_STEP`])
-//! from fast-path activity alone ([`fast_path_value`] lets a proposer decide
+//! recorder's step never advances past round 1's first step (`FIRST_ROUND_STEP`)
+//! from fast-path activity alone (`fast_path_value` lets a proposer decide
 //! *without* the recorder-visible step ever moving beyond it), so a hedged
 //! backup cannot distinguish "the leader's fast-path proposal reached this
 //! recorder's `F[4]` but never reached a majority" from "it reached a
@@ -285,7 +285,7 @@
 //! decision outside this module's scope.
 //!
 //! This is deliberately **not** a safety mechanism: it only ever changes
-//! *when* [`begin_step`] first runs for a given proposer, never anything
+//! *when* `begin_step` first runs for a given proposer, never anything
 //! about what a step, a quorum, a decision, or catch-up mean once activated
 //! -- all of that is the same, unmodified machinery documented above. A
 //! hedged proposer that activates "late" (having deferred, or having waited
@@ -307,19 +307,19 @@ use crate::rpc::{ConcreteMsg, RecordRequest, RecordResponse};
 /// `H`, the reserved maximum priority (§4.2.5, Appendix A). Two roles:
 ///
 /// 1. It bounds the leaderless random draw range `1..H`, i.e. Algorithm 4's
-///    `random(1..H-1)` -- see [`draw_priority`]. No proposal drawn in a
+///    `random(1..H-1)` -- see `draw_priority`. No proposal drawn in a
 ///    leaderless step can ever equal `H`, by construction (`gen_range`'s
 ///    upper bound is exclusive).
 /// 2. In round 1 (`s = 4`) of a leader-based slot, the designated leader
 ///    attaches exactly `H` to its proposal instead of drawing randomly (see
-///    [`Proposer::begin_step`]'s phase-0 branch) -- Algorithm 4's `s mod 4 =
+///    `Proposer::begin_step`'s phase-0 branch) -- Algorithm 4's `s mod 4 =
 ///    0 and (s > 4 or i is not leader)` guard, negated.
 ///
 /// Because `H` is `u64::MAX` and every leaderless draw is strictly less
 /// than `H`, `H` is *the* unbeatable maximum of this priority space: once
 /// any proposal carries it, `Ord` guarantees nothing else can ever compare
 /// greater. This is exactly what the phase-0 fast-path decision rule
-/// ([`fast_path_value`]) exploits -- see that function's docs and Lemma
+/// (`fast_path_value`) exploits -- see that function's docs and Lemma
 /// C.10 in the paper.
 pub const H: u64 = u64::MAX;
 
@@ -330,7 +330,7 @@ const FIRST_ROUND_STEP: u64 = 4;
 
 /// How many logical ticks a proposer waits, at minimum, after sending (or
 /// resending) a step's requests before checking whether it needs to retry.
-/// The *actual* spacing grows with [`retry_backoff_delay`]; this is the
+/// The *actual* spacing grows with `retry_backoff_delay`; this is the
 /// base (first-retry) value.
 pub const RETRY_DELAY_TICKS: u64 = 20;
 
@@ -552,7 +552,7 @@ impl<V: Ord + Clone> Proposer<V> {
     ///
     /// # The invariant this argument carries
     ///
-    /// What must hold for [`fast_path_value`]'s safety argument is: **at
+    /// What must hold for `fast_path_value`'s safety argument is: **at
     /// most one distinct `H`-tagged proposal may ever exist for a slot.**
     /// This constructor cannot check that, and no single call site can
     /// guarantee it.
@@ -578,7 +578,7 @@ impl<V: Ord + Clone> Proposer<V> {
     /// value to every `Proposer::new` call, which satisfies the invariant
     /// for its single-slot clusters.
     /// `slot` is attached verbatim to every outgoing `record` request and
-    /// checked on every incoming reply (see [`Proposer::slot`]'s field
+    /// checked on every incoming reply (see `Proposer::slot`'s field
     /// docs); single-slot callers (this crate's own Phase 2/3 tests and
     /// [`crate::concrete::ConcreteCluster`]) always pass `0`.
     pub fn new(
@@ -696,7 +696,7 @@ impl<V: Ord + Clone> Proposer<V> {
     /// If this proposer was configured with [`Proposer::with_hedging`] and
     /// has a nonzero `activation_delay`, this does *not* activate
     /// immediately: it arms [`HEDGE_TIMER`] and defers the actual first
-    /// `begin_step` to [`Proposer::maybe_activate_after_hedge`]. With no
+    /// `begin_step` to `Proposer::maybe_activate_after_hedge`. With no
     /// hedging configured (`activation_delay == 0`, the default), this is
     /// exactly Phase 3's unconditional behavior: activate right now.
     ///
@@ -711,7 +711,7 @@ impl<V: Ord + Clone> Proposer<V> {
     /// rather than left to fall out of the code:
     ///
     /// - **Undecided: restart round 1.** `step` is reset to
-    ///   [`FIRST_ROUND_STEP`] and the first step is (re-)issued or
+    ///   `FIRST_ROUND_STEP` and the first step is (re-)issued or
     ///   re-hedged. This is a restart of *this proposer's* attempt, not of
     ///   the protocol: the recorders' ISR state is monotone and survives
     ///   independently, so the re-issued phase-0 `record` requests come
@@ -726,7 +726,7 @@ impl<V: Ord + Clone> Proposer<V> {
     ///   re-broadcasting, and without arming a hedge timer.
     ///
     /// The decided guard is not cosmetic. Without it a re-kick rewinds a
-    /// decided proposer's `step` to [`FIRST_ROUND_STEP`], which silently
+    /// decided proposer's `step` to `FIRST_ROUND_STEP`, which silently
     /// rewrites the provenance [`Proposer::decided_via_fast_path`] reports
     /// -- a replica that decided at step 8 through the ordinary
     /// spread/gather machinery would afterwards claim a phase-0 fast-path

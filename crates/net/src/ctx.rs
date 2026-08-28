@@ -22,7 +22,7 @@ use crate::driver::Event;
 /// The tick <-> real-time mapping plus everything [`Ctx::send`]/
 /// [`Ctx::schedule_timer`] need to reach the outside world:
 ///
-/// - `send` **buffers** `(dst, payload)` in [`RealCtx::pending_outbound`]
+/// - `send` **buffers** `(dst, payload)` in `RealCtx::pending_outbound`
 ///   rather than handing it to the network immediately -- see
 ///   [`RealCtx::flush_outbound`]'s docs for why (write-before-reply, P12, on
 ///   real disk: `crate::driver::run_node` must persist this event's durable
@@ -113,7 +113,7 @@ impl RealCtx {
     }
 
     /// Recompute `now_ticks` from real elapsed time since this replica
-    /// started, offset by [`Self::baseline`]: `ticks = baseline +
+    /// started, offset by `Self::baseline`: `ticks = baseline +
     /// elapsed_nanos / tick_nanos`, i.e. the tick duration configured at
     /// startup (`NodeConfig::tick`) is exactly what every virtual-time delay
     /// in the consensus/SMR core (hedging delay, retry backoff, the

@@ -52,7 +52,7 @@
 //! (`rustls::server::WebPkiClientVerifier`'s default `AnonymousClientPolicy`
 //! is `Deny` -- see [`build_peer_tls`]), not merely offered.
 //!
-//! The one deliberate relaxation is in [`ChainOnlyServerCertVerifier`]
+//! The one deliberate relaxation is in `ChainOnlyServerCertVerifier`
 //! (used for the peer dialer's view of the acceptor's cert, and by default
 //! for the client's view of a replica's cert): it performs full X.509 chain
 //! validation -- signature verification up to one of the configured CA's
@@ -134,7 +134,7 @@ pub struct ClientTlsConfig {
     /// If set, verify the replica's cert's Subject Alternative Names
     /// against this exact name (full, unrelaxed
     /// `rustls::client::verify_server_name`) instead of the default
-    /// chain-only verification -- see [`ChainOnlyServerCertVerifier`]'s
+    /// chain-only verification -- see `ChainOnlyServerCertVerifier`'s
     /// docs for why chain-only is the default and when you would want to
     /// opt back into strict name matching (e.g. every replica happens to
     /// share one cert/SAN, or the caller wants defense-in-depth against a
@@ -147,7 +147,7 @@ pub struct ClientTlsConfig {
 /// client cert required) and one `rustls::ClientConfig` for
 /// [`crate::transport::spawn_peer_dialer`] (mTLS, this replica presents its
 /// own cert and verifies the acceptor's chain-only -- see
-/// [`ChainOnlyServerCertVerifier`]).
+/// `ChainOnlyServerCertVerifier`).
 pub struct PeerTls {
     pub server_config: Arc<rustls::ServerConfig>,
     pub client_config: Arc<rustls::ClientConfig>,
@@ -355,7 +355,7 @@ impl ServerCertVerifier for ChainOnlyServerCertVerifier {
 /// chaining to `cfg.ca_path` is rejected during the TLS handshake itself,
 /// before a single `WireMsg` byte is read. The dialer side (`client_config`)
 /// presents this replica's own cert as its client-auth credential and
-/// verifies the acceptor's cert via [`ChainOnlyServerCertVerifier`].
+/// verifies the acceptor's cert via `ChainOnlyServerCertVerifier`.
 pub fn build_peer_tls(cfg: &TlsConfig) -> anyhow::Result<PeerTls> {
     let provider = crypto_provider();
     let cert_chain = load_cert_chain(&cfg.cert_chain_path)?;
@@ -417,7 +417,7 @@ pub fn build_client_facing_server_tls(
 /// server-authenticated TLS client config for talking to a replica's
 /// client port: verifies the replica's cert against `cfg.ca_path`, presents
 /// no client certificate of its own. Uses
-/// [`ChainOnlyServerCertVerifier`] unless [`ClientTlsConfig::expected_server_name`]
+/// `ChainOnlyServerCertVerifier` unless [`ClientTlsConfig::expected_server_name`]
 /// is set, in which case it uses the stock, fully name-checking
 /// `rustls::client::WebPkiServerVerifier` instead -- see that field's docs.
 pub fn build_client_tls(cfg: &ClientTlsConfig) -> anyhow::Result<Arc<rustls::ClientConfig>> {
@@ -447,7 +447,7 @@ pub fn build_client_tls(cfg: &ClientTlsConfig) -> anyhow::Result<Arc<rustls::Cli
 /// verification is actually in effect (`build_client_tls` with
 /// [`ClientTlsConfig::expected_server_name`] set, which uses this
 /// function's `expected_name` argument instead of `host` -- see below); for
-/// [`ChainOnlyServerCertVerifier`] (the default, and always for peer
+/// `ChainOnlyServerCertVerifier` (the default, and always for peer
 /// dialing) it is accepted by the TLS handshake API but never actually
 /// checked against the presented cert, so any syntactically valid value
 /// works. `host` should be the dial target's hostname/IP with any `:port`

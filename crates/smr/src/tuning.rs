@@ -18,8 +18,8 @@
 //! giving every replica at least two epochs as leader (one replica gets a
 //! third, since `2n+1` does not divide evenly by `n`). Every slot's
 //! completion latency (wall/virtual time from its first proposal attempt to
-//! its first decision, see [`Self::note_attempt_start`]/
-//! [`Self::note_slot_decided`]) observed during an epoch is folded into a
+//! its first decision, see `Self::note_attempt_start`/
+//! `Self::note_slot_decided`) observed during an epoch is folded into a
 //! running average for that epoch's leader.
 //!
 //! # Exploit
@@ -35,7 +35,7 @@
 //! leader's running average is compared against the next-ranked replica's;
 //! if the leader has fallen behind, the tuner switches leaders (promotes the
 //! next-ranked replica) -- no crash or timeout is required to trigger this,
-//! matching §5.3's "not proactively explor[ing] other leaders unless the
+//! matching §5.3's "not proactively explor\[ing\] other leaders unless the
 //! current leader's performance falls below that of the next in the
 //! schedule." Per the task brief, the paper's footnote-7 "restless bandits"
 //! refinement (periodically re-exploring non-leader replicas to detect
@@ -53,7 +53,7 @@
 //! What that can and cannot cost is worth being precise about. It is never
 //! a safety or liveness failure: P15 holds regardless of how the leader is
 //! chosen, every epoch's configuration stays pinned once assigned (see
-//! [`EpochConfig`]), and the section above explains why nothing this module
+//! `EpochConfig`), and the section above explains why nothing this module
 //! produces can affect Agreement. The cost is latency and churn — each
 //! switch re-ranks the hedging schedule, so the fast path keeps being handed
 //! to a replica that has not settled.
@@ -306,14 +306,14 @@ impl EpochTuner {
 
     /// The `leader` value every [`queso_consensus::proposer::Proposer`] for
     /// `slot` must be built with. Stable forever once assigned (see
-    /// [`EpochConfig`]'s docs) -- safe to call for a slot whose epoch has
+    /// `EpochConfig`'s docs) -- safe to call for a slot whose epoch has
     /// long since closed (a lagging replica's late catch-up attempt).
     pub fn leader_for_slot(&self, slot: u64) -> NodeId {
         self.config_for(slot).leader
     }
 
     /// This replica's hedging activation delay for `slot`, per that slot's
-    /// pinned schedule (rank in [`EpochConfig::schedule`] times the
+    /// pinned schedule (rank in `EpochConfig::schedule` times the
     /// configured base delay).
     pub fn delay_for_slot(&self, slot: u64, id: NodeId) -> u64 {
         let cfg = self.config_for(slot);
@@ -482,7 +482,7 @@ impl EpochTuner {
 
     /// `replica`'s most recently observed single-epoch completion time (as
     /// leader), if it has led at least one epoch with at least one measured
-    /// slot. This is [`Self::recent`], not a lifetime average -- see that
+    /// slot. This is `Self::recent`, not a lifetime average -- see that
     /// field's docs for why.
     pub fn average_for(&self, replica: NodeId) -> Option<u64> {
         self.recent.get(&replica).copied()

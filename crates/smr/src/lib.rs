@@ -27,7 +27,7 @@
 //!    rejoins as a learner, catching up before it resumes participating. See
 //!    [`replica::Durable`]'s docs for the split and how it is modeled
 //!    faithfully against the harness's actual restart semantics, and
-//!    [`replica::SmrNode::on_restart`] for the recovery sequence.
+//!    `replica::SmrNode::on_restart` for the recovery sequence.
 //!
 //! # Scope (Stage 4a + 4b, plus Phase 5/6)
 //!

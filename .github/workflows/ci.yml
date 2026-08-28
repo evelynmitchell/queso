@@ -29,6 +29,14 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # Rustdoc warnings gated like clippy's (issue #79): broken intra-doc
+      # links are doc rot pointing at moved/renamed items, and the module
+      # docs here carry design reasoning, not just API notes.
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       - name: cargo build
         run: cargo build --all
 
