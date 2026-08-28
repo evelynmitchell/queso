@@ -23,7 +23,7 @@
 //! 1. **Single-threaded.** [`Kernel`] never spawns a thread or touches an
 //!    async executor; `clippy.toml` denies `std::thread::spawn` workspace-
 //!    wide as a backstop.
-//! 2. **No wall clock.** The only time type is [`LogicalTime`]
+//! 2. **No wall clock.** The only time type is `LogicalTime`
 //!    ([`time`]), advanced solely by the kernel's event loop.
 //!    `clippy.toml` denies `Instant::now`/`SystemTime::now`.
 //! 3. **One seeded PRNG.** `Kernel` owns a single
@@ -32,7 +32,7 @@
 //!    coin flips, node-level randomness reached through `NodeCtx::rng` —
 //!    comes from that one stream, consumed in the kernel's single dispatch
 //!    order. `clippy.toml` denies `rand::thread_rng`/`rand::random`.
-//! 4. **Total event order.** The event queue ([`queue`], private) orders by
+//! 4. **Total event order.** The event queue (`queue`, private) orders by
 //!    `(LogicalTime, tiebreak_seq)`; `tiebreak_seq` is a monotonic counter
 //!    assigned in call order, so ties can never depend on incidental
 //!    ordering.
@@ -61,7 +61,7 @@
 //! - [`trace`] — the trace recorder ([`trace::Trace`],
 //!   [`trace::TraceEvent`]).
 //! - [`node`] — the [`node::Node`] trait and [`node::NodeCtx`] handle.
-//! - [`kernel`] — [`Kernel`], tying everything above together into the DES
+//! - `kernel` — [`Kernel`], tying everything above together into the DES
 //!   loop.
 
 pub mod fault;

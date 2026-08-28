@@ -338,7 +338,7 @@ pub fn spawn_peer_dialer(
 /// is *required*, not merely offered) -- *before* the `Hello` handshake
 /// below; a connection that fails the TLS handshake (no cert, or a cert
 /// from an untrusted CA) never reaches `Hello` at all, and is dropped by
-/// [`handle_peer_connection`] without ever touching `inbox`.
+/// `handle_peer_connection` without ever touching `inbox`.
 pub async fn accept_peers(
     listener: TcpListener,
     inbox: mpsc::UnboundedSender<Event>,

@@ -47,7 +47,7 @@ use crate::driver::Event;
 use crate::tls::{server_name_for, MaybeTlsStream};
 
 /// Accept client connections forever, spawning one task per connection
-/// (see [`serve_one_client`]).
+/// (see `serve_one_client`).
 ///
 /// `tls` (Phase 8.2a, `crate::tls`) is this replica's client-facing,
 /// server-authenticated-only TLS config (see

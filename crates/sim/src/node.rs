@@ -43,7 +43,7 @@ pub trait Node<P> {
 /// The interface a [`Node`] uses to interact with its driver during a
 /// callback: send messages, schedule timers, read the current time, or draw
 /// from a seeded PRNG stream. [`NodeCtx`] is the in-simulation
-/// implementation (backed by [`KernelCore`]'s deterministic logical clock
+/// implementation (backed by `KernelCore`'s deterministic logical clock
 /// and single PRNG stream); a real-network driver (`queso-net`) provides a
 /// second implementation backed by real time, real sockets, and a real
 /// seeded RNG. Node/consensus/SMR code is written against this trait alone,
@@ -70,7 +70,7 @@ pub trait Ctx<P> {
 }
 
 /// The sim kernel's [`Ctx`] implementation: send/schedule_timer/rng/now are
-/// forwarded to the shared [`KernelCore`], scoped to `self_id`.
+/// forwarded to the shared `KernelCore`, scoped to `self_id`.
 pub struct NodeCtx<'a, P> {
     pub(crate) core: &'a mut KernelCore<P>,
     pub(crate) self_id: NodeId,

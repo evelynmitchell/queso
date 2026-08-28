@@ -14,7 +14,7 @@
 //!
 //! 1. **Boot**: [`crate::persist::Store::load`] checks whether this node id
 //!    has a snapshot on disk already. If so, this is a genuine restart:
-//!    build the [`SmrNode`] from the loaded [`Durable`] via
+//!    build the [`SmrNode`] from the loaded `Durable` via
 //!    [`SmrNode::from_durable`], restore [`RealCtx`]'s logical-time
 //!    baseline from the snapshot's `max_tick`, and immediately call
 //!    [`Node::on_restart`] -- the same learner/catch-up entry point the sim
@@ -72,7 +72,7 @@
 //!    before if none is ready).
 //! 2. Applies it, then -- **without awaiting anything** -- drains any
 //!    *already-queued* events with a non-blocking `try_recv`, applying each
-//!    in turn, up to [`GROUP_COMMIT_BATCH_LIMIT`] events total. This never
+//!    in turn, up to `GROUP_COMMIT_BATCH_LIMIT` events total. This never
 //!    waits for more events to arrive: it only coalesces work that was
 //!    already sitting in the channel the instant this batch started
 //!    forming, so a low-traffic replica (at most one event ready at a time)
@@ -94,21 +94,21 @@
 //!    change.
 //! 4. Calls [`RealCtx::flush_outbound`] exactly **once** for the whole
 //!    batch -- every event's buffered sends (see [`RealCtx::send`]'s docs)
-//!    are still queued in [`RealCtx::pending_outbound`] at this point
+//!    are still queued in `RealCtx::pending_outbound` at this point
 //!    (`flush_outbound` is the only thing that ever drains it), so this
 //!    single call releases everything the whole batch produced, all at
 //!    once, only after step 3's fsync (if any) has completed -- preserving
 //!    write-before-reply for every event in the batch, not just the last
 //!    one.
 //!
-//! [`GROUP_COMMIT_BATCH_LIMIT`] bounds how many events one batch (and
+//! `GROUP_COMMIT_BATCH_LIMIT` bounds how many events one batch (and
 //! therefore one fsync-latency's worth of buffered replies) can hold, so a
 //! sustained flood of ready events can't indefinitely delay the *earliest*
 //! reply in a batch behind an ever-growing one -- see its own docs.
 //!
 //! # Async fsync offload (Phase 8.1a, issue #46 / issue #39)
 //!
-//! [`queso_smr::SmrNode`]/[`Durable`] are `Rc<RefCell<_>>`-based (see
+//! [`queso_smr::SmrNode`]/`Durable` are `Rc<RefCell<_>>`-based (see
 //! "Single-threaded ownership" below) and therefore not `Send` -- they can
 //! never cross a `tokio::spawn`/`spawn_blocking` boundary. What *can* cross
 //! one is the serialized bytes: [`crate::persist::Store::persist`]

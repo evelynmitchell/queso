@@ -168,7 +168,7 @@ impl<P: Payload> KernelCore<P> {
     }
 }
 
-/// The simulation kernel: owns all nodes plus the [`KernelCore`] described
+/// The simulation kernel: owns all nodes plus the `KernelCore` described
 /// above. `P` is the (opaque, application-defined) message payload type.
 pub struct Kernel<P> {
     core: KernelCore<P>,

@@ -20,7 +20,7 @@
 //!   method's docs for exactly what "ready" means here and, just as
 //!   importantly, what it does *not* claim.
 //! - **`GET /metrics`** -- a small pretty-printed JSON document (see
-//!   [`StatusShared::metrics_json`]) of counters this replica actually
+//!   `StatusShared::metrics_json`) of counters this replica actually
 //!   tracks: total events dispatched, current log frontier (`next_slot`),
 //!   real fsync'd-save count, the same `ready` bool `/ready` reports, and
 //!   uptime. Every number here is a plain, already-tracked counter --
@@ -28,7 +28,7 @@
 //!
 //! Only `GET` is served, only these three paths; anything else (wrong
 //! method, unknown path, or a request this parser can't make sense of) gets
-//! a `4xx` and the connection is closed. See [`handle_connection`]'s docs
+//! a `4xx` and the connection is closed. See `handle_connection`'s docs
 //! for the defensive bounds (capped read, timeout) that keep a malformed or
 //! slow-loris-style request from costing this replica anything beyond one
 //! bounded-lifetime task.
@@ -79,11 +79,11 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Hard cap on how many status connections may be *in flight at once*
-/// (issue #50). [`MAX_REQUEST_BYTES`] and [`REQUEST_TIMEOUT`] bound what
+/// (issue #50). `MAX_REQUEST_BYTES` and `REQUEST_TIMEOUT` bound what
 /// one connection can cost; this bounds how many of them there can be.
 ///
 /// Without it, a flood of many thousands of simultaneous idle connections
-/// would each hold a file descriptor for up to [`REQUEST_TIMEOUT`] -- and
+/// would each hold a file descriptor for up to `REQUEST_TIMEOUT` -- and
 /// those descriptors come out of the *same* per-process limit
 /// `crate::transport`'s peer listener and `crate::client`'s client listener
 /// draw on. The failure that matters is therefore not "status gets slow",
@@ -263,7 +263,7 @@ struct MetricsBody {
 }
 
 /// Accept connections on `listener` forever, spawning one bounded-lifetime
-/// task per connection (see [`handle_connection`]), at most
+/// task per connection (see `handle_connection`), at most
 /// [`MAX_STATUS_CONNECTIONS`] of them at a time. Each handler task only
 /// ever reads from `status` -- never `queso_smr::SmrNode` or
 /// `crate::ctx::RealCtx` -- so this can run on an ordinary `tokio::spawn`
@@ -293,7 +293,7 @@ pub async fn serve_status(listener: TcpListener, status: Arc<StatusShared>) {
 /// The cost of that choice, stated plainly: while the cap is saturated a
 /// legitimate probe waits in the backlog rather than getting a fast
 /// rejection. That is bounded -- every permit is released within
-/// [`REQUEST_TIMEOUT`] whatever the client does -- and a probe that is
+/// `REQUEST_TIMEOUT` whatever the client does -- and a probe that is
 /// merely delayed is no worse off than one that was shed, since a health
 /// check treats "slow" and "failed" alike. Protecting the descriptor budget
 /// consensus shares is worth more than a faster answer to a probe that is

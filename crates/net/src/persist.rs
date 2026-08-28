@@ -8,31 +8,30 @@
 //! Exactly [`queso_smr::Durable`] (per-slot recorder ISR state, the log
 //! frontier, the applied log, and the KV state with its embedded dedup
 //! table) plus one extra field this crate needs that `queso_smr` has no
-//! reason to know about: [`PersistedState::max_tick`], the highest
+//! reason to know about: `PersistedState::max_tick`, the highest
 //! [`LogicalTime`] tick this replica had reached as of this snapshot -- see
 //! `crate::ctx::RealCtx`'s `baseline` field docs for why a real restart
 //! needs this to keep `LogicalTime` monotonic. Nothing else: the volatile
 //! half of a replica's state (pending-op queue, in-flight proposer) is
 //! deliberately not here, exactly as `queso_smr::replica::Durable`'s docs
-//! describe -- a real crash genuinely loses it, and [`SmrNode::on_restart`]
+//! describe -- a real crash genuinely loses it, and `SmrNode::on_restart`
 //! is what recovers gracefully from that loss (see `crate::driver::run_node`
 //! for how the two compose).
 //!
 //! [`LogicalTime`]: queso_sim::time::LogicalTime
-//! [`SmrNode::on_restart`]: queso_smr::SmrNode::on_restart
 //!
 //! # On-disk format: a versioned header, then bincode (Phase 8.1a, issue #39)
 //!
 //! Every snapshot file starts with a small, fixed-size, *unversioned itself*
-//! header -- [`MAGIC`] (4 bytes identifying this as a queso-net durable
+//! header -- `MAGIC` (4 bytes identifying this as a queso-net durable
 //! snapshot file at all, not some other file that happened to end up at this
-//! path) followed by a little-endian `u16` [`FORMAT_VERSION`] -- before the
-//! bincode-serialized [`PersistedState`] payload. [`Store::load`] checks
+//! path) followed by a little-endian `u16` `FORMAT_VERSION` -- before the
+//! bincode-serialized `PersistedState` payload. [`Store::load`] checks
 //! both fields *before* attempting to `bincode::deserialize` anything, and
 //! fails loudly (a clear `anyhow::Error`, not a silent mis-parse or a
 //! confusing bincode error deep in some nested field) if either doesn't
 //! match what this build understands. This is what lets a future
-//! `Durable`/`Isr`/`Recorder`/`Kv` layout change bump [`FORMAT_VERSION`] and
+//! `Durable`/`Isr`/`Recorder`/`Kv` layout change bump `FORMAT_VERSION` and
 //! know for certain that an old-format data directory will be rejected
 //! rather than silently misinterpreted as the new layout (bincode has no
 //! self-describing schema -- a length or discriminant byte in the old
@@ -222,7 +221,7 @@ fn decode(bytes: &[u8]) -> anyhow::Result<(Durable, u64)> {
 /// Where in the atomic-write sequence an injected [`DiskFault`] fires.
 ///
 /// The variants are the three places a real crash or a real `ENOSPC` can
-/// land inside [`Store::write_bytes_blocking`], and each leaves the data
+/// land inside `Store::write_bytes_blocking`, and each leaves the data
 /// directory in a materially different state -- which is the whole point:
 /// the recovery argument in this module's docs is about *which* of these
 /// states `load` can encounter, and until this existed none of them had
@@ -262,7 +261,7 @@ pub enum DiskFaultPoint {
 /// module's docs argue for.
 ///
 /// **Test-only instrumentation**, in the same sense as
-/// [`Store::artificial_delay`] and [`Store::save_count`] and for the same
+/// `Store::artificial_delay` and [`Store::save_count`] and for the same
 /// reason: `queso-node`'s CLI never constructs one, a `Store` has none
 /// unless a test explicitly calls [`Store::with_disk_fault`], and the
 /// disarmed path costs one `Option` check per write. It lives in ordinary
@@ -428,7 +427,7 @@ impl Store {
     }
 
     /// Inject `delay` as an artificial sleep before every future blocking
-    /// write this store performs -- see [`Self::artificial_delay`]'s docs.
+    /// write this store performs -- see `Self::artificial_delay`'s docs.
     /// Test-only; `queso-node`'s CLI never calls this (always leaves the
     /// default `Duration::ZERO`, a no-op).
     #[must_use]
@@ -454,7 +453,7 @@ impl Store {
     /// Load this replica's most recently persisted `(Durable, max_tick)`, or
     /// `None` if no snapshot exists yet (a genuinely fresh, never-before-run
     /// replica -- `crate::driver::run_node` must not call
-    /// [`queso_smr::SmrNode::on_restart`] in that case, see that function's
+    /// `queso_smr::SmrNode::on_restart` in that case, see that function's
     /// docs). Fails with a clear error (rather than silently mis-parsing)
     /// if the file exists but its schema header doesn't match what this
     /// build understands -- see the module docs.
