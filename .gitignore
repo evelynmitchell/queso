@@ -19,3 +19,7 @@ soak-failures/
 # mdbook's build output (book.toml sets build-dir = "book"); the Pages
 # workflow builds it fresh on every deploy.
 /book/
+
+# The tutorial's (and README usage section's) default node data directory
+# for a hand-run local cluster (docs/tutorial.md).
+/data/
