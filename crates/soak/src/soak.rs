@@ -48,7 +48,7 @@ use queso_conformance::source::CobTarget;
 use queso_conformance::workload::{self, CobWorkload};
 
 use crate::cluster::RealCluster;
-use crate::schedule::{Fault, Schedule, ScheduleConfig};
+use crate::schedule::{Fault, Schedule, ScheduleConfig, ScheduledFault};
 
 /// How to run a soak.
 #[derive(Debug, Clone)]
@@ -277,7 +277,7 @@ impl SoakReport {
         // timeout tuning). Compared against the schedule the run actually
         // traversed, so an early exit on divergence cannot fire this
         // spuriously.
-        let scheduled = self.injections_expected();
+        let scheduled = self.injections_expected(config.step_ms);
         if !self.injections.covers(&scheduled) {
             problems.push(format!(
                 "VACUOUS: the fault-injection path did not deliver what the \
@@ -306,8 +306,8 @@ impl SoakReport {
     /// Only counts windows that opened at or before the last one the run
     /// reached, so a run cut short by a divergence is judged against the
     /// turbulence it actually saw.
-    fn injections_expected(&self) -> Injections {
-        injections_expected(&self.schedule, self.windows_entered)
+    fn injections_expected(&self, sample_step_ms: u64) -> Injections {
+        injections_expected(&self.schedule, self.windows_entered, sample_step_ms)
     }
 
     /// A one-screen summary, for a soak binary's stdout.
@@ -361,8 +361,21 @@ struct Injected {
 impl Injected {
     /// What the schedule says should be in force at `t_ms`.
     fn desired(schedule: &Schedule, t_ms: u64, replicas: usize) -> Self {
+        Self::desired_of(schedule.faults(), t_ms, replicas)
+    }
+
+    /// [`Self::desired`] over an explicit window slice. This is the one
+    /// definition of "what the schedule means": the driver evaluates it
+    /// over the whole schedule every step, and [`injections_expected`]
+    /// evaluates it over the entered prefix's boundary instants -- so the
+    /// audit and the injector cannot disagree about the semantics of a
+    /// window arrangement, by construction.
+    fn desired_of(faults: &[ScheduledFault], t_ms: u64, replicas: usize) -> Self {
         let mut state = Injected::default();
-        for scheduled in schedule.active_at(t_ms) {
+        for scheduled in faults
+            .iter()
+            .filter(|f| f.start_ms <= t_ms && t_ms < f.end_ms)
+        {
             match scheduled.fault {
                 Fault::Isolate { node } => {
                     for peer in 0..replicas {
@@ -539,133 +552,169 @@ impl Soak {
 /// fault injector to *do*, by kind -- the expectation
 /// [`Injections::covers`] is checked against.
 ///
-/// # The principle: expect only what the injector can physically deliver
+/// # One semantics, by construction
 ///
-/// [`Injected::reconcile`] injects *state transitions*, not windows, so any
-/// kind whose windows can combine into fewer transitions than windows must
-/// have its expectation computed over the combined state -- otherwise the
-/// check accuses a perfectly healthy run of being vacuous. That has now
-/// happened twice, once per merged kind below; both runs' verdicts were
-/// `0 divergence(s), 0 stall(s)` with post-mortem-clean logs.
+/// [`Injected::reconcile`] injects *state transitions* of the desired-state
+/// function, not windows. Three nightly failures in a row were
+/// safety-and-liveness-clean runs failed by an expectation that counted
+/// windows while the injector delivered transitions, one window
+/// arrangement at a time: overlapping same-node crash windows (the first
+/// nightly, seed 14), a latency window shadowed by a concurrent higher one
+/// (run 13, seed 106, #98), and touching same-node crash windows (run 14,
+/// seed 119). Each fix enumerated the observed arrangement; the space of
+/// arrangements kept producing new members.
 ///
-/// # Why crash windows are merged (found by the first nightly soak)
+/// This function ends the family instead of patching its members. It walks
+/// the entered windows' boundary instants -- desired state is
+/// piecewise-constant and can only change where a window opens or closes
+/// -- through [`Injected::desired_of`], the *same* function the driver
+/// evaluates every step, extracts each resource's activation intervals
+/// (per-link cut spans, per-node down spans, the applied-latency value
+/// pieces of `L(t) = max`), and counts transitions with the same rules
+/// `reconcile` applies: a cut per link entering the cut set, a kill per
+/// node entering the crashed set, a latency change per move to a new
+/// non-zero value. There is no second model of the schedule left to
+/// disagree with the first.
 ///
-/// `reconcile` kills a node on the `false -> true` edge of the desired
-/// crashed-set (`to.crashed.difference(&from.crashed)`), so two overlapping
-/// `Crash` windows for the same node produce exactly one `kill()` --
-/// correctly, since a process cannot be killed twice while it is still
-/// dead. The nightly soak's first run reported seed 14 as `VACUOUS:
-/// scheduled kills: 14, injected kills: 13`, on `Crash { node: 0 }` over
-/// `168880..171117ms` and again over `170502..172247ms` -- overlapping, so
-/// one kill. Nightly run 14 (n=3, seed 119) found the boundary case of the
-/// same disease: `Crash { node: 1 }` over `41033..41636ms` and again over
-/// `41636..43212ms` -- *touching*, not overlapping. Windows are half-open,
-/// so the node's desired state is "down" continuously across the shared
-/// instant and only one kill can ever be delivered; the strict-overlap
-/// merge counted two and failed a run whose verdict was `0 divergence(s),
-/// 0 stall(s)` with post-mortem-agreeing applied logs (regression-pinned
-/// against seed 119's regenerated schedule below). It took a 180s schedule
-/// with 63 windows to make an overlap
-/// likely; the 20s bounded soak in CI has seven or eight windows and had
-/// never produced one.
+/// This also makes the **cuts** expectation exact in `reconcile`'s own
+/// units (link transitions) for the first time: the old one-per-window
+/// count was a floor so loose (43 windows against 122 delivered link cuts
+/// in run 14's n=3 leg) that an injector silently dropping half its cuts
+/// would still have passed.
 ///
-/// # Why latency is counted as edges of the max, not per window (issue #98)
+/// # The injector samples, so the expectation must too
 ///
-/// [`Injected::desired`] resolves overlapping latency windows with
-/// `max(ms)`, so the applied latency is the piecewise function
-/// `L(t) = max over active windows`, and `reconcile` counts one change
-/// whenever `L` moves to a new non-zero value. A window whose entire span
-/// is shadowed by a concurrent higher-latency window never changes `L` and
-/// contributes **zero** countable edges. Nightly run 13 (the first
-/// post-#90 night), seed 106: `[82869..84676] Latency 60` fully contained
-/// `[83376..84188] Latency 39`, so the injector correctly delivered 7
-/// changes against 8 windows and the per-window expectation failed a
-/// safety-clean n=5 leg -- the run whose verdict was the first field
-/// evidence on the #83 fix. The expectation here now counts the edges of
-/// the same `L(t)` the injector applies (regression-pinned against seed
-/// 106's regenerated schedule).
+/// The driver evaluates the desired state once per `sample_step_ms`
+/// (`SoakConfig::step_ms`, 100ms in the nightly), so a same-resource
+/// inactive gap no longer than one step -- a link healed for 20ms between
+/// two cut windows, say -- falls between samples unless a sample happens
+/// to land inside it. Whether the "extra" transition pair is delivered is
+/// a coin flip the schedule does not control, so this expectation
+/// coalesces same-resource gaps (and skips latency value-pieces) of
+/// `<= sample_step_ms`: it demands only transitions the sampled injector
+/// can be relied on to deliver, and a lucky sample that delivers more
+/// simply exceeds the floor, which [`Injections::covers`] permits.
 ///
-/// Neither merge weakens the check: non-combining windows still expect one
-/// transition each, and a genuinely missed kill or latency change still
-/// leaves `injected` short of `expected`.
+/// Measured across every seed of nightly runs 14 and 15 (32 seed-legs,
+/// two nights, both cluster sizes): with this coalescing the expectation
+/// matched the injector's delivered counts exactly on 30 of 32 and was
+/// exceeded on 2 (seeds whose sub-step gaps a sample happened to catch);
+/// without it, three green seed-legs (5ms, 10ms, and 20ms gaps) would
+/// have been failed as vacuous. Every gap of 126ms or more in that corpus
+/// -- 23 transitions across 12 gap sites, cuts and latency both -- was
+/// delivered.
 ///
-/// Known remaining gap, deliberately not papered over: a same-node crash
-/// gap shorter than a real respawn (`reconcile`'s `is_running` guard skips
-/// the kill *and* its count) can still under-inject against this
-/// expectation -- the suspected shape of run 9's `kills: 19/20`, but that
-/// depends on real process timing, not the schedule, so it cannot be fixed
-/// here without inventing a respawn-time constant. Tracked in #98.
+/// # The two ways delivery can still fall short, deliberately retained
+///
+/// - **Respawn timing** (#98): `reconcile` kills a node only if it
+///   `is_running`, so a same-node crash gap longer than a step but shorter
+///   than a real respawn still skips a kill this expectation counts -- the
+///   suspected shape of run 9's `kills: 19/20`. Timing-dependent, not
+///   schedule-dependent; not modeled here.
+/// - **Sampling jitter**: a gap slightly longer than one step can still be
+///   missed when the loop's processing time stretches the sampling cadence
+///   past the gap. The field corpus above (23/23 delivered at >= 126ms)
+///   bounds how much this matters in practice; a future occurrence will
+///   fail a clean run and should move this threshold, with its evidence.
 ///
 /// Assumes windows are in non-decreasing `start_ms` order, which
 /// [`Schedule::generate`] guarantees.
-fn injections_expected(schedule: &Schedule, windows_entered: usize) -> Injections {
-    let mut expected = Injections::default();
-    // Per node, the end of the crash window group currently open for it.
-    let mut open_crash: BTreeMap<usize, u64> = BTreeMap::new();
-    let mut latency_windows: Vec<(u64, u64, u64)> = Vec::new();
-    for scheduled in schedule.faults().iter().take(windows_entered) {
-        match scheduled.fault {
-            Fault::Isolate { .. } | Fault::CutLink { .. } => expected.cuts += 1,
-            Fault::Latency { ms } => {
-                latency_windows.push((scheduled.start_ms, scheduled.end_ms, ms));
-            }
-            Fault::Crash { node } => match open_crash.get_mut(&node) {
-                // Still down from an earlier window: no new kill edge. `>=`
-                // and not `>`: windows are half-open (see `active_at`), so a
-                // window starting exactly where the previous one ends keeps
-                // the node's desired state at "down" with no instant of
-                // uptime in between -- `reconcile` never respawns it, and a
-                // second kill does not physically exist to deliver.
-                Some(open_until) if *open_until >= scheduled.start_ms => {
-                    *open_until = (*open_until).max(scheduled.end_ms);
-                }
-                // Back up (or never down) by the time this window opens.
-                _ => {
-                    expected.kills += 1;
-                    open_crash.insert(node, scheduled.end_ms);
-                }
-            },
-        }
-    }
-    expected.latency_changes = expected_latency_edges(&latency_windows);
-    expected
-}
+fn injections_expected(
+    schedule: &Schedule,
+    windows_entered: usize,
+    sample_step_ms: u64,
+) -> Injections {
+    let entered = &schedule.faults()[..windows_entered.min(schedule.faults().len())];
+    let replicas = schedule.config().replicas;
 
-/// How many latency *changes* [`Injected::reconcile`] would count for these
-/// `(start_ms, end_ms, ms)` windows under polling dense enough to visit
-/// every piece of `L(t) = max over active windows` -- see
-/// [`injections_expected`]'s latency section for why this, and not the
-/// window count, is the deliverable expectation.
-///
-/// `L` is piecewise-constant and can only change at a window boundary, so
-/// evaluating it at each boundary (window intervals are half-open,
-/// matching `Schedule::active_at`) visits every piece.
-fn expected_latency_edges(windows: &[(u64, u64, u64)]) -> usize {
-    let mut boundaries: Vec<u64> = windows.iter().flat_map(|&(s, e, _)| [s, e]).collect();
+    let mut boundaries: Vec<u64> = entered
+        .iter()
+        .flat_map(|f| [f.start_ms, f.end_ms])
+        .collect();
     boundaries.sort_unstable();
     boundaries.dedup();
 
-    let mut edges = 0;
-    let mut prev = 0u64;
+    // Walk the boundary instants once, extracting each resource's
+    // activation intervals. Every window has closed by the last boundary
+    // (it is the maximum end), so nothing is left dangling open.
+    let mut cut_spans: BTreeMap<(usize, usize), Vec<(u64, u64)>> = BTreeMap::new();
+    let mut open_cut: BTreeMap<(usize, usize), u64> = BTreeMap::new();
+    let mut down_spans: BTreeMap<usize, Vec<(u64, u64)>> = BTreeMap::new();
+    let mut open_down: BTreeMap<usize, u64> = BTreeMap::new();
+    // `(value, start)` of each piece of the applied latency `L(t)`.
+    let mut latency_pieces: Vec<(u64, u64)> = Vec::new();
+    let mut prev = Injected::default();
     for &t in &boundaries {
-        let current = windows
-            .iter()
-            .filter(|&&(s, e, _)| s <= t && t < e)
-            .map(|&(_, _, ms)| ms)
-            .max()
-            .unwrap_or(0);
-        if current != prev && current > 0 {
-            edges += 1;
+        let now = Injected::desired_of(entered, t, replicas);
+        for &link in now.cuts.difference(&prev.cuts) {
+            open_cut.insert(link, t);
         }
-        prev = current;
+        for &link in prev.cuts.difference(&now.cuts) {
+            let opened = open_cut.remove(&link).expect("closing an open cut span");
+            cut_spans.entry(link).or_default().push((opened, t));
+        }
+        for &node in now.crashed.difference(&prev.crashed) {
+            open_down.insert(node, t);
+        }
+        for &node in prev.crashed.difference(&now.crashed) {
+            let opened = open_down.remove(&node).expect("closing an open down span");
+            down_spans.entry(node).or_default().push((opened, t));
+        }
+        if now.latency_ms != prev.latency_ms {
+            latency_pieces.push((now.latency_ms, t));
+        }
+        prev = now;
     }
-    edges
+    debug_assert!(open_cut.is_empty() && open_down.is_empty());
+
+    // One reliably-deliverable transition per coalesced activation span:
+    // spans separated by a gap the sampled driver may never observe are
+    // one continuous activation as far as it can be relied on to see.
+    let coalesced = |spans: &[(u64, u64)]| -> usize {
+        let mut groups = 0usize;
+        let mut open_until: Option<u64> = None;
+        for &(start, end) in spans {
+            match open_until {
+                Some(until) if start.saturating_sub(until) <= sample_step_ms => {}
+                _ => groups += 1,
+            }
+            open_until = Some(open_until.unwrap_or(0).max(end));
+        }
+        groups
+    };
+
+    let mut expected = Injections {
+        cuts: cut_spans.values().map(|spans| coalesced(spans)).sum(),
+        kills: down_spans.values().map(|spans| coalesced(spans)).sum(),
+        latency_changes: 0,
+    };
+
+    // Latency: `reconcile` counts a change whenever the value it *observes*
+    // moves to a new non-zero value. Pieces no longer than one step may
+    // never be observed, so they are skipped; what remains is the value
+    // sequence the driver reliably sees.
+    let mut observed = 0u64;
+    for (i, &(value, start)) in latency_pieces.iter().enumerate() {
+        let piece_end = latency_pieces
+            .get(i + 1)
+            .map(|&(_, s)| s)
+            .unwrap_or_else(|| boundaries.last().copied().unwrap_or(start));
+        if piece_end.saturating_sub(start) <= sample_step_ms {
+            continue;
+        }
+        if value != observed {
+            if value > 0 {
+                expected.latency_changes += 1;
+            }
+            observed = value;
+        }
+    }
+    expected
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schedule::ScheduledFault;
 
     fn schedule_of(faults: Vec<ScheduledFault>) -> Schedule {
         Schedule::with_faults(0, ScheduleConfig::default(), faults)
@@ -676,6 +725,22 @@ mod tests {
             start_ms,
             end_ms,
             fault: Fault::Crash { node },
+        }
+    }
+
+    fn isolate(node: usize, start_ms: u64, end_ms: u64) -> ScheduledFault {
+        ScheduledFault {
+            start_ms,
+            end_ms,
+            fault: Fault::Isolate { node },
+        }
+    }
+
+    fn cut_link(from: usize, to: usize, start_ms: u64, end_ms: u64) -> ScheduledFault {
+        ScheduledFault {
+            start_ms,
+            end_ms,
+            fault: Fault::CutLink { from, to },
         }
     }
 
@@ -692,7 +757,7 @@ mod tests {
     #[test]
     fn overlapping_crash_windows_for_one_node_expect_a_single_kill() {
         let schedule = schedule_of(vec![crash(0, 168_880, 171_117), crash(0, 170_502, 172_247)]);
-        assert_eq!(injections_expected(&schedule, 2).kills, 1);
+        assert_eq!(injections_expected(&schedule, 2, 100).kills, 1);
     }
 
     /// The other side of the same edge: windows that do *not* overlap each
@@ -710,7 +775,7 @@ mod tests {
             crash(0, 173_074, 175_984),
         ]);
         assert_eq!(
-            injections_expected(&schedule, 3).kills,
+            injections_expected(&schedule, 3, 100).kills,
             2,
             "the first two windows overlap into one kill; the third is separate"
         );
@@ -727,7 +792,7 @@ mod tests {
     #[test]
     fn touching_crash_windows_for_one_node_expect_a_single_kill() {
         let schedule = schedule_of(vec![crash(1, 41_033, 41_636), crash(1, 41_636, 43_212)]);
-        assert_eq!(injections_expected(&schedule, 2).kills, 1);
+        assert_eq!(injections_expected(&schedule, 2, 100).kills, 1);
     }
 
     /// Issue #98, second occurrence, reproduced from the schedule that
@@ -762,17 +827,186 @@ mod tests {
             70,
             "test premise: this is the schedule run 14 actually walked"
         );
-        let expected = injections_expected(&schedule, schedule.faults().len());
+        let expected = injections_expected(&schedule, schedule.faults().len(), 100);
         assert_eq!(
             expected.kills, 17,
             "the injector reported 17 kills on this schedule and all 17 are \
              deliverable; expecting 18 is what failed the clean run"
         );
-        assert_eq!(expected.cuts, 43, "cuts matched run 14's scheduled count");
+        assert_eq!(
+            expected.cuts, 122,
+            "in reconcile's own units (link transitions) run 14 delivered \
+             exactly 122 cuts; the old per-window floor of 43 could not have \
+             noticed an injector dropping half of them"
+        );
         assert_eq!(
             expected.latency_changes, 9,
             "latency matched exactly in run 14 (the #99 fix held)"
         );
+    }
+
+    /// The audit, calibrated against the field: every seed of nightly runs
+    /// 14 and 15 (32 seed-legs -- two nights, both cluster sizes, the two
+    /// nights this rewrite was validated against), with each leg's
+    /// `windows_entered` and delivered `Injections` transcribed from the
+    /// job logs. The schedules regenerate deterministically; the delivered
+    /// counts are history.
+    ///
+    /// Two properties are pinned. Every delivery covers its expectation --
+    /// zero false positives over the corpus -- and 30 of the 32 match it
+    /// *exactly*, which is what makes the floor meaningful rather than
+    /// merely safe. The two non-exact seeds are the sub-step-gap coin
+    /// flips a sample happened to catch (67ms gaps on seed 126 n=5, 32ms
+    /// gaps on eight links of seed 127 n=5): delivery exceeded the floor,
+    /// which `covers` permits. The corpus also contains the three flips
+    /// that landed the other way (5ms, 10ms, 20ms gaps on seeds 126 n=3,
+    /// 118 n=5, 120 n=5): without gap coalescing those three GREEN
+    /// seed-legs would have been failed as vacuous.
+    #[test]
+    fn the_expectation_matches_two_nights_of_field_deliveries() {
+        // (seed, replicas, windows_entered, injected cuts/kills/latency).
+        let field: Vec<(u64, usize, usize, usize, usize, usize)> = vec![
+            (112, 3, 65, 121, 12, 1),
+            (113, 3, 68, 125, 12, 4),
+            (114, 3, 66, 98, 18, 4),
+            (115, 3, 66, 129, 10, 5),
+            (116, 3, 67, 133, 6, 11),
+            (117, 3, 57, 125, 6, 5),
+            (118, 3, 67, 117, 11, 9),
+            (119, 3, 70, 122, 17, 9),
+            (112, 5, 67, 284, 12, 4),
+            (113, 5, 66, 255, 11, 7),
+            (114, 5, 73, 244, 11, 9),
+            (115, 5, 73, 230, 12, 9),
+            (116, 5, 69, 258, 11, 7),
+            (117, 5, 67, 232, 10, 6),
+            (118, 5, 66, 280, 10, 8),
+            (119, 5, 73, 232, 22, 9),
+            (120, 3, 63, 138, 8, 6),
+            (121, 3, 57, 95, 11, 4),
+            (122, 3, 62, 102, 12, 9),
+            (123, 3, 66, 121, 9, 7),
+            (124, 3, 68, 140, 15, 2),
+            (125, 3, 60, 125, 12, 6),
+            (126, 3, 63, 95, 12, 4),
+            (127, 3, 62, 116, 13, 5),
+            (120, 5, 77, 258, 13, 7),
+            (121, 5, 66, 221, 12, 5),
+            (122, 5, 71, 203, 13, 15),
+            (123, 5, 72, 258, 16, 9),
+            (124, 5, 69, 329, 12, 2),
+            (125, 5, 62, 249, 14, 7),
+            (126, 5, 70, 166, 17, 10),
+            (127, 5, 65, 224, 15, 5),
+        ];
+        let mut exact = 0usize;
+        for &(seed, replicas, entered, cuts, kills, latency_changes) in &field {
+            let config = ScheduleConfig {
+                replicas,
+                duration_ms: 180_000,
+                min_fault_ms: 600,
+                max_fault_ms: 3_000,
+                min_gap_ms: 500,
+                max_gap_ms: 2_500,
+            };
+            let schedule = Schedule::generate(seed, config);
+            let expected = injections_expected(&schedule, entered, 100);
+            let injected = Injections {
+                cuts,
+                kills,
+                latency_changes,
+            };
+            assert!(
+                injected.covers(&expected),
+                "seed {seed} n={replicas}: the field delivered {injected:?} but the \
+                 expectation demands {expected:?} -- this expectation would have \
+                 failed a green night"
+            );
+            if injected == expected {
+                exact += 1;
+            }
+        }
+        assert_eq!(
+            exact, 30,
+            "30 of 32 field deliveries matched the expectation exactly when this \
+             was calibrated; fewer means the expectation drifted loose, more \
+             means the two known coin-flip seeds changed"
+        );
+    }
+
+    /// An `Isolate` cuts every link touching the node, both directions, so
+    /// in `reconcile`'s units one isolation of one node in a 3-replica
+    /// cluster is four link transitions -- which is why run 14's n=3 leg
+    /// delivered 122 cuts against 43 windows, and why counting windows
+    /// made the cuts floor nearly powerless.
+    #[test]
+    fn one_isolation_expects_a_cut_per_severed_link_direction() {
+        let schedule = schedule_of(vec![isolate(0, 1_000, 3_000)]);
+        assert_eq!(injections_expected(&schedule, 1, 100).cuts, 4);
+    }
+
+    /// A `CutLink` whose whole span lies inside an `Isolate` that already
+    /// severs the same link asks for nothing the injector has not already
+    /// done: the link never leaves the desired cut set, so there is no
+    /// transition to deliver. (The driver-side twin of this fact is
+    /// `reconcile`'s set-difference; this pins that the audit agrees.)
+    #[test]
+    fn a_cut_link_shadowed_by_an_isolation_expects_no_extra_cut() {
+        let schedule = schedule_of(vec![isolate(0, 1_000, 5_000), cut_link(0, 1, 2_000, 4_000)]);
+        assert_eq!(injections_expected(&schedule, 2, 100).cuts, 4);
+    }
+
+    /// The sampling rule, minimally, for cuts: the driver observes the
+    /// desired state once per step (100ms here), so a link healed for less
+    /// than one step between two cut windows may never be seen up --
+    /// whether the second cut is delivered is a coin flip. The expectation
+    /// demands only what delivery can be relied on for: one cut. The field
+    /// corpus above holds both outcomes of that coin: seed 120 n=5's 20ms
+    /// gap was missed, seed 127 n=5's 32ms gaps were caught.
+    #[test]
+    fn a_sub_step_heal_between_two_cut_windows_expects_a_single_cut() {
+        let schedule = schedule_of(vec![
+            cut_link(0, 1, 1_000, 2_000),
+            cut_link(0, 1, 2_050, 3_000),
+        ]);
+        assert_eq!(injections_expected(&schedule, 2, 100).cuts, 1);
+    }
+
+    /// ...and the same gap wider than a step is two deliverable cuts: the
+    /// coalescing narrows the floor to reliable deliveries, it does not
+    /// blunt it.
+    #[test]
+    fn a_heal_wider_than_a_step_between_cut_windows_expects_a_cut_each() {
+        let schedule = schedule_of(vec![
+            cut_link(0, 1, 1_000, 2_000),
+            cut_link(0, 1, 2_500, 3_000),
+        ]);
+        assert_eq!(injections_expected(&schedule, 2, 100).cuts, 2);
+    }
+
+    /// The same sampling rule for kills: a same-node crash gap no longer
+    /// than one step is one continuous down period as far as the sampled
+    /// driver can be relied on to see (and shorter than any real respawn
+    /// anyway -- #98's timing half). This subsumes the overlap merge (the
+    /// first nightly) and the touching merge (run 14) as the gap-0 cases.
+    #[test]
+    fn a_sub_step_gap_between_crash_windows_expects_a_single_kill() {
+        let schedule = schedule_of(vec![crash(1, 1_000, 2_000), crash(1, 2_080, 3_000)]);
+        assert_eq!(injections_expected(&schedule, 2, 100).kills, 1);
+    }
+
+    /// A latency value held for no longer than one step may never be
+    /// observed at all, so it contributes no reliable change. Two windows
+    /// arranged so `L(t)` visits 60, dips to 39 for 80ms, and returns to
+    /// 60 reliably deliver only the first change.
+    #[test]
+    fn a_latency_piece_no_longer_than_a_step_expects_no_change() {
+        let schedule = schedule_of(vec![
+            latency(60, 1_000, 3_000),
+            latency(39, 3_000, 3_080),
+            latency(60, 3_080, 5_000),
+        ]);
+        assert_eq!(injections_expected(&schedule, 3, 100).latency_changes, 1);
     }
 
     /// Merging is per node. Two nodes crashed over the same interval are
@@ -781,7 +1015,7 @@ mod tests {
     #[test]
     fn overlapping_crash_windows_for_different_nodes_expect_a_kill_each() {
         let schedule = schedule_of(vec![crash(0, 1_000, 3_000), crash(1, 2_000, 4_000)]);
-        assert_eq!(injections_expected(&schedule, 2).kills, 2);
+        assert_eq!(injections_expected(&schedule, 2, 100).kills, 2);
     }
 
     /// The check must still catch what it exists to catch. A schedule with
@@ -791,7 +1025,7 @@ mod tests {
     #[test]
     fn a_genuinely_missed_kill_is_still_not_covered() {
         let schedule = schedule_of(vec![crash(0, 1_000, 2_000), crash(0, 5_000, 6_000)]);
-        let expected = injections_expected(&schedule, 2);
+        let expected = injections_expected(&schedule, 2, 100);
         assert_eq!(expected.kills, 2, "test premise: two separate windows");
 
         let injected = Injections {
@@ -816,8 +1050,8 @@ mod tests {
             crash(0, 5_000, 6_000),
             crash(1, 5_500, 6_500),
         ]);
-        assert_eq!(injections_expected(&schedule, 1).kills, 1);
-        assert_eq!(injections_expected(&schedule, 3).kills, 3);
+        assert_eq!(injections_expected(&schedule, 1, 100).kills, 1);
+        assert_eq!(injections_expected(&schedule, 3, 100).kills, 3);
     }
 
     fn latency(ms: u64, start_ms: u64, end_ms: u64) -> ScheduledFault {
@@ -860,7 +1094,7 @@ mod tests {
             "test premise: this is the schedule run 13 actually walked"
         );
         let windows_entered = schedule.faults().len();
-        let expected = injections_expected(&schedule, windows_entered);
+        let expected = injections_expected(&schedule, windows_entered, 100);
         assert_eq!(
             expected.latency_changes, 7,
             "the injector reported 7 latency changes on this schedule and \
@@ -875,7 +1109,7 @@ mod tests {
     #[test]
     fn a_latency_window_shadowed_by_a_higher_one_expects_no_extra_change() {
         let schedule = schedule_of(vec![latency(60, 1_000, 5_000), latency(39, 2_000, 4_000)]);
-        assert_eq!(injections_expected(&schedule, 2).latency_changes, 1);
+        assert_eq!(injections_expected(&schedule, 2, 100).latency_changes, 1);
     }
 
     /// The other side of that edge, in both directions overlap can go:
@@ -887,12 +1121,12 @@ mod tests {
     fn overlapping_latency_windows_that_change_the_max_expect_a_change_each() {
         // Rising: 0 -> 30 -> 60.
         let rising = schedule_of(vec![latency(30, 1_000, 3_000), latency(60, 2_000, 4_000)]);
-        assert_eq!(injections_expected(&rising, 2).latency_changes, 2);
+        assert_eq!(injections_expected(&rising, 2, 100).latency_changes, 2);
 
         // Falling out from under: 0 -> 60, then the 60 window ends while
         // the 39 one is still active, so 60 -> 39 is a real change too.
         let outlasting = schedule_of(vec![latency(60, 1_000, 3_000), latency(39, 2_000, 4_000)]);
-        assert_eq!(injections_expected(&outlasting, 2).latency_changes, 2);
+        assert_eq!(injections_expected(&outlasting, 2, 100).latency_changes, 2);
     }
 
     /// Disjoint windows keep the old one-per-window expectation -- the fix
@@ -902,7 +1136,7 @@ mod tests {
     #[test]
     fn a_genuinely_missed_latency_change_is_still_not_covered() {
         let schedule = schedule_of(vec![latency(30, 1_000, 2_000), latency(60, 5_000, 6_000)]);
-        let expected = injections_expected(&schedule, 2);
+        let expected = injections_expected(&schedule, 2, 100);
         assert_eq!(
             expected.latency_changes, 2,
             "test premise: disjoint windows"
@@ -927,7 +1161,7 @@ mod tests {
     #[test]
     fn adjacent_equal_latency_windows_expect_a_single_change() {
         let schedule = schedule_of(vec![latency(30, 1_000, 2_000), latency(30, 2_000, 3_000)]);
-        assert_eq!(injections_expected(&schedule, 2).latency_changes, 1);
+        assert_eq!(injections_expected(&schedule, 2, 100).latency_changes, 1);
     }
 
     /// Only the traversed prefix counts for latency too, mirroring
@@ -935,8 +1169,8 @@ mod tests {
     #[test]
     fn untraversed_latency_windows_are_not_expected() {
         let schedule = schedule_of(vec![latency(30, 1_000, 2_000), latency(60, 5_000, 6_000)]);
-        assert_eq!(injections_expected(&schedule, 1).latency_changes, 1);
-        assert_eq!(injections_expected(&schedule, 2).latency_changes, 2);
+        assert_eq!(injections_expected(&schedule, 1, 100).latency_changes, 1);
+        assert_eq!(injections_expected(&schedule, 2, 100).latency_changes, 2);
     }
 
     #[test]
