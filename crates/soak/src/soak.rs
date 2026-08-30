@@ -557,7 +557,15 @@ impl Soak {
 /// dead. The nightly soak's first run reported seed 14 as `VACUOUS:
 /// scheduled kills: 14, injected kills: 13`, on `Crash { node: 0 }` over
 /// `168880..171117ms` and again over `170502..172247ms` -- overlapping, so
-/// one kill. It took a 180s schedule with 63 windows to make an overlap
+/// one kill. Nightly run 14 (n=3, seed 119) found the boundary case of the
+/// same disease: `Crash { node: 1 }` over `41033..41636ms` and again over
+/// `41636..43212ms` -- *touching*, not overlapping. Windows are half-open,
+/// so the node's desired state is "down" continuously across the shared
+/// instant and only one kill can ever be delivered; the strict-overlap
+/// merge counted two and failed a run whose verdict was `0 divergence(s),
+/// 0 stall(s)` with post-mortem-agreeing applied logs (regression-pinned
+/// against seed 119's regenerated schedule below). It took a 180s schedule
+/// with 63 windows to make an overlap
 /// likely; the 20s bounded soak in CI has seven or eight windows and had
 /// never produced one.
 ///
@@ -602,8 +610,13 @@ fn injections_expected(schedule: &Schedule, windows_entered: usize) -> Injection
                 latency_windows.push((scheduled.start_ms, scheduled.end_ms, ms));
             }
             Fault::Crash { node } => match open_crash.get_mut(&node) {
-                // Still down from an earlier window: no new kill edge.
-                Some(open_until) if *open_until > scheduled.start_ms => {
+                // Still down from an earlier window: no new kill edge. `>=`
+                // and not `>`: windows are half-open (see `active_at`), so a
+                // window starting exactly where the previous one ends keeps
+                // the node's desired state at "down" with no instant of
+                // uptime in between -- `reconcile` never respawns it, and a
+                // second kill does not physically exist to deliver.
+                Some(open_until) if *open_until >= scheduled.start_ms => {
                     *open_until = (*open_until).max(scheduled.end_ms);
                 }
                 // Back up (or never down) by the time this window opens.
@@ -700,6 +713,65 @@ mod tests {
             injections_expected(&schedule, 3).kills,
             2,
             "the first two windows overlap into one kill; the third is separate"
+        );
+    }
+
+    /// Nightly run 14's boundary case, minimally: two windows that *touch*
+    /// (the second starts at the exact ms the first ends) are one
+    /// continuous down period, because windows are half-open -- there is no
+    /// instant at which the node is meant to be up, so `reconcile` never
+    /// respawns it and a second kill cannot be delivered.
+    ///
+    /// Falsifier: merging only strictly-overlapping windows (the pre-fix
+    /// behavior) expects 2 here.
+    #[test]
+    fn touching_crash_windows_for_one_node_expect_a_single_kill() {
+        let schedule = schedule_of(vec![crash(1, 41_033, 41_636), crash(1, 41_636, 43_212)]);
+        assert_eq!(injections_expected(&schedule, 2).kills, 1);
+    }
+
+    /// Issue #98, second occurrence, reproduced from the schedule that
+    /// found it. Nightly run 14's n=3 leg, seed 119, failed as `VACUOUS:
+    /// ... kills: 18` scheduled vs `17` injected on a run whose verdict was
+    /// `0 divergence(s), 0 stall(s)` and whose preserved applied logs agree
+    /// pairwise on every shared slot: the schedule contains `Crash { node:
+    /// 1 }` over `41033..41636` and `41636..43212` -- touching, so one
+    /// deliverable kill -- and the injector delivered all 17 kills that
+    /// physically exist.
+    ///
+    /// Regenerated from seed 119 with the `queso-soak` binary's exact
+    /// `ScheduleConfig`, so this pins the real failure, not a synthetic
+    /// cousin: 70 faults, 18 crash windows, 17 deliverable kills, and the
+    /// cuts/latency expectations byte-identical to what run 14 logged.
+    ///
+    /// Falsifier: merging only strictly-overlapping crash windows (the
+    /// pre-fix behavior) yields 18 here and this fails.
+    #[test]
+    fn nightly_run_14_seed_119s_touching_crash_windows_expect_17_kills() {
+        let config = ScheduleConfig {
+            replicas: 3,
+            duration_ms: 180_000,
+            min_fault_ms: 600,
+            max_fault_ms: 3_000,
+            min_gap_ms: 500,
+            max_gap_ms: 2_500,
+        };
+        let schedule = Schedule::generate(119, config);
+        assert_eq!(
+            schedule.faults().len(),
+            70,
+            "test premise: this is the schedule run 14 actually walked"
+        );
+        let expected = injections_expected(&schedule, schedule.faults().len());
+        assert_eq!(
+            expected.kills, 17,
+            "the injector reported 17 kills on this schedule and all 17 are \
+             deliverable; expecting 18 is what failed the clean run"
+        );
+        assert_eq!(expected.cuts, 43, "cuts matched run 14's scheduled count");
+        assert_eq!(
+            expected.latency_changes, 9,
+            "latency matched exactly in run 14 (the #99 fix held)"
         );
     }
 
