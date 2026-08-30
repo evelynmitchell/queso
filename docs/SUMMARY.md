@@ -6,6 +6,7 @@
      remains fully supported; the README stays the canonical front door
      and lists the same files with descriptions. -->
 
+- [Tutorial: boot a cluster, kill it, and watch it survive](tutorial.md)
 - [Project outline](00-project-outline.md)
 - [Backgrounder: the consensus problem space](01-backgrounder.md)
 - [Property model](02-properties.md)
