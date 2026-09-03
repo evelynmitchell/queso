@@ -193,6 +193,18 @@ pub struct SoakReport {
     /// contained faults" is not the claim the anti-vacuity check needs --
     /// "faults reached the cluster" is.
     pub injections: Injections,
+    /// Process transitions `reconcile` found the cluster already in: a
+    /// kill wanted on a node already down, a restart on one already up.
+    ///
+    /// Zero on every run observed so far, and zero by an invariant --
+    /// `is_running` mirrors the crashed set, so neither guard can fire --
+    /// whose premises the private `Reconciled::desynced` states in full.
+    /// It is counted and reported by name in [`Self::problems`] because
+    /// that is an argument about the harness rather than a measurement of
+    /// it, and because a suppressed kill is otherwise invisible until it
+    /// surfaces as a vacuity failure on a clean night: the shape #98
+    /// wrongly hypothesised for nightly run 9.
+    pub process_desyncs: usize,
     /// Fault windows the schedule opened during the run. Below the
     /// schedule's own count only if the run ended early on a divergence.
     pub windows_entered: usize,
@@ -270,6 +282,24 @@ impl SoakReport {
             problems.push(
                 "VACUOUS: the schedule never opened a fault window during the run".to_string(),
             );
+        }
+        // Whether the injection counts can be trusted at all, before they
+        // are judged: a desync means `reconcile` skipped a process
+        // transition the schedule asked for, so the kill count below is an
+        // under-count, and the comparison after it would report a broken
+        // injection path when the real defect is that the driver lost
+        // track of which replicas were running.
+        if self.process_desyncs > 0 {
+            problems.push(format!(
+                "VACUOUS: the driver's process model desynced from the cluster \
+                 {} time(s) -- a kill wanted on a node already down, or a \
+                 restart on one already up. Each one is a fault the schedule \
+                 asked for that was neither performed nor counted, so the kill \
+                 count below understates the run; the invariant that rules this \
+                 out (`is_running` mirrors the crashed set) has broken, which is \
+                 a harness bug rather than a cluster one.",
+                self.process_desyncs
+            ));
         }
         // Per kind rather than in total: a total would stay green if, say,
         // only the crash path still worked, and each kind exercises
@@ -427,6 +457,7 @@ impl Soak {
         let started_at = cluster.now();
         let mut injected = Injected::default();
         let mut injections = Injections::default();
+        let mut process_desyncs = 0usize;
         let mut seen_windows: BTreeSet<(u64, u64)> = BTreeSet::new();
 
         let mut divergences: Vec<Divergence> = Vec::new();
@@ -441,7 +472,9 @@ impl Soak {
                 seen_windows.insert((scheduled.start_ms, scheduled.end_ms));
             }
             let desired = Injected::desired(&self.schedule, elapsed, replicas);
-            injections.add(Self::reconcile(cluster, &injected, &desired));
+            let done = Self::reconcile(cluster, &injected, &desired);
+            injections.add(done.injected);
+            process_desyncs += done.desynced;
             injected = desired;
 
             for _ in 0..config.submits_per_step {
@@ -463,7 +496,7 @@ impl Soak {
         }
 
         // Heal everything before judging liveness.
-        Self::reconcile(cluster, &injected, &Injected::default());
+        process_desyncs += Self::reconcile(cluster, &injected, &Injected::default()).desynced;
         let undrained = cluster.drain_inflight(Duration::from_secs(5));
         // A replica the schedule crashed near the end was only just
         // respawned. Waiting for it to answer `/health` separates "the
@@ -503,6 +536,7 @@ impl Soak {
             undrained,
             unready_after_heal,
             injections,
+            process_desyncs,
             windows_entered: seen_windows.len(),
             proxy_accepts: cluster.turbulence().total_accepted(),
             observer_report: observer.render_report(),
@@ -514,12 +548,12 @@ impl Soak {
     /// Returns the *new* faults injected -- links severed, processes
     /// killed, non-zero latency applied. Healing does not count: the
     /// number exists to prove turbulence reached the cluster.
-    fn reconcile(cluster: &mut RealCluster, from: &Injected, to: &Injected) -> Injections {
-        let mut injected = Injections::default();
+    fn reconcile(cluster: &mut RealCluster, from: &Injected, to: &Injected) -> Reconciled {
+        let mut done = Reconciled::default();
         let turbulence = cluster.turbulence();
         for &(a, b) in to.cuts.difference(&from.cuts) {
             turbulence.link(a, b).cut();
-            injected.cuts += 1;
+            done.injected.cuts += 1;
         }
         for &(a, b) in from.cuts.difference(&to.cuts) {
             turbulence.link(a, b).heal();
@@ -527,7 +561,7 @@ impl Soak {
         if from.latency_ms != to.latency_ms {
             turbulence.set_latency_ms(to.latency_ms);
             if to.latency_ms > 0 {
-                injected.latency_changes += 1;
+                done.injected.latency_changes += 1;
             }
         }
 
@@ -536,16 +570,51 @@ impl Soak {
         for node in kill {
             if cluster.is_running(node) {
                 cluster.kill(node);
-                injected.kills += 1;
+                done.injected.kills += 1;
+            } else {
+                done.desynced += 1;
             }
         }
         for node in restart {
             if !cluster.is_running(node) {
                 cluster.spawn(node);
+            } else {
+                done.desynced += 1;
             }
         }
-        injected
+        done
     }
+}
+
+/// What one [`Soak::reconcile`] did to the cluster, and what it found it
+/// could not do.
+#[derive(Debug, Default, Clone, Copy)]
+struct Reconciled {
+    /// Faults actually injected, in `reconcile`'s own units.
+    injected: Injections,
+    /// Process transitions the schedule asked for and the cluster was
+    /// *already in*: a kill wanted on a node already down, a restart
+    /// wanted on one already up. `reconcile` skips those -- killing a
+    /// dead node panics -- and skipping a kill also skips counting it.
+    ///
+    /// Expected to be zero on every run, and load-bearing precisely
+    /// because of that. `RealCluster::is_running` is
+    /// `children[i].is_some()`, `spawn` sets that synchronously, and the
+    /// only other sites that take or replace a child handle are `start`
+    /// (which spawns all of them), `kill` and `Drop` -- so provided `run`
+    /// is handed a fully-running cluster, which `RealCluster::start`
+    /// provides, `is_running(i) == !injected.crashed.contains(i)` holds
+    /// across every reconcile and both guards are always true.
+    ///
+    /// That is an argument, and this counter is what stops it having to
+    /// be believed. A suppressed kill is otherwise invisible until it
+    /// surfaces hours later as a vacuity failure on a safety-clean
+    /// night, with nothing in the log to distinguish it from a broken
+    /// injector -- which is the shape #98 hypothesised for nightly run 9,
+    /// and left open as unenumerable, before the schedules refuted it (see
+    /// [`injections_expected`]). If the invariant is ever wrong,
+    /// [`SoakReport::problems`] now says so in those words.
+    desynced: usize,
 }
 
 /// What the first `windows_entered` windows of `schedule` actually ask the
@@ -561,7 +630,8 @@ impl Soak {
 /// arrangement at a time: overlapping same-node crash windows (the first
 /// nightly, seed 14), a latency window shadowed by a concurrent higher one
 /// (run 13, seed 106, #98), and touching same-node crash windows (run 14,
-/// seed 119). Each fix enumerated the observed arrangement; the space of
+/// seed 119 -- and, as it turned out, run 9's seeds 78 and 79 before it).
+/// Each fix enumerated the observed arrangement; the space of
 /// arrangements kept producing new members.
 ///
 /// This function ends the family instead of patching its members. It walks
@@ -604,18 +674,52 @@ impl Soak {
 /// -- 23 transitions across 12 gap sites, cuts and latency both -- was
 /// delivered.
 ///
-/// # The two ways delivery can still fall short, deliberately retained
+/// # Run 9, and the respawn hypothesis that outlived it
 ///
-/// - **Respawn timing** (#98): `reconcile` kills a node only if it
-///   `is_running`, so a same-node crash gap longer than a step but shorter
-///   than a real respawn still skips a kill this expectation counts -- the
-///   suspected shape of run 9's `kills: 19/20`. Timing-dependent, not
-///   schedule-dependent; not modeled here.
-/// - **Sampling jitter**: a gap slightly longer than one step can still be
-///   missed when the loop's processing time stretches the sampling cadence
-///   past the gap. The field corpus above (23/23 delivered at >= 126ms)
-///   bounds how much this matters in practice; a future occurrence will
-///   fail a clean run and should move this threshold, with its evidence.
+/// #98 left one occurrence unexplained -- nightly run 9's n=5 leg failing
+/// seeds 78 and 79 as vacuous on `kills` -- and offered respawn timing for
+/// it: `reconcile` kills a node only if it `is_running`, so a crash gap
+/// too short for a real respawn would skip both the kill and its count.
+/// The hypothesis is **false** and the occurrence is **explained**; both
+/// are enumerated in
+/// `run_9s_kill_shortfall_was_touching_crash_windows`, and neither needed
+/// anything beyond regenerating the two schedules, which are
+/// deterministic.
+///
+/// Seed 78 schedules `Crash { node: 2 }` over `140717..142105` and again
+/// over `142105..144327` -- *touching*, not gapped. Half-open windows
+/// leave node 2 continuously crashed across the join, so exactly one kill
+/// edge exists there, at any cadence; seed 79 carries the same
+/// arrangement on node 4 (`22087..23346`, `23346..26134`). Running the
+/// pre-fix per-window expectation (`d1e8617^`) over the regenerated
+/// seed-78 schedule reproduces run 9's reported line exactly --
+/// `cuts: 42, kills: 20` against the `221` cuts and `19` kills its log
+/// records as delivered -- and this transition-based expectation gives
+/// that `19`; seed 79, whose per-seed numbers the issue does not quote,
+/// computes to `13` against a pre-fix `14`. The fix that landed for the *other*
+/// arrangements already covered this one; nothing was left to do but
+/// check, which is why the check is now a test rather than a paragraph.
+///
+/// The respawn hypothesis additionally required `is_running` to be false
+/// while a kill was desired. It cannot be, and the mechanism of that
+/// "cannot" is small enough to state: `is_running` is
+/// `children[i].is_some()`, `spawn` sets it synchronously, and the only
+/// sites in `cluster.rs` that take or replace a child handle are `start`,
+/// `spawn`, `kill` and `Drop` -- so the invariant of
+/// [`Reconciled::desynced`] holds and both guards are always true,
+/// *provided* `run` is handed a fully-running cluster. Rather than rest
+/// on that, `reconcile` counts every transition its guards suppress and
+/// [`SoakReport::problems`] reports the count by name: the next run that
+/// violates the premise says so, instead of quietly under-counting a kill
+/// and failing as vacuous three hours later.
+///
+/// # The one way delivery can still fall short, deliberately retained
+///
+/// **Sampling jitter**: a gap slightly longer than one step can still be
+/// missed when the loop's processing time stretches the sampling cadence
+/// past the gap. The field corpus above (23/23 delivered at >= 126ms)
+/// bounds how much this matters in practice; a future occurrence will
+/// fail a clean run and should move this threshold, with its evidence.
 ///
 /// Assumes windows are in non-decreasing `start_ms` order, which
 /// [`Schedule::generate`] guarantees.
@@ -1263,5 +1367,322 @@ mod tests {
             BTreeSet::from([2])
         );
         assert_eq!(Injected::desired(&schedule, 200, 3), Injected::default());
+    }
+
+    /// The nightly's schedule shape (`bin/queso-soak.rs`), which every
+    /// field seed in this module was drawn from.
+    fn nightly_schedule(seed: u64, replicas: usize) -> Schedule {
+        Schedule::generate(
+            seed,
+            ScheduleConfig {
+                replicas,
+                duration_ms: 180_000,
+                min_fault_ms: 600,
+                max_fault_ms: 3_000,
+                min_gap_ms: 500,
+                max_gap_ms: 2_500,
+            },
+        )
+    }
+
+    /// The expectation exactly as it stood when nightly run 9 ran it,
+    /// transcribed from `git show d1e8617^:crates/soak/src/soak.rs`.
+    ///
+    /// Kept so a claim about what run 9 *reported* is checkable against
+    /// the regenerated schedule rather than taken from a log quote in an
+    /// issue. Note the strict `>`: a window opening exactly where the
+    /// previous one closed started a fresh kill group.
+    fn expectation_as_of_run_9(schedule: &Schedule) -> Injections {
+        let mut expected = Injections::default();
+        let mut open_crash: BTreeMap<usize, u64> = BTreeMap::new();
+        for scheduled in schedule.faults() {
+            match scheduled.fault {
+                Fault::Isolate { .. } | Fault::CutLink { .. } => expected.cuts += 1,
+                Fault::Latency { .. } => expected.latency_changes += 1,
+                Fault::Crash { node } => match open_crash.get_mut(&node) {
+                    Some(open_until) if *open_until > scheduled.start_ms => {
+                        *open_until = (*open_until).max(scheduled.end_ms);
+                    }
+                    _ => {
+                        expected.kills += 1;
+                        open_crash.insert(node, scheduled.end_ms);
+                    }
+                },
+            }
+        }
+        expected
+    }
+
+    /// Same-node crash windows, in schedule order.
+    fn crash_windows(schedule: &Schedule, node: usize) -> Vec<(u64, u64)> {
+        schedule
+            .faults()
+            .iter()
+            .filter(|f| matches!(f.fault, Fault::Crash { node: n } if n == node))
+            .map(|f| (f.start_ms, f.end_ms))
+            .collect()
+    }
+
+    /// Nightly run 9's unexplained trip, explained -- the half of #98 that
+    /// stayed open after #99 fixed the latency clause.
+    ///
+    /// Run 9's n=5 leg failed seeds 78 and 79 as vacuous on `kills` while
+    /// both were safety- and liveness-clean, and #98 hypothesised respawn
+    /// timing: a crash gap too short for the node to be back up, so
+    /// `reconcile`'s `is_running` guard skips the kill and its count. It
+    /// also called that unenumerable, because it depends on process timing
+    /// rather than on the schedule. The schedules refute it outright.
+    ///
+    /// Both seeds carry **touching** same-node crash windows -- one window
+    /// opening exactly where the previous closed. No restart happens
+    /// between them at any cadence, so the guard is never even consulted,
+    /// and `desired_of`'s half-open windows leave the node continuously
+    /// crashed across the join: one kill edge exists where the pre-fix
+    /// per-window count demanded two.
+    ///
+    /// Pinned in the units run 9 reported. `expectation_as_of_run_9`
+    /// reproduces `scheduled Injections { cuts: 42, kills: 20 }` against
+    /// the `221` cuts and `19` kills recorded as delivered -- so the
+    /// regenerated schedule *is* the one that ran -- and the current
+    /// expectation demands what was delivered. #98's table labels that
+    /// row "seeds 78-79" without splitting it; the pre-fix cut counts
+    /// separate them, 42 for seed 78 and 48 for seed 79, so the quoted
+    /// numbers are seed 78's. Seed 79's own counts are asserted below as
+    /// what the two functions compute, which is all the issue supports:
+    /// it records that the seed failed, not the numbers it failed on.
+    ///
+    /// **Measured power.** Reverting `injections_expected` to run 9's own
+    /// per-window body -- the mutation this test exists to catch -- fails
+    /// it on the delivered-counts assertion. Mutating the *gap coalescing*
+    /// alone does **not** fail it, whether the sub-step threshold is
+    /// dropped or touching spans are split apart, and that is worth having
+    /// measured rather than assumed: by the time `coalesced` runs, the
+    /// boundary walk through `desired_of` has already made a touching pair
+    /// one continuous span, so this test's power is over the transition
+    /// extraction and not over the threshold.
+    /// `the_expectation_never_exceeds_a_sampled_injectors_delivery` is
+    /// what covers the threshold.
+    #[test]
+    fn run_9s_kill_shortfall_was_touching_crash_windows() {
+        let seed_78 = nightly_schedule(78, 5);
+        assert_eq!(
+            crash_windows(&seed_78, 2),
+            vec![
+                (34_843, 36_784),
+                (117_897, 120_762),
+                (140_717, 142_105),
+                (142_105, 144_327),
+            ],
+            "seed 78's node-2 crash windows are the arrangement under test: \
+             142105 closes one window and opens the next"
+        );
+        assert_eq!(
+            expectation_as_of_run_9(&seed_78),
+            Injections {
+                cuts: 42,
+                kills: 20,
+                latency_changes: 5,
+            },
+            "the pre-fix expectation over the regenerated schedule must \
+             reproduce run 9's reported line for seed 78, or this is not the \
+             schedule that ran"
+        );
+        let expected_78 = injections_expected(&seed_78, seed_78.faults().len(), 100);
+        assert_eq!(
+            (expected_78.cuts, expected_78.kills),
+            (221, 19),
+            "run 9's n=5 log records 221 cuts and 19 kills delivered for seed 78; \
+             the expectation must demand exactly those, not the 20 kills that \
+             failed a clean night"
+        );
+
+        // Seed 79, the other failing seed of that leg: same arrangement on
+        // node 4, one kill short for the same reason.
+        let seed_79 = nightly_schedule(79, 5);
+        let windows_79 = crash_windows(&seed_79, 4);
+        assert_eq!(
+            windows_79[0..2],
+            [(22_087, 23_346), (23_346, 26_134)],
+            "seed 79 touches at 23346 on node 4"
+        );
+        assert_eq!(expectation_as_of_run_9(&seed_79).kills, 14);
+        assert_eq!(
+            injections_expected(&seed_79, seed_79.faults().len(), 100).kills,
+            13
+        );
+    }
+
+    /// What the driver's sampling loop delivers over `schedule`, with the
+    /// cluster removed.
+    ///
+    /// The loop evaluates `Injected::desired` on a `step_ms` grid, so it
+    /// observes a window boundary only at the first grid instant at or
+    /// after it, and the desired state is constant between consecutive
+    /// such instants -- which is why walking the snapped boundaries is the
+    /// same walk as sampling every step, at a fraction of the cost.
+    /// `the_sampled_delivery_model_matches_a_dense_replay` is the check on
+    /// that equivalence.
+    ///
+    /// Returns what was delivered and the windows the sampling saw, the
+    /// same pair the driver reports.
+    fn sampled_delivery(schedule: &Schedule, step_ms: u64) -> (Injections, usize) {
+        let duration_ms = schedule.config().duration_ms;
+        let replicas = schedule.config().replicas;
+        let mut instants: Vec<u64> = schedule
+            .faults()
+            .iter()
+            .flat_map(|f| [f.start_ms, f.end_ms])
+            .map(|t| t.div_ceil(step_ms) * step_ms)
+            .chain(std::iter::once(0))
+            .filter(|&t| t < duration_ms)
+            .collect();
+        instants.sort_unstable();
+        instants.dedup();
+
+        let mut delivered = Injections::default();
+        let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut prev = Injected::default();
+        for t in instants {
+            for f in schedule.active_at(t) {
+                seen.insert((f.start_ms, f.end_ms));
+            }
+            let now = Injected::desired(schedule, t, replicas);
+            delivered.cuts += now.cuts.difference(&prev.cuts).count();
+            delivered.kills += now.crashed.difference(&prev.crashed).count();
+            if now.latency_ms != prev.latency_ms && now.latency_ms > 0 {
+                delivered.latency_changes += 1;
+            }
+            prev = now;
+        }
+        (delivered, seen.len())
+    }
+
+    /// The boundary-snapping shortcut in `sampled_delivery` against the
+    /// literal loop it stands in for: sample every `step_ms` from zero,
+    /// diff consecutive states. Four seeds at both sizes, which is what
+    /// the dense version costs.
+    #[test]
+    fn the_sampled_delivery_model_matches_a_dense_replay() {
+        for seed in 0..4 {
+            for replicas in [3, 5] {
+                let schedule = nightly_schedule(seed, replicas);
+                let mut dense = Injections::default();
+                let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
+                let mut prev = Injected::default();
+                let mut t = 0;
+                while t < schedule.config().duration_ms {
+                    for f in schedule.active_at(t) {
+                        seen.insert((f.start_ms, f.end_ms));
+                    }
+                    let now = Injected::desired(&schedule, t, replicas);
+                    dense.cuts += now.cuts.difference(&prev.cuts).count();
+                    dense.kills += now.crashed.difference(&prev.crashed).count();
+                    if now.latency_ms != prev.latency_ms && now.latency_ms > 0 {
+                        dense.latency_changes += 1;
+                    }
+                    prev = now;
+                    t += 100;
+                }
+                assert_eq!(
+                    sampled_delivery(&schedule, 100),
+                    (dense, seen.len()),
+                    "seed {seed} n={replicas}"
+                );
+            }
+        }
+    }
+
+    /// The expectation against a simulated injector, over 200 seeds it was
+    /// not calibrated on.
+    ///
+    /// `the_expectation_matches_two_nights_of_field_deliveries` is the
+    /// authoritative corpus -- real deliveries, transcribed from real
+    /// logs -- but it is 32 fixed seed-legs, and this family of bugs kept
+    /// arriving as *new* window arrangements: overlapping crash windows
+    /// (seed 14), a shadowed latency window (seed 106), touching crash
+    /// windows (seeds 78, 79, 119). Each was found by a night failing,
+    /// which costs a night. So: generate 400 fresh seed-legs, replay the
+    /// driver's sampling loop over each, and check the property the field
+    /// checks.
+    ///
+    /// **What this can and cannot catch.** The replay *models* the
+    /// injector rather than running it, so a bug inside `reconcile` or the
+    /// turbulence mesh is invisible to it -- that is what the field corpus
+    /// and the real-process soak are for. What it covers is the audit
+    /// disagreeing with the injector's semantics on an arrangement no
+    /// night has drawn yet, which is how all four of the above arrived.
+    ///
+    /// **Measured power, and what the two counts mean.** Over the 400
+    /// legs the expectation is exactly what an evenly-sampled injector
+    /// delivers on 385, and is *exceeded* on 15 -- never missed, which is
+    /// the assertion that matters. Both numbers are pinned, and so is the
+    /// explanation of the 15: on every one of them the expectation with
+    /// sampling coalescing turned off (`sample_step_ms: 0`) equals the
+    /// delivery, so the excess is entirely sub-step gaps a grid instant
+    /// happened to land inside -- the coin flip the field corpus also
+    /// caught on 2 of its 32 legs -- and not the expectation drifting
+    /// loose somewhere unexamined.
+    ///
+    /// The other side of the same coin is the falsifier: on 17 legs the
+    /// grid *misses* a sub-step gap, so an expectation without the
+    /// coalescing would demand a transition that was never delivered.
+    /// Measured, not predicted: dropping the sub-step threshold fails this
+    /// test at the `covers` assertion on the first of those legs (seed 10
+    /// n=3, 124 demanded against 122 delivered). That is its detection
+    /// power for the #72/#99/run-9 family, in legs rather than in prose.
+    #[test]
+    fn the_expectation_never_exceeds_a_sampled_injectors_delivery() {
+        let mut legs = 0usize;
+        let mut exact = 0usize;
+        let mut sub_step_dependent = 0usize;
+        for seed in 0..200u64 {
+            for replicas in [3, 5] {
+                let schedule = nightly_schedule(seed, replicas);
+                let (delivered, windows_entered) = sampled_delivery(&schedule, 100);
+                let expected = injections_expected(&schedule, windows_entered, 100);
+                assert!(
+                    delivered.covers(&expected),
+                    "seed {seed} n={replicas}: a sampled injector delivers \
+                     {delivered:?} but the expectation demands {expected:?} -- \
+                     this expectation would fail a clean night"
+                );
+                legs += 1;
+
+                // `sample_step_ms: 0` is this same expectation with only
+                // the semantic coalescing (touching spans, which no
+                // cadence can separate) left standing.
+                let uncoalesced = injections_expected(&schedule, windows_entered, 0);
+                if delivered == expected {
+                    exact += 1;
+                } else {
+                    assert_eq!(
+                        delivered, uncoalesced,
+                        "seed {seed} n={replicas}: delivery exceeds the \
+                         expectation, so every unit of the excess must be a \
+                         sub-step gap this grid happened to sample inside -- if \
+                         it is not, the expectation is loose for some other \
+                         reason and that reason is unexamined"
+                    );
+                }
+                if !delivered.covers(&uncoalesced) {
+                    sub_step_dependent += 1;
+                }
+            }
+        }
+        assert_eq!(legs, 400);
+        assert_eq!(
+            exact, 385,
+            "measured when this was written: 385 of 400 legs match exactly and \
+             15 exceed (each explained by the assertion above). A drop means the \
+             expectation went loose; a rise means the corpus stopped drawing the \
+             sub-step gaps that make the 15"
+        );
+        assert_eq!(
+            sub_step_dependent, 17,
+            "the 17 legs where the sampled injector misses a sub-step gap, i.e. \
+             where removing the coalescing would fail a clean night. This is this \
+             test's detection power for that regression; a drop toward zero means \
+             the corpus stopped exercising what it is mostly here to protect"
+        );
     }
 }
