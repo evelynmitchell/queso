@@ -29,6 +29,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use queso_compare::stall::StallMonitor;
 use queso_compare::workload::{run_workload, StopCondition, WorkloadConfig};
 use queso_compare::{KvTarget, QuesoTarget};
 use queso_net::client::{Client, ClientConfig};
@@ -104,8 +105,18 @@ async fn leader_isolation_keeps_the_majority_available_with_no_election_style_st
     let ops = 20usize;
     let deadline = tokio::time::Instant::now() + DEADLINE;
     let isolation_started = Instant::now();
+    // Watch how late *this process* is being scheduled for as long as the
+    // gap is being measured, so a gap can be attributed to the cluster or
+    // to the machine rather than argued about after the fact (issue #107;
+    // see `queso_compare::stall` for what the measurement can and cannot
+    // settle).
+    let scheduling = StallMonitor::start(isolation_started);
     let mut last_completion = isolation_started;
     let mut max_gap = Duration::ZERO;
+    // The window the longest gap spanned, as offsets from
+    // `isolation_started` -- the monitor shares that origin, so the two
+    // can be intersected.
+    let mut max_gap_window = (Duration::ZERO, Duration::ZERO);
     for i in 0..ops {
         let key = 900 + i as u32;
         let attempt = tokio::time::timeout_at(deadline, degraded_target.put(key, i as i64))
@@ -115,16 +126,44 @@ async fn leader_isolation_keeps_the_majority_available_with_no_election_style_st
             });
         attempt.unwrap_or_else(|err| panic!("op {i} failed with the leader isolated: {err:?}"));
         let now = Instant::now();
-        max_gap = max_gap.max(now.duration_since(last_completion));
+        let gap = now.duration_since(last_completion);
+        if gap > max_gap {
+            max_gap = gap;
+            max_gap_window = (
+                last_completion.duration_since(isolation_started),
+                now.duration_since(isolation_started),
+            );
+        }
         last_completion = now;
     }
     let isolation_elapsed = isolation_started.elapsed();
     let degraded_throughput = ops as f64 / isolation_elapsed.as_secs_f64();
+    let scheduling = scheduling.stop();
+
+    // A monitor that never ran would report no stalls, and "no stalls
+    // recorded" would then mean "nothing was watching", not "the machine
+    // was healthy" -- the same silence, two opposite meanings. Rule the
+    // first one out before trusting a zero correction.
+    assert!(
+        scheduling.ticks() > 0,
+        "the scheduling monitor never completed a tick in {:?}, so it cannot \
+         say whether the machine was healthy: {scheduling:?}",
+        scheduling.monitored()
+    );
+    let frozen = scheduling.frozen_within(max_gap_window.0, max_gap_window.1);
+    let cluster_gap = max_gap.saturating_sub(frozen);
 
     eprintln!(
         "leader-isolated: {ops} writes in {isolation_elapsed:?} ({degraded_throughput:.1} ops/sec), \
-         max inter-op gap = {max_gap:?} (this is the availability-gap number -- \
-         compare against etcd's election-timeout-bounded stall, see docs/compare-etcd.md)"
+         max inter-op gap = {max_gap:?}, of which {frozen:?} coincided with this \
+         process not being scheduled, leaving {cluster_gap:?} for the cluster to \
+         account for (this is the availability-gap number -- compare against \
+         etcd's election-timeout-bounded stall, see docs/compare-etcd.md). \
+         Scheduling monitor: {} tick(s) over {:?}, worst stall {:?}, {:?} total.",
+        scheduling.ticks(),
+        scheduling.monitored(),
+        scheduling.worst(),
+        scheduling.total(),
     );
 
     // The headline assertion: the *longest single gap* between consecutive
@@ -134,10 +173,24 @@ async fn leader_isolation_keeps_the_majority_available_with_no_election_style_st
     // docs/compare-etcd.md's methodology section for the citation). This is
     // Meerkat/QuePaxa's leaderless-tolerant hedging keeping the majority
     // deciding immediately, with no election to wait out.
+    //
+    // The 2s bound is not a tuning knob: the claim *is* "shorter than an
+    // election timeout", so raising it past one discards what it asserts.
+    // What is subtracted instead is the part of the gap during which this
+    // process was measurably not running at all -- a runner that stops
+    // scheduling this process freezes the measurement, not the cluster,
+    // which is the distinction CI run 33221049520 turned on (issue #107).
+    // The correction is expected to run *small* rather than large (argued:
+    // an idle sleeper needs one scheduling slot to look healthy, while the
+    // three node threads need sustained CPU and round-trips), so it errs
+    // toward failing a run the machine may have caused rather than passing
+    // one the cluster caused.
     assert!(
-        max_gap < Duration::from_secs(2),
+        cluster_gap < Duration::from_secs(2),
         "expected no single operation to stall anywhere near an election-timeout \
-         window with the leader isolated, but saw a {max_gap:?} gap"
+         window with the leader isolated, but saw a {max_gap:?} gap with only \
+         {frozen:?} of it attributable to this process not being scheduled, \
+         leaving {cluster_gap:?} unaccounted for. Scheduling monitor: {scheduling:?}"
     );
 
     // Anti-vacuous: prove the leader was genuinely isolated, not that the
