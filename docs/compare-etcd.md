@@ -298,6 +298,43 @@ default is a 1000ms election timeout with randomized backoff up to
 roughly double that) while still being comfortably non-flaky in a
 contended sandbox.
 
+#### Whose stall was it? (issue #107)
+
+That 2-second bound is not a tuning knob. The claim it encodes is
+"shorter than an election timeout", so raising it past one would not make
+the test less flaky, it would make it assert nothing. But a gap timed with
+two clock reads around an operation cannot, by itself, tell *the cluster
+went quiet* apart from *this whole process stopped being scheduled* -- and
+on a shared two-vCPU CI runner with another workflow's build resident, the
+second happens. It is what produced a 4.61s gap in [CI run
+33221049520](https://github.com/evelynmitchell/queso/actions/runs/33221049520)
+on a tree that had passed the identical test minutes before.
+
+So the test measures the confounder instead of arguing about it.
+`queso_compare::stall::StallMonitor` runs one otherwise-idle thread across
+the isolated phase, recording every interval in which it was still not
+running more than 100ms after its 20ms sleep was due. Those intervals are
+timestamped on the same clock as the operations, so the part of them
+overlapping the longest gap is subtracted, and the assertion is made on
+what is left -- the part of the gap something other than the machine's
+scheduler has to account for. Every run prints all three numbers (raw gap,
+attributed stall, remainder), so an occurrence lands with its evidence
+rather than needing one reconstructed afterwards.
+
+Two limits, because the correction is only as good as they are. The
+monitor is a **lower bound on contention**: a thread that only sleeps
+needs one scheduling slot to look healthy, while the cluster's three node
+threads need sustained CPU and network round-trips, so a runner that
+starves the cluster more than an idle sleeper is under-corrected for and
+the assertion still fails. That direction is chosen deliberately --
+under-correcting costs a re-run, over-correcting costs the claim. And it
+is **not established that this would have caught run 33221049520**: that
+run predates the instrumentation and its artifacts have expired, so
+whether a matching stall was recorded there is unknown. What is measured
+is that a 1000ms `SIGSTOP` of the test process is observed as a 990ms
+stall, against 0ns on an unloaded machine (`cargo test -p queso-compare
+--test stall_detection -- --ignored`).
+
 *Methodology note:* the leader-isolated phase intentionally runs at
 concurrency 1 (one operation in flight at a time), unlike the
 baseline/recovered phases' concurrency 4 -- sequential submission is what

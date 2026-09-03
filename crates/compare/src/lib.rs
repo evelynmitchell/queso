@@ -22,6 +22,9 @@
 //! - [`etcd_target`] -- [`etcd_target::EtcdTarget`], `KvTarget` over etcd's
 //!   v3 gRPC-gateway JSON/HTTP API (see that module's docs for why not
 //!   `etcd-client`).
+//! - [`stall`] -- [`stall::StallMonitor`], a measurement of how late this
+//!   process's own threads are being scheduled, so a wall-clock gap can be
+//!   attributed to the cluster or to the machine (issue #107).
 //! - [`workload`] -- [`workload::run_workload`], the shared closed-/open-
 //!   loop load generator (mirrors `crates/net/src/bin/queso-bench.rs`) that
 //!   drives any `KvTarget` and reduces the run into a
@@ -43,10 +46,12 @@
 
 pub mod etcd_target;
 pub mod queso_target;
+pub mod stall;
 pub mod target;
 pub mod workload;
 
 pub use etcd_target::EtcdTarget;
 pub use queso_target::QuesoTarget;
+pub use stall::{StallMonitor, StallReport};
 pub use target::KvTarget;
 pub use workload::{run_workload, StopCondition, WorkloadConfig};
