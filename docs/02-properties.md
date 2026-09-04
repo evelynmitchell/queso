@@ -210,3 +210,9 @@ called out explicitly because they are the failure modes we actively hunt for)
 
 *Note: A6 (client sessions), A7 (bounded step/slot), and the durability design
 (P12) are prerequisites, not late add-ons — they land with the Phase-4 KV store.*
+
+This table says *when* a property becomes verifiable, not *whether* it has been
+verified or how strongly. For that, see
+[`conformance-matrix.md`](conformance-matrix.md), which maps each property to
+the artifact that verifies it and to the class of evidence that artifact
+provides.

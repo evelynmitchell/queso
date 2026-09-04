@@ -11,6 +11,7 @@
 - [Backgrounder: the consensus problem space](01-backgrounder.md)
 - [Property model](02-properties.md)
 - [Testing plan](03-testing-plan.md)
+- [Conformance matrix: property → evidence](conformance-matrix.md)
 - [What each test establishes](what-each-test-establishes.md)
 - [Investigating with logs](investigating-with-logs.md)
 - [TLA+ models (spec/)](spec.md)

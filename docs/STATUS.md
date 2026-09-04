@@ -69,8 +69,12 @@ real traffic. See §4 for the honest remaining gaps.
 - **Hedging (§5):** staggered delay schedule (leader at 0, proposer *k* at `(k-1)·δ`),
   activating only if no earlier progress is seen; **unbounded retry with exponential
   backoff** (issue #13 — backoff bounds the retry *rate*, never the *count*, so a
-  network that heals arbitrarily late still resumes the slot). Measured `O(n)` vs
-  `O(n²)` messaging under synchrony (10 vs 50 msgs at n=5; 42 vs 882 at n=21).
+  network that heals arbitrarily late still resumes the slot). `O(n)` rather than
+  `O(n²)` messaging under synchrony — *tested, power unmeasured*:
+  `hedging.rs::d2_…` asserts leader-only cost `≤ 4n` with no backup activated,
+  at n ∈ {3, 5, 7, 11}. (The figures "10 vs 50 msgs at n=5; 42 vs 882 at n=21"
+  stood here from this file's first commit and trace to no test in the tree —
+  n=21 is never run — so they are *asserted, unmeasured* and are not repeated.)
 
 ### `crates/smr` — replicated log + linearizable KV (Phases 4, 6)
 - Multi-slot log (prefix consistency, total order, gap-free apply) chaining per-slot
@@ -339,9 +343,15 @@ deployment runbook, comparison writeup, and licensing all landed.
 - **Published API docs** (`cargo doc`) — not built or hosted anywhere.
 - **Client guide** — the client library exists; there's no user-facing guide to it.
 - **`CONTRIBUTING.md`, `CHANGELOG.md`, ADRs** — none.
-- **Conformance matrix** — mapping each property (P1–P17, N1–N6) to its verifying
-  test(s)/model in one place. Still the highest-value doc item; the testing plan
-  sketches it, it isn't materialized.
+
+**Closed since this snapshot:**
+- **Conformance matrix** — [`conformance-matrix.md`](conformance-matrix.md) maps
+  each property (P1–P17, N1–N6, D1–D11) to its verifying test(s)/model *and* to
+  the evidence class that artifact provides. Its §6 records what building it
+  found: P17, N2, N4 and N5 have no artifact that names them; D3 and D10 have
+  real coverage that is not mapped to them; and measured detection power is
+  concentrated on the four properties where bugs were actually found, so
+  P5–P8, P10, P11 and P13–P16 currently rest on tests of unmeasured power.
 
 ### 4c. CI/CD
 
