@@ -253,9 +253,13 @@ mod tests {
     /// anywhere else -- which is precisely the vacuous version of this
     /// check, and the reason the monitor timestamps its spans at all.
     ///
-    /// Falsifier: sum the spans wholesale instead of intersecting them
-    /// (`self.total()` in place of the map over `overlap`) and the second
-    /// and third assertions here both fail.
+    /// Falsifier, run: summing the spans wholesale instead of intersecting
+    /// them (`self.total()` in place of the map over `overlap`) fails the
+    /// second assertion, `left: 500ms, right: 0ns`. The third was checked
+    /// separately -- a run stops at the first failure, so "both fail" cannot
+    /// be observed in one run -- by neutralising the second: it then fails
+    /// identically, `left: 500ms, right: 0ns`. Both, measured, one
+    /// deterministic run each.
     #[test]
     fn a_stall_is_charged_only_to_the_window_it_falls_in() {
         let seen = report(&[(1_000, 1_500)]);

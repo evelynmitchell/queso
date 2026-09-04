@@ -77,10 +77,12 @@ fn run_to_quiescence(cluster: &mut ConcreteCluster<u32>, seed: u64) -> usize {
 /// decision, not the step, not the fast-path provenance, and not one byte
 /// on the wire.
 ///
-/// Falsifier: with the `decided.is_some()` guard removed from
-/// `Proposer::start`, this fails on the very first seed at the
-/// message-count assertion (a full round of `record` requests goes out for
-/// an already-settled slot) and at the step assertion.
+/// Falsifier, run: with the `decided.is_some()` guard removed from
+/// `Proposer::start`, this fails on the very first seed (seed 0) at the
+/// message-count assertion -- a full round of `record` requests goes out for
+/// an already-settled slot. The step assertion is downstream of it in the
+/// same run and so was not separately observed; the message-count assertion
+/// is what the measurement rests on.
 #[test]
 fn re_kicking_a_decided_proposer_changes_nothing() {
     for seed in 0..40 {
@@ -145,8 +147,11 @@ fn re_kicking_a_decided_proposer_changes_nothing() {
 /// be a genuine fast-path one, and asserts it found such a replica rather
 /// than trusting that it did.
 ///
-/// Falsifier: with the guard removed, every one of these replicas reports
-/// `decided_via_fast_path() == true` after the re-kick.
+/// Falsifier, run: with the guard removed this fails on seed 0 -- "replica
+/// n0 decided past round 1 but claims a phase-0 fast path". The run stops
+/// at the first such replica, so "every one of these replicas" is the
+/// prediction from the mechanism, not what one run showed; what is measured
+/// is that the forged provenance is caught, on the first seed.
 #[test]
 fn a_re_kick_does_not_forge_fast_path_provenance() {
     let mut checked = 0usize;
@@ -195,10 +200,16 @@ fn a_re_kick_does_not_forge_fast_path_provenance() {
 /// The `run_slot(1)` is deliberate: zero-delay kickoff timers land at
 /// `now + 1`, so one tick is exactly enough to observe the re-kick itself.
 ///
-/// Falsifier: making `start` fully idempotent (returning early whenever
-/// the proposer has already been started, not only once decided) leaves
-/// these replicas parked at their pre-kick step and the rewind assertion
-/// fails.
+/// Falsifier, run: making `start` fully idempotent (returning early
+/// whenever the proposer has already been started -- `self.decided.is_some()
+/// || self.step >= FIRST_ROUND_STEP` -- not only once decided) leaves these
+/// replicas parked at their pre-kick step and the rewind assertion fails on
+/// seed 0.
+///
+/// That same mutation correctly *survives*
+/// `re_kicking_a_decided_proposer_changes_nothing`, whose subject is the
+/// decided guard the mutation leaves in place -- so the two tests separate
+/// the two halves of the contract rather than both resting on one edit.
 #[test]
 fn re_kicking_a_stalled_undecided_proposer_restarts_round_one() {
     let mut observed = 0usize;
