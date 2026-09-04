@@ -75,11 +75,12 @@ space.
 | **P8** Linearizability | `smr/tests/linearizability.rs` (randomized concurrent put/get, checked offline) | tested, power unmeasured |
 | **P8a** Idempotent commands | `smr/tests/idempotency.rs` | tested, power unmeasured |
 | **P9** No lost committed writes | `smr/tests/restart_recovery.rs`; `net/tests/restart_recovery.rs` (#36, majority reboot of real OS processes) | tested, power unmeasured |
-| | `net/tests/durability_faults.rs::acknowledged_writes_survive_rolling_restarts_under_load` — *falsifier: disabling the boot-time reload in `driver.rs` fails it 8/8* | tested, power measured |
+| | `net/tests/durability_faults.rs::acknowledged_writes_survive_rolling_restarts_under_load` — *falsifier, run: disabling the boot-time reload in `driver.rs` fails it 8/8, every time at the lost-write assertion* | tested, power measured |
 | | Write-before-reply is asserted at runtime in `driver.rs` by a **release-mode** assert, so the check is in the shipped artifact rather than only under `cargo test`. No falsifier has been run for the assert itself | tested, power unmeasured; enforcement **in-build** |
 | **P10** Read safety under lag | `smr/tests/{linearizability,idempotency,restart_recovery}.rs` | tested, power unmeasured |
 | **P11** Safety under > f crashes | `consensus/tests/partition.rs`; `smr/tests/log_safety.rs` | tested, power unmeasured |
-| **P12** Restart safety | `net/tests/durability_faults.rs` (#39) — four real-process fault tests. *Falsifiers, run (see §6.8 and the file's "Detection power" docs): disabling the boot-time reload fails the torn-snapshot test 8/8, the rolling-restart test 8/8 and the in-flight-write test 3/8, and leaves the disk-full test passing 8/8; swallowing the persist error fails the disk-full test 4/4* | tested, power measured (3 of 4; the in-flight test partially — see §6.8) |
+| **P12** Restart safety | `net/tests/durability_faults.rs` (#39) — four real-process fault tests. *Falsifiers, run (§6.8 and the file's "Detection power" docs): disabling the boot-time reload fails the torn-snapshot test 8/8 and the rolling-restart test 8/8, and leaves the disk-full test passing 8/8; swallowing the persist error fails the disk-full test 8/8* | tested, power measured (3 of the 4 tests) |
+| | The fourth, `an_unacknowledged_write_is_lost_or_kept_but_never_split`, dies 7/16 under the reload mutation — but always on its separate "an acknowledged write must survive the crash regardless" check, never on the never-split assertion it exists for. That assertion's power is **unmeasured** | tested, power unmeasured (see §6.8) |
 | | `net/tests/persist_fidelity.rs` (#83), `group_commit.rs`; `smr/tests/{restart_recovery,restart_agreement}.rs` | tested, power unmeasured (except `restart_agreement.rs`, above) |
 
 ---
@@ -158,17 +159,26 @@ Listed because an unlabelled property is one nobody can audit.
    For D10 specifically, nobody has checked the endpoint against §D's named
    metrics list.
 4. **Most core safety rests on model-checking plus tests of unmeasured power.**
-   Every `Falsifier:` comment in `crates/` (27 of them, `grep -rni falsifier
-   crates/ --include=*.rs`) sits in one of eight files, and they cluster where
-   bugs were actually found: #83 (`proposer.rs` three of five,
-   `restart_agreement.rs` 24/24, `proposer_start_contract.rs`), #92
-   (`two_h_proposals.rs`, enumerated), and the observer/postmortem machinery
-   (`postmortem.rs`, `observer.rs`, `soak.rs`, `evidence.rs`), plus
-   `durability_faults.rs` as of finding 8. That is the
-   expected shape — power gets measured where someone was already suspicious —
-   but it means P5–P8, P8a, P10, P11 and P14–P16 currently have **no
-   demonstrated ability to detect their own failure** (P13's measured row
-   covers the re-kick contract only, not majority progress as such). CLAUDE.md's own cautionary example is 60 sim
+   `grep -rn "Falsifier[,:]" crates/ --include=*.rs` finds 27 markers in 10
+   files (23 in 9 before this change added four). They cluster where bugs were
+   actually found: #83 (`proposer.rs` three of five, `restart_agreement.rs`
+   24/24, `proposer_start_contract.rs`), #92 (`two_h_proposals.rs`,
+   enumerated), the observer/postmortem machinery (`postmortem.rs`,
+   `observer.rs`, `soak.rs`, `evidence.rs`, `chain.rs`, `stall.rs`), and
+   `durability_faults.rs` as of finding 8. That is the expected shape — power
+   gets measured where someone was already suspicious — but it means P5–P8,
+   P8a, P10, P11 and P14–P16 currently have **no demonstrated ability to
+   detect their own failure** (P13's measured row covers the re-kick contract
+   only, not majority progress as such).
+
+   A second-order gap in the convention itself: only **7 of the 27** markers
+   say `Falsifier, run:`. The rest say `Falsifier:` and describe a mutation
+   without recording whether anyone executed it. A described mutation is a
+   prediction; an executed one is a measurement. Nothing in the tree
+   distinguishes them for those 20, so this matrix classes a row as "power
+   measured" on the strength of a comment that may itself be argued —
+   a premise worth stating out loud, and cheap to close by re-running them
+   and adding the counts. CLAUDE.md's own cautionary example is 60 sim
    scenarios with measured-*zero* power for #83 being read as reassurance for
    weeks. The cheapest next step is not to mutate everything; it is to pick the
    two or three properties whose failure would be most catastrophic and least
@@ -182,7 +192,9 @@ Listed because an unlabelled property is one nobody can audit.
 7. **A number in STATUS.md did not trace to a test — now labelled.** STATUS §2
    reported D2 as "measured `O(n)` vs `O(n²)` messaging under synchrony (10 vs
    50 msgs at n=5; 42 vs 882 at n=21)". `hedging.rs::d2_…` asserts a `≤ 4n`
-   bound at n ∈ {3, 5, 7, 11} and never runs n=21, and `git log -S882` finds
+   bound at n ∈ {3, 5, 7, 11} and runs no 21-replica cluster — nor does any
+   other test in `crates/` (searched for `21` as a numeric literal; the one
+   hit is a slot count in `observer_detects.rs`). `git log -S882` finds
    the figures entering the tree in `655114c`, the commit that created
    STATUS.md, with no accompanying code — they appear in no test, then or
    since. They are not shown to be wrong; they are **unsourced**, which is the
@@ -200,19 +212,30 @@ Listed because an unlabelled property is one nobody can audit.
    mutation at all. Since the failure was a pure function of a one-line edit,
    CLAUDE.md §4 says enumerate rather than argue, so both mutations were run:
 
-   | Test | Reload disabled | Persist error swallowed |
-   |---|---|---|
-   | 1 torn snapshot | **fails 8/8** | passes |
-   | 2 disk-full fail-stop | passes 8/8 (control) | **fails 4/4** |
-   | 3 unacknowledged in-flight | fails **3/8** | passes |
-   | 4 rolling restart under load | **fails 8/8** | passes |
+   | Test | A: reload disabled | B: persist error swallowed | Assertion that fired |
+   |---|---|---|---|
+   | 1 torn snapshot | **8/8** | 0/8 | lost an acknowledged write after finding a torn temp file |
+   | 2 disk-full fail-stop | 0/8 (control) | **8/8** | the node must exit promptly on a failed durability write |
+   | 3 unacknowledged in-flight | **7/16** | 0/8 | an acknowledged write must survive the crash regardless |
+   | 4 rolling restart under load | **8/8** | 0/8 | lost acknowledged write to key … across rolling restarts |
 
-   The rows are now measured rather than inherited, the numbers live in the
-   file's own doc comments, and one thing came out that the argued version
-   would have hidden: test 3 detects a reload bug only 3 times in 8, because
-   its assertion is "lost or kept, but never split" and the lost case is
-   legitimate. Its reliable job — never-split — still has **no** falsifier.
-   Nothing in CI re-runs these; they rot silently.
+   Whole-file runs at `--test-threads=1`, one rebuild per mutation; mutation
+   A was run twice, hence test 3's denominator of 16. Test 2 under mutation A
+   is the control, so the other rows are not "any mutation reddens the file".
+   Test 1's eight kills all landed on the assertion named, never on the
+   `ENOENT` that issue #111 describes — which would otherwise have inflated
+   the count.
+
+   Two things came out that the argued version would have hidden. First,
+   **test 3's kills never come from the assertion it exists for**: neither
+   the never-split check nor the burst-acknowledged check fired on any of
+   the 16 runs; all 7 were the separate "an earlier acknowledged write
+   survived" assertion, which is P9-shaped and merely lives in this test. So
+   never-split power is still **unmeasured**, and the row above says so.
+   Second, the 7-in-16 rate is **unexplained** — replica 0 stays up holding
+   the value in memory, which would let a correct read through on some runs,
+   but nobody has shown that is the mechanism. Nothing in CI re-runs any of
+   this; the counts rot silently.
 
 ---
 

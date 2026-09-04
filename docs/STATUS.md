@@ -71,10 +71,14 @@ real traffic. See §4 for the honest remaining gaps.
   backoff** (issue #13 — backoff bounds the retry *rate*, never the *count*, so a
   network that heals arbitrarily late still resumes the slot). `O(n)` rather than
   `O(n²)` messaging under synchrony — *tested, power unmeasured*:
-  `hedging.rs::d2_…` asserts leader-only cost `≤ 4n` with no backup activated,
-  at n ∈ {3, 5, 7, 11}. (The figures "10 vs 50 msgs at n=5; 42 vs 882 at n=21"
-  stood here from this file's first commit and trace to no test in the tree —
-  n=21 is never run — so they are *asserted, unmeasured* and are not repeated.)
+  `hedging.rs::d2_…` asserts, at n ∈ {3, 5, 7, 11}, that no backup activated,
+  that leader-only cost is `≤ 4n`, and that it is strictly below the δ=0
+  all-active baseline over the identical scenario (by more than 2× for n ≥ 5).
+  (The figures "10 vs 50 msgs at n=5; 42 vs 882 at n=21" stood here from this
+  file's first commit and trace to no test: that test runs no 21-replica
+  cluster, and no other test in `crates/` constructs one either — searched for
+  `21` as a numeric literal, whose one hit is a slot count in
+  `observer_detects.rs`. They are *asserted, unmeasured* and are not repeated.)
 
 ### `crates/smr` — replicated log + linearizable KV (Phases 4, 6)
 - Multi-slot log (prefix consistency, total order, gap-free apply) chaining per-slot
@@ -348,10 +352,13 @@ deployment runbook, comparison writeup, and licensing all landed.
 - **Conformance matrix** — [`conformance-matrix.md`](conformance-matrix.md) maps
   each property (P1–P17, N1–N6, D1–D11) to its verifying test(s)/model *and* to
   the evidence class that artifact provides. Its §6 records what building it
-  found: P17, N2, N4 and N5 have no artifact that names them; D3 and D10 have
-  real coverage that is not mapped to them; and measured detection power is
-  concentrated on the four properties where bugs were actually found, so
-  P5–P8, P10, P11 and P13–P16 currently rest on tests of unmeasured power.
+  found: P17, N2, N4 and N5 have no artifact that names them (`grep -rlE`
+  over `crates/` returns no file for any of the four); D3 and D10 have real
+  coverage that is not mapped to them; and the 27 `Falsifier` markers in
+  `crates/` sit in 10 files, all of them where a bug had already been found
+  (and only 7 of the 27 record that the mutation was actually run) — leaving **P5–P8, P8a, P10, P11 and P14–P16** resting on tests of
+  unmeasured power. Read §6 there rather than this summary; the matrix is
+  the version that gets updated.
 
 ### 4c. CI/CD
 

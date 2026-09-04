@@ -65,24 +65,36 @@
 //!   tick).await?;` becomes `let _ = store.persist(&snapshot, tick).await;`
 //!   -- the node serves on out of state it never persisted.
 //!
-//! | Test | Mutation A | Mutation B |
-//! |---|---|---|
-//! | 1 torn snapshot | **fails 8/8** | passes |
-//! | 2 disk-full fail-stop | passes 8/8 (control -- it is not about reload) | **fails 4/4** |
-//! | 3 unacknowledged in-flight | fails **3/8** -- see below | passes |
-//! | 4 rolling restart under load | **fails 8/8** | passes |
+//! | Test | Mutation A | Mutation B | The assertion that fired |
+//! |---|---|---|---|
+//! | 1 torn snapshot | **8/8** | 0/8 | `replica {i} lost an acknowledged write after finding a torn temp file` |
+//! | 2 disk-full fail-stop | 0/8 (control) | **8/8** | `the node must exit promptly on a failed durability write, not hang` |
+//! | 3 unacknowledged in-flight | **7/16** | 0/8 | `an acknowledged write must survive the crash regardless` |
+//! | 4 rolling restart under load | **8/8** | 0/8 | `replica {i} lost acknowledged write to key {key} across rolling restarts` |
 //!
-//! Test 3's 3-in-8 is not flakiness in the test; it is the test's subject.
-//! Its assertion is deliberately "lost or kept, but never split", so it can
-//! only catch mutation A on the runs where the in-flight write *had*
-//! reached a majority before the crash -- on the others the write was free
-//! to vanish and no replica disagreed. Read as detection power for a
-//! reload bug, 3/8 is what this test is worth; its reliable job is the
-//! never-split half, for which no falsifier has been run.
+//! Runs of this whole file with `--test-threads=1`, one binary rebuild per
+//! mutation; mutation A was run twice (8 + 8), which is why test 3 has a
+//! denominator of 16. Test 2 under mutation A is the control: it shows the
+//! other rows are not "any mutation anywhere reddens the file".
 //!
-//! Counts are runs of this file with `--test-threads=1`, one binary
-//! rebuild per mutation. Re-running them is the way to check this section
-//! has not rotted; nothing in CI does it.
+//! **Read test 3's row carefully.** The assertion that fires is *not* this
+//! test's stated subject. Test 3 exists for "lost or kept, but **never
+//! split**", and neither the never-split assertion nor the
+//! burst-acknowledged one fired on any of the 16 runs; every kill came from
+//! the separate check that an *earlier, definitely acknowledged* write
+//! survived -- a P9-shaped durability assertion that happens to live in
+//! this test. So what is measured here is that check, and the never-split
+//! half has **no** falsifier. Why the rate is 7 in 16 rather than 16 in 16
+//! is not established: the surviving replica 0 keeps the value in memory,
+//! so the read can still be served correctly on some runs, but nobody has
+//! shown that is the mechanism.
+//!
+//! Test 1's eight kills all landed on the assertion above, never on the
+//! `ENOENT` at the snapshot read that issue #111 describes -- worth saying,
+//! because that flake would otherwise inflate a mutation count here.
+//!
+//! Counts are from this sandbox; nothing in CI re-runs them, so they rot
+//! silently. Re-running them is the way to check this section.
 //!
 //! # Anti-vacuity
 //!
@@ -180,11 +192,12 @@ fn read_value(outcome: &Outcome) -> Option<i64> {
 /// test passed with the boot-time reload disabled entirely. Crashing the
 /// majority leaves reloaded-from-disk state as the only possible source.
 ///
-/// Falsifier, run: mutation A (see the module docs) fails this 8/8, at
-/// `replica 1 lost an acknowledged write after finding a torn temp file`.
-/// That is the committed majority-crash form under the same mutation the
-/// one-replica form survived, so the design argument above is now measured
-/// rather than inferred.
+/// Falsifier, run: mutation A (see the module docs) fails this 8/8, every
+/// time at `replica {i} lost an acknowledged write after finding a torn
+/// temp file` -- never at the `ENOENT` of issue #111. That is the committed
+/// majority-crash form under the same mutation the one-replica form
+/// survived, so the design argument above is now measured rather than
+/// inferred.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_torn_snapshot_left_by_a_crash_does_not_affect_recovery() {
     let data_dir = tempfile::tempdir().expect("tempdir");
@@ -276,11 +289,12 @@ async fn a_torn_snapshot_left_by_a_crash_does_not_affect_recovery() {
 /// A single replica is its own majority, so it decides alone and reaches
 /// the durability write with no peers involved.
 ///
-/// Falsifier, run: mutation B (see the module docs) fails this 4/4.
-/// Mutation A leaves it passing 8/8, which is the right shape -- this test
-/// is about the write path failing loudly, not about what boot reloads --
-/// and makes it the control that shows the other three rows are not just
-/// "any mutation anywhere reddens the file".
+/// Falsifier, run: mutation B (see the module docs) fails this 8/8, every
+/// time at `the node must exit promptly on a failed durability write, not
+/// hang`. Mutation A leaves it passing 8/8, which is the right shape --
+/// this test is about the write path failing loudly, not about what boot
+/// reloads -- and makes it the control that shows the other three rows are
+/// not just "any mutation anywhere reddens the file".
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_durability_write_stops_the_node() {
     let data_dir = tempfile::tempdir().expect("tempdir");
@@ -398,12 +412,16 @@ async fn a_failed_durability_write_stops_the_node() {
 /// asserting a race. What is never allowed is the third possibility --
 /// replicas disagreeing about which it was, or the cluster wedging.
 ///
-/// Falsifier, run: mutation A fails this on **3 of 8** runs -- and the
-/// partial rate is a property of the assertion, not a flake. The test can
-/// only see a reload bug on the runs where the in-flight write had already
-/// reached a majority (so it was committed and owed survival); on the rest
-/// the write was legitimately free to vanish. Nobody has run a falsifier
-/// for the never-split half, which is this test's actual job.
+/// Falsifier, run: mutation A fails this on **7 of 16** runs -- but read
+/// what fires. On all 7, the assertion was the separate check below that an
+/// *earlier, definitely acknowledged* write survived the crash. The
+/// never-split assertion and the burst-acknowledged assertion -- this
+/// test's actual subject -- did **not** fire on any of the 16 runs, so
+/// their detection power is still unmeasured; what the 7/16 measures is a
+/// P9-shaped durability check that happens to live here. The rate itself
+/// is unexplained: replica 0 stays alive and holds the value in memory, so
+/// a correct read is still possible on some runs, but nobody has shown
+/// that is the mechanism.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unacknowledged_write_is_lost_or_kept_but_never_split() {
     let data_dir = tempfile::tempdir().expect("tempdir");
@@ -543,8 +561,8 @@ async fn an_unacknowledged_write_is_lost_or_kept_but_never_split() {
 /// real failure rather than the expected consequence of losing quorum --
 /// the same discipline `queso-soak`'s fault schedule follows.
 ///
-/// Falsifier, run: mutation A fails this 8/8, at `replica 0 lost
-/// acknowledged write to key 510 across rolling restarts`.
+/// Falsifier, run: mutation A fails this 8/8, every time at `replica {i}
+/// lost acknowledged write to key {key} across rolling restarts`.
 #[tokio::test(flavor = "multi_thread")]
 async fn acknowledged_writes_survive_rolling_restarts_under_load() {
     let data_dir = tempfile::tempdir().expect("tempdir");
