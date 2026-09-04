@@ -69,8 +69,16 @@ real traffic. See §4 for the honest remaining gaps.
 - **Hedging (§5):** staggered delay schedule (leader at 0, proposer *k* at `(k-1)·δ`),
   activating only if no earlier progress is seen; **unbounded retry with exponential
   backoff** (issue #13 — backoff bounds the retry *rate*, never the *count*, so a
-  network that heals arbitrarily late still resumes the slot). Measured `O(n)` vs
-  `O(n²)` messaging under synchrony (10 vs 50 msgs at n=5; 42 vs 882 at n=21).
+  network that heals arbitrarily late still resumes the slot). `O(n)` rather than
+  `O(n²)` messaging under synchrony — *tested, power unmeasured*:
+  `hedging.rs::d2_…` asserts, at n ∈ {3, 5, 7, 11}, that no backup activated,
+  that leader-only cost is `≤ 4n`, and that it is strictly below the δ=0
+  all-active baseline over the identical scenario (by more than 2× for n ≥ 5).
+  (The figures "10 vs 50 msgs at n=5; 42 vs 882 at n=21" stood here from this
+  file's first commit and trace to no test: that test runs no 21-replica
+  cluster, and no other test in `crates/` constructs one either — searched for
+  `21` as a numeric literal, whose one hit is a slot count in
+  `observer_detects.rs`. They are *asserted, unmeasured* and are not repeated.)
 
 ### `crates/smr` — replicated log + linearizable KV (Phases 4, 6)
 - Multi-slot log (prefix consistency, total order, gap-free apply) chaining per-slot
@@ -339,9 +347,18 @@ deployment runbook, comparison writeup, and licensing all landed.
 - **Published API docs** (`cargo doc`) — not built or hosted anywhere.
 - **Client guide** — the client library exists; there's no user-facing guide to it.
 - **`CONTRIBUTING.md`, `CHANGELOG.md`, ADRs** — none.
-- **Conformance matrix** — mapping each property (P1–P17, N1–N6) to its verifying
-  test(s)/model in one place. Still the highest-value doc item; the testing plan
-  sketches it, it isn't materialized.
+
+**Closed since this snapshot:**
+- **Conformance matrix** — [`conformance-matrix.md`](conformance-matrix.md) maps
+  each property (P1–P17, N1–N6, D1–D11) to its verifying test(s)/model *and* to
+  the evidence class that artifact provides. Its §6 records what building it
+  found: P17, N2, N4 and N5 have no artifact that names them (`grep -rlE`
+  over `crates/` returns no file for any of the four); D3 and D10 have real
+  coverage that is not mapped to them; and the 27 `Falsifier` markers in
+  `crates/` sit in 10 files, all of them where a bug had already been found
+  (and only 7 of the 27 record that the mutation was actually run) — leaving **P5–P8, P8a, P10, P11 and P14–P16** resting on tests of
+  unmeasured power. Read §6 there rather than this summary; the matrix is
+  the version that gets updated.
 
 ### 4c. CI/CD
 

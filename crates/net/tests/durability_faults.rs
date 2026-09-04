@@ -49,6 +49,53 @@
 //! that "argued" and "exercised" are different claims, which would be a
 //! poor argument to make while quietly blurring the line somewhere else.
 //!
+//! # Detection power (measured)
+//!
+//! Anti-vacuity (below) shows each fault fired; it does not show the tests
+//! can see the bug. Two mutations of `driver.rs` were run against all four,
+//! on this sandbox, at the commit that added this section:
+//!
+//! - **Mutation A -- boot-time reload disabled.** `let loaded =
+//!   store.load()?;` becomes `let loaded: Option<(queso_smr::Durable, u64)>
+//!   = { store.load()?; None };` -- the call stays, so an I/O error still
+//!   propagates, and only the reloaded state is thrown away. This is the
+//!   #36 shape: a node that boots from an empty heap while its snapshot
+//!   sits on disk.
+//! - **Mutation B -- persist error swallowed.** `store.persist(&snapshot,
+//!   tick).await?;` becomes `let _ = store.persist(&snapshot, tick).await;`
+//!   -- the node serves on out of state it never persisted.
+//!
+//! | Test | Mutation A | Mutation B | The assertion that fired |
+//! |---|---|---|---|
+//! | 1 torn snapshot | **8/8** | 0/8 | `replica {i} lost an acknowledged write after finding a torn temp file` |
+//! | 2 disk-full fail-stop | 0/8 (control) | **8/8** | `the node must exit promptly on a failed durability write, not hang` |
+//! | 3 unacknowledged in-flight | **7/16** | 0/8 | `an acknowledged write must survive the crash regardless` |
+//! | 4 rolling restart under load | **8/8** | 0/8 | `replica {i} lost acknowledged write to key {key} across rolling restarts` |
+//!
+//! Runs of this whole file with `--test-threads=1`, one binary rebuild per
+//! mutation; mutation A was run twice (8 + 8), which is why test 3 has a
+//! denominator of 16. Test 2 under mutation A is the control: it shows the
+//! other rows are not "any mutation anywhere reddens the file".
+//!
+//! **Read test 3's row carefully.** The assertion that fires is *not* this
+//! test's stated subject. Test 3 exists for "lost or kept, but **never
+//! split**", and neither the never-split assertion nor the
+//! burst-acknowledged one fired on any of the 16 runs; every kill came from
+//! the separate check that an *earlier, definitely acknowledged* write
+//! survived -- a P9-shaped durability assertion that happens to live in
+//! this test. So what is measured here is that check, and the never-split
+//! half has **no** falsifier. Why the rate is 7 in 16 rather than 16 in 16
+//! is not established: the surviving replica 0 keeps the value in memory,
+//! so the read can still be served correctly on some runs, but nobody has
+//! shown that is the mechanism.
+//!
+//! Test 1's eight kills all landed on the assertion above, never on the
+//! `ENOENT` at the snapshot read that issue #111 describes -- worth saying,
+//! because that flake would otherwise inflate a mutation count here.
+//!
+//! Counts are from this sandbox; nothing in CI re-runs them, so they rot
+//! silently. Re-running them is the way to check this section.
+//!
 //! # Anti-vacuity
 //!
 //! Every test asserts that its fault actually happened --
@@ -144,6 +191,13 @@ fn read_value(outcome: &Outcome) -> Option<i64> {
 /// nothing -- verified by mutation, where a one-replica version of this
 /// test passed with the boot-time reload disabled entirely. Crashing the
 /// majority leaves reloaded-from-disk state as the only possible source.
+///
+/// Falsifier, run: mutation A (see the module docs) fails this 8/8, every
+/// time at `replica {i} lost an acknowledged write after finding a torn
+/// temp file` -- never at the `ENOENT` of issue #111. That is the committed
+/// majority-crash form under the same mutation the one-replica form
+/// survived, so the design argument above is now measured rather than
+/// inferred.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_torn_snapshot_left_by_a_crash_does_not_affect_recovery() {
     let data_dir = tempfile::tempdir().expect("tempdir");
@@ -234,6 +288,13 @@ async fn a_torn_snapshot_left_by_a_crash_does_not_affect_recovery() {
 ///
 /// A single replica is its own majority, so it decides alone and reaches
 /// the durability write with no peers involved.
+///
+/// Falsifier, run: mutation B (see the module docs) fails this 8/8, every
+/// time at `the node must exit promptly on a failed durability write, not
+/// hang`. Mutation A leaves it passing 8/8, which is the right shape --
+/// this test is about the write path failing loudly, not about what boot
+/// reloads -- and makes it the control that shows the other three rows are
+/// not just "any mutation anywhere reddens the file".
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_durability_write_stops_the_node() {
     let data_dir = tempfile::tempdir().expect("tempdir");
@@ -350,6 +411,17 @@ async fn a_failed_durability_write_stops_the_node() {
 /// did not it is free to vanish. Asserting either specific outcome would be
 /// asserting a race. What is never allowed is the third possibility --
 /// replicas disagreeing about which it was, or the cluster wedging.
+///
+/// Falsifier, run: mutation A fails this on **7 of 16** runs -- but read
+/// what fires. On all 7, the assertion was the separate check below that an
+/// *earlier, definitely acknowledged* write survived the crash. The
+/// never-split assertion and the burst-acknowledged assertion -- this
+/// test's actual subject -- did **not** fire on any of the 16 runs, so
+/// their detection power is still unmeasured; what the 7/16 measures is a
+/// P9-shaped durability check that happens to live here. The rate itself
+/// is unexplained: replica 0 stays alive and holds the value in memory, so
+/// a correct read is still possible on some runs, but nobody has shown
+/// that is the mechanism.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unacknowledged_write_is_lost_or_kept_but_never_split() {
     let data_dir = tempfile::tempdir().expect("tempdir");
@@ -488,6 +560,9 @@ async fn an_unacknowledged_write_is_lost_or_kept_but_never_split() {
 /// throughout, so the cluster owes progress the whole way and a stall is a
 /// real failure rather than the expected consequence of losing quorum --
 /// the same discipline `queso-soak`'s fault schedule follows.
+///
+/// Falsifier, run: mutation A fails this 8/8, every time at `replica {i}
+/// lost acknowledged write to key {key} across rolling restarts`.
 #[tokio::test(flavor = "multi_thread")]
 async fn acknowledged_writes_survive_rolling_restarts_under_load() {
     let data_dir = tempfile::tempdir().expect("tempdir");

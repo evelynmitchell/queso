@@ -386,6 +386,7 @@ site is rebuilt from `docs/` and rustdoc on every push to `main` (see
 - [`docs/01-backgrounder.md`](docs/01-backgrounder.md) — white-paper backgrounder on the consensus problem space, QuePaxa, and Meerkat, with references.
 - [`docs/02-properties.md`](docs/02-properties.md) — the full property model (invariants, anti-properties, assumptions).
 - [`docs/03-testing-plan.md`](docs/03-testing-plan.md) — the testing strategy (harness, property tests, DST, formal verification, benchmarks).
+- [`docs/conformance-matrix.md`](docs/conformance-matrix.md) — every property (P1–P17, N1–N6, D1–D11) mapped to the test or model that verifies it *and* to the class of evidence that artifact provides — model-checked, enumerated, tested with power measured, tested with power unmeasured, argued, or assumed.
 - [`docs/deploy-flyio.md`](docs/deploy-flyio.md) — fly.io deployment runbook.
 - [`docs/compare-etcd.md`](docs/compare-etcd.md) — Queso-vs-etcd comparison methodology and results.
 - [`docs/STATUS.md`](docs/STATUS.md) — current status and gap analysis.
