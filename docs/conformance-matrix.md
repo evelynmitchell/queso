@@ -34,10 +34,26 @@ The evidence classes are [`CLAUDE.md`](https://github.com/evelynmitchell/queso/b
 | **not implemented** | The feature does not exist; there is nothing to verify. |
 
 **Provenance of the "power measured" rows.** Each cites the falsifier documented
-at that location in-tree. Those falsifiers were recorded by the change that
-introduced them; this matrix reports them, it does not re-run them. Re-running
-the whole set would be the natural next step if any of these rows is ever load-bearing
-for a release decision.
+at that location in-tree. All **29** markers say `Falsifier, run:`, but they do
+not all rest on the same evidence, and the difference matters:
+
+- **20 were executed in #114**, each mutation applied and its outcome observed,
+  with the observed values recorded in the marker. Before #114 these described a
+  mutation without saying whether anyone had run it, so this matrix classed rows
+  as "power measured" partly on the strength of predictions. All 20 predictions
+  held once the described mutation was faithfully reconstructed.
+- **2 were executed in #113** (`log_safety.rs`, `cluster.rs`), which measured
+  P5/P6/P7, P10 and P11 from scratch rather than checking an existing marker.
+- **7 were already marked `Falsifier, run:`** by the changes that introduced them
+  (`durability_faults.rs` ×4, `proposer.rs` ×2, `restart_agreement.rs`). Neither
+  #113 nor #114 re-ran these; their counts are carried over as recorded —
+  *assumed* from the introducing change, not re-measured here.
+
+Two markers record something other than a plain kill, and say so where they sit:
+`postmortem.rs`'s `identical_logs_agree_on_every_slot_they_share` (the loop-only
+truncation **survives** it and is caught by three sibling tests instead), and
+`logs_with_nothing_in_common_are_no_overlap_not_agreement` (its falsifier is a
+compile error, not a failing run).
 
 **The two model-checked configs**, referenced throughout:
 
@@ -166,9 +182,9 @@ Listed because an unlabelled property is one nobody can audit.
    For D10 specifically, nobody has checked the endpoint against §D's named
    metrics list.
 4. **Most core safety rests on model-checking plus tests of unmeasured power.**
-   `grep -rn "Falsifier[,:]" crates/ --include=*.rs` finds 27 markers in 10
-   files (23 in 9 before this change added four). They cluster where bugs were
-   actually found: #83 (`proposer.rs` three of five, `restart_agreement.rs`
+   `grep -rn "Falsifier[,:]" crates/ --include=*.rs` finds 29 markers in 12
+   files (23 in 9 before #112, then #114's re-runs and #113's two new ones).
+   They cluster where bugs were actually found: #83 (`proposer.rs` three of five, `restart_agreement.rs`
    24/24, `proposer_start_contract.rs`), #92 (`two_h_proposals.rs`,
    enumerated), the observer/postmortem machinery (`postmortem.rs`,
    `observer.rs`, `soak.rs`, `evidence.rs`, `chain.rs`, `stall.rs`), and
@@ -179,19 +195,30 @@ Listed because an unlabelled property is one nobody can audit.
    majority progress as such). P5, P6, P7, P10 and P11 were on that list
    too until #113 measured them — see finding 9.
 
-   A second-order gap in the convention itself: only **7 of the 27** markers
-   say `Falsifier, run:`. The rest say `Falsifier:` and describe a mutation
-   without recording whether anyone executed it. A described mutation is a
-   prediction; an executed one is a measurement. Nothing in the tree
-   distinguishes them for those 20, so this matrix classes a row as "power
-   measured" on the strength of a comment that may itself be argued —
-   a premise worth stating out loud, and cheap to close by re-running them
-   and adding the counts. CLAUDE.md's own cautionary example is 60 sim
-   scenarios with measured-*zero* power for #83 being read as reassurance for
-   weeks. The cheapest next step was not to mutate everything but to pick the
-   two properties whose failure would be most catastrophic and least visible —
-   P5 and P10 — and measure those. That is what #113 did, and finding 9 records
-   what it turned up.
+   The second-order gap in the convention itself is **closed** (#114). Every
+   marker in the tree now says `Falsifier, run:`; the 20 that previously described a
+   mutation without recording whether anyone ran it were each executed, and
+   every one of the 20 predictions held — no marker turned out to be a
+   prediction that fails.
+
+   Three of the 20 needed their described mutation reconstructed before it
+   reproduced the stated behavior, and each marker now says so. For `soak.rs`'s
+   two strict-overlap markers, weakening `coalesced`'s gap test is a no-op on
+   those inputs — `desired_of`'s half-open filter already leaves touching
+   windows one continuous span, so the pre-fix shape has to be rebuilt as a
+   merge over the window list. For its latency-window marker, dropping the
+   short-piece skip is not the same edit as counting one change per window.
+   In all three cases the first, obvious one-line edit survived; the marker's
+   own stated behavior did not.
+
+   That closed the provenance question, not the coverage one. CLAUDE.md's
+   cautionary example is 60 sim scenarios with measured-*zero* power for #83
+   being read as reassurance for weeks. The cheapest next step was not to
+   mutate everything but to pick the two properties whose failure would be
+   most catastrophic and least visible — P5 and P10 — and measure those. That
+   is what #113 did; finding 9 records what it turned up, and P8, P8a and
+   P14–P16 are what remain.
+
 5. **The `>= ½` per-round termination bound (P14) is assumed, not derived here.**
    The tests show termination happens; they do not establish the probability
    bound. That is a legitimate `assumed` — it is the paper's theorem — but it
@@ -294,7 +321,10 @@ Two rules make that visible rather than silent:
 
   which is empty today (35 identifiers each side). Nothing in CI runs it.
 - **A mutation run that measures a test's power belongs in the test's own doc
-  comment first** (as `Falsifier: …`, the convention already used in
+  comment first** (as `Falsifier, run: …` once executed, with the observed
+  values and their denominator; `Falsifier (predicted, not run): …` if it is
+  only a prediction — never a bare `Falsifier:`, which hides which of the two
+  it is. The convention is already used in
   `soak/`, `proposer.rs`, `proposer_start_contract.rs`, `restart_agreement.rs`
   and `compare/src/stall.rs`), and in this matrix second. The doc comment is
   what survives a file move; this table is the index.

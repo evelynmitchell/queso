@@ -380,8 +380,18 @@ mod tests {
     /// another position's height. That is indistinguishable, to the
     /// Chain-of-Blocks observer, from a real divergence.
     ///
-    /// Falsifier: with the frontier held as two independent atomics this
-    /// fails within a fraction of a second.
+    /// Falsifier, run: with the frontier held as two independent atomics
+    /// -- an `AtomicU64` each for `n` and `h`, stored and loaded separately
+    /// instead of copied as one value under the lock -- this fails 5/5 runs,
+    /// reported at 0.13-0.14s each (`cargo test` "finished in", build warm).
+    /// So "within a fraction of a second" is measured, not estimated: the
+    /// whole test fails inside 0.14s.
+    ///
+    /// The unmutated test reports 0.80-0.89s over 3 runs, but that contrast
+    /// does *not* measure how early the tear is caught: the mutation also
+    /// replaces a mutex acquisition per write with two relaxed stores, so the
+    /// writer thread is cheaper under it too. How far into the 2,000,000
+    /// writes the first tear appears is unmeasured.
     #[test]
     fn a_concurrent_reader_never_observes_a_torn_frontier() {
         use std::sync::atomic::{AtomicBool, Ordering};

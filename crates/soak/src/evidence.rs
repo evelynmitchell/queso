@@ -78,8 +78,9 @@ mod tests {
 
     /// The whole point: a failed seed's state survives, contents intact.
     ///
-    /// Falsifier: invert the `keep` branch and this fails -- which is
-    /// precisely the bug #73 spent three occurrences on.
+    /// Falsifier, run: inverting the `keep` branch fails this -- killed
+    /// (one deterministic run) -- which is precisely the bug #73 spent three
+    /// occurrences on.
     #[test]
     fn a_failed_seed_is_kept_with_its_contents() {
         let dir = populated_dir();

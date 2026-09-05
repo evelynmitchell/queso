@@ -647,9 +647,24 @@ mod tests {
         (0..len).map(|i| put(0, i as u64, 0, i)).collect()
     }
 
-    /// Falsifier: have `compare` stop at the first slot rather than walking
-    /// the overlap and this still passes, so the count is asserted too --
-    /// "agree" is only worth what it compared.
+    /// Falsifier, run: two readings of "stop at the first slot", and they
+    /// part company -- which is exactly why the count is asserted.
+    ///
+    /// Truncating only the comparison *loop* (`0..overlap.min(1)`), leaving
+    /// `compared` at the true overlap, **survives this test**: identical
+    /// logs give the loop nothing to find at any slot, so shortening it
+    /// changes nothing observable here. That mutation is killed instead by
+    /// three other tests in this module --
+    /// `every_pair_is_compared_not_just_consecutive_ones`,
+    /// `the_earliest_differing_slot_is_the_one_reported` and
+    /// `the_recorder_focus_is_the_earliest_divergent_slot_not_the_claimed_height`
+    /// (3 of 66 `queso-soak` lib tests failed; one deterministic run).
+    ///
+    /// Truncating the overlap itself, so `compare` reports what it actually
+    /// walked, **is** killed here: `Agree { compared: 1 }` against the
+    /// expected 8. So "agree" is only worth what it compared -- but this
+    /// test is the instrument for the *count*, not for the walk, and the
+    /// original marker's "this still passes" is right about the walk.
     #[test]
     fn identical_logs_agree_on_every_slot_they_share() {
         let pm = Postmortem::from_logs(vec![log(0, run(8)), log(1, run(8))]);
@@ -669,7 +684,8 @@ mod tests {
     /// the first disagreement also disagrees. Reporting a later one would
     /// point a root-cause hunt at a consequence.
     ///
-    /// Falsifier: iterate the overlap in reverse and this reports slot 6.
+    /// Falsifier, run: iterating the overlap in reverse reports slot 6.
+    /// Killed here, `left: 6, right: 3` (one deterministic run).
     #[test]
     fn the_earliest_differing_slot_is_the_one_reported() {
         let mut theirs = run(8);
@@ -707,8 +723,11 @@ mod tests {
     /// `NonZeroUsize`: a cluster that died before persisting anything must
     /// not read as a cluster that was checked and found consistent.
     ///
-    /// Falsifier: replace `NoOverlap` with `Agree { compared: 0 }` and this
-    /// stops compiling -- which is the point.
+    /// Falsifier, run: replacing `NoOverlap` with `Agree { compared: 0 }`
+    /// does not compile -- `compared` is a `NonZeroUsize`. Checked, and it
+    /// is the point: the type refuses the vacuous verdict before any test
+    /// has to, so this marker records a compile-time falsifier rather than a
+    /// failing run.
     #[test]
     fn logs_with_nothing_in_common_are_no_overlap_not_agreement() {
         let pm = Postmortem::from_logs(vec![log(0, vec![]), log(1, run(4))]);
@@ -780,8 +799,10 @@ mod tests {
     /// no evidence to offer. Folding that into "confirmed" would let a
     /// short log corroborate a claim it never saw.
     ///
-    /// Falsifier: make `chain_at` clamp to the log length instead of
-    /// returning `None` and this reports `Confirmed` for the frontier hash.
+    /// Falsifier, run: making `chain_at` clamp to the log length
+    /// (`&self.commands[..n.min(len)]`) instead of returning `None` reports
+    /// `Confirmed` for the frontier hash. Killed here, `left: Confirmed,
+    /// right: ShortLog { log_len: 4 }` (one deterministic run).
     #[test]
     fn a_claim_past_the_end_of_a_log_is_not_confirmed() {
         let commands = run(4);
@@ -801,7 +822,9 @@ mod tests {
     /// observability path, which is the outcome #73 most needs to be able
     /// to reach.
     ///
-    /// Falsifier: emit only `divergence.other` and this reports one claim.
+    /// Falsifier, run: emitting only `divergence.other` reports one claim
+    /// (`NodeId(2)` alone) where two are owed. Killed here (one
+    /// deterministic run).
     #[test]
     fn a_divergence_becomes_a_claim_against_each_replica_it_names() {
         let claims = claims_from(&[Divergence {
@@ -871,10 +894,12 @@ mod tests {
     /// empty one would make "this replica had no record of the slot"
     /// indistinguishable from "this replica recorded nothing at the slot".
     ///
-    /// Falsifier: have `recorder_at` return
-    /// `Summary(IsrSummary::default())`-ish for an absent slot key (or
-    /// `NoRecorder` for an absent snapshot) and the respective assertion
-    /// fails.
+    /// Falsifier, run: both collapses were applied, and each is killed by
+    /// its own assertion here (one deterministic run each) --
+    /// `recorder_at` returning an empty
+    /// `Summary(IsrSummary { step: 0, first: None, prior_agg: None })` for
+    /// an absent slot key, and returning `NoRecorder` for an absent
+    /// snapshot. The three answers stay three.
     #[test]
     fn a_missing_recorder_a_missing_snapshot_and_a_recorder_are_three_answers() {
         let mut with_recorder = log(0, run(4));
@@ -914,8 +939,10 @@ mod tests {
     /// carries a difference forward, so the claimed height is downstream of
     /// the cause.
     ///
-    /// Falsifier: consult claims before pairs in `disputed_slot` and this
-    /// reports slot 6 (the claim's n=7 minus one).
+    /// Falsifier, run: consulting claims before pairs in `disputed_slot`
+    /// reports slot 6 (the claim's n=7 minus one). Killed here, `left:
+    /// Some((6, ObserverClaim)), right: Some((3, EarliestDivergence))` (one
+    /// deterministic run).
     #[test]
     fn the_recorder_focus_is_the_earliest_divergent_slot_not_the_claimed_height() {
         let mut theirs = run(8);
@@ -1031,8 +1058,10 @@ mod tests {
     /// would shrink the evidence set silently -- and a two-replica
     /// comparison that should have been three-replica still looks clean.
     ///
-    /// Falsifier: swallow the load error (`filter_map(|r| r.ok().flatten())`)
-    /// and this passes with two logs.
+    /// Falsifier, run: swallowing the load error
+    /// (`filter_map(|r| r.ok().flatten())`, with `discover`'s `collect`
+    /// retyped to match) returns two logs instead of erroring. Killed here
+    /// (one deterministic run).
     #[test]
     fn a_corrupt_snapshot_is_an_error_not_a_quietly_smaller_evidence_set() {
         let dir = tempfile::tempdir().expect("tempdir");
