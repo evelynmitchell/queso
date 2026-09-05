@@ -471,8 +471,9 @@ mod tests {
     /// `2 divergence(s)` and then prints the same two lines; that reads as
     /// corroboration and is not.
     ///
-    /// Falsifier: push into a `Vec` instead of keying by
-    /// `(n, disagreeing replica)` and this reports 4.
+    /// Falsifier, run: pushing into a `Vec` instead of keying by
+    /// `(n, disagreeing replica)` reports 4. Killed, `left: 4, right: 1`
+    /// (one deterministic run).
     #[test]
     fn re_observing_a_disagreement_does_not_multiply_it() {
         let mut observer = Observer::new();
@@ -497,7 +498,8 @@ mod tests {
     /// separate facts about two separate replicas, and collapsing them
     /// would hide one.
     ///
-    /// Falsifier: key the divergence map by `n` alone and this reports 1.
+    /// Falsifier, run: keying the divergence map by `n` alone reports 1.
+    /// Killed, `left: 1, right: 2` (one deterministic run).
     #[test]
     fn two_replicas_disagreeing_at_one_height_are_two_divergences() {
         let mut observer = Observer::new();

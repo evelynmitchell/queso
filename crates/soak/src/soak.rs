@@ -856,8 +856,15 @@ mod tests {
     /// made a run whose verdict was `0 divergence(s), 0 stall(s)` fail as
     /// VACUOUS.
     ///
-    /// Falsifier: count `Fault::Crash` per window (the pre-fix behavior)
-    /// and this expects 2.
+    /// Falsifier, run: counting `Fault::Crash` per window (the pre-fix
+    /// behavior) expects 2. Killed here, `left: 2, right: 1` (one
+    /// deterministic run).
+    ///
+    /// The *other* pre-fix shape -- merging only strictly-overlapping
+    /// windows -- correctly survives this test, because these two windows do
+    /// genuinely overlap. `touching_crash_windows_for_one_node_expect_a_single_kill`
+    /// is the instrument for that one; the two markers describe different
+    /// bugs and each test catches its own.
     #[test]
     fn overlapping_crash_windows_for_one_node_expect_a_single_kill() {
         let schedule = schedule_of(vec![crash(0, 168_880, 171_117), crash(0, 170_502, 172_247)]);
@@ -891,8 +898,18 @@ mod tests {
     /// instant at which the node is meant to be up, so `reconcile` never
     /// respawns it and a second kill cannot be delivered.
     ///
-    /// Falsifier: merging only strictly-overlapping windows (the pre-fix
-    /// behavior) expects 2 here.
+    /// Falsifier, run: merging only strictly-overlapping windows expects 2
+    /// here. Killed, `left: 2, right: 1` (one deterministic run).
+    ///
+    /// The pre-fix behavior has to be reconstructed to run it: building
+    /// crash spans by a `start < open_until` merge over the window list,
+    /// rather than by the half-open boundary walk. Weakening `coalesced`'s
+    /// gap test alone is *not* this mutation and does not fail the test
+    /// (run, survives). The reason, argued from `Injected::desired_of`'s
+    /// half-open filter (`start_ms <= t_ms && t_ms < end_ms`) rather than
+    /// instrumented: the node stays crashed across the shared instant, so the
+    /// boundary walk closes no span there and `coalesced` is handed one span,
+    /// never two.
     #[test]
     fn touching_crash_windows_for_one_node_expect_a_single_kill() {
         let schedule = schedule_of(vec![crash(1, 41_033, 41_636), crash(1, 41_636, 43_212)]);
@@ -913,8 +930,10 @@ mod tests {
     /// cousin: 70 faults, 18 crash windows, 17 deliverable kills, and the
     /// cuts/latency expectations byte-identical to what run 14 logged.
     ///
-    /// Falsifier: merging only strictly-overlapping crash windows (the
-    /// pre-fix behavior) yields 18 here and this fails.
+    /// Falsifier, run: merging only strictly-overlapping crash windows (the
+    /// pre-fix behavior, reconstructed as in
+    /// `touching_crash_windows_for_one_node_expect_a_single_kill`) yields 18
+    /// here. Killed, `left: 18, right: 17` (one deterministic run).
     #[test]
     fn nightly_run_14_seed_119s_touching_crash_windows_expect_17_kills() {
         let config = ScheduleConfig {
@@ -1179,8 +1198,9 @@ mod tests {
     /// `ScheduleConfig`, so this pins the real failure, not a synthetic
     /// cousin: 74 faults, 8 latency windows, 7 deliverable edges.
     ///
-    /// Falsifier: counting one expected change per latency window (the
-    /// pre-fix behavior) yields 8 here and this fails.
+    /// Falsifier, run: counting one expected change per latency window (the
+    /// pre-fix behavior) yields 8 here. Killed, `left: 8, right: 7` (one
+    /// deterministic run).
     #[test]
     fn nightly_run_13_seed_106s_shadowed_latency_window_expects_7_changes() {
         let config = ScheduleConfig {
