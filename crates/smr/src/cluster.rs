@@ -653,6 +653,47 @@ mod tests {
         assert_eq!(result.outcome, Some(Outcome::Get(Some(100))));
     }
 
+    /// # Detection power for P10 (measured, issue #113)
+    ///
+    /// The defect P10 forbids is answering a `Get` from local state
+    /// instead of putting it through the log. Modelling it needs **two**
+    /// edits, because this crate has two independent implementations of
+    /// the submit contract:
+    ///
+    /// - `SmrCluster::submit` (above) -- the path every in-process test
+    ///   takes, including this one and `queso-conformance`'s.
+    /// - `SmrNode::submit` (`crate::replica`) -- whose only caller in the
+    ///   tree is `crates/net/src/driver.rs`, the real-node path.
+    ///
+    /// Mutation **P10-A**, applied at one or both: short-circuit a
+    /// `Command::Get` at submit time, completing it from
+    /// `durable.kv.get(key)` and never queueing it.
+    ///
+    /// | Site mutated | `queso-smr` (60 tests) | `queso-net` |
+    /// |---|---|---|
+    /// | `SmrCluster::submit` only | **13** killed | not on this path |
+    /// | `SmrNode::submit` only | **0** killed | **15** killed, 8 files |
+    ///
+    /// The 13: this module 3/7 (including this test), `tests/linearizability.rs`
+    /// 4/5, `tests/idempotency.rs` 3/3, `tests/restart_recovery.rs` 3/7.
+    /// `tests/log_safety.rs` survives 0/7, correctly -- it asserts on logs,
+    /// never on read outcomes.
+    ///
+    /// **The row that matters is the second one.** A P10 defect written
+    /// only into the path the shipped node uses is invisible to all 60
+    /// in-process tests; it is caught, but by `queso-net`'s real-process
+    /// suite, not by anything here. The two suites are not redundant for
+    /// this property -- each is the *only* instrument for its own site.
+    /// A first attempt at this measurement mutated `SmrNode::submit`
+    /// alone, read "survives every test" off the sim suite, and would
+    /// have recorded zero power for P10; the mutation was simply in code
+    /// those tests never run.
+    ///
+    /// This asymmetry is specific to `submit`. `finish_attempt`, which
+    /// `tests/log_safety.rs` mutates for P5/P7, is shared by both paths.
+    ///
+    /// Falsifier, run: mutating `SmrCluster::submit` as above fails this
+    /// test 1/1.
     #[test]
     fn read_after_write_on_a_different_replica_still_sees_it() {
         // The write is fully decided on replica 0's own view of the log
