@@ -101,11 +101,18 @@ fn initial_values(n: u32) -> BTreeMap<NodeId, u32> {
 /// doubled is 4n, which sits exactly on the old bound.
 ///
 /// And nothing else in the tree covers it. Under that mutation this is the
-/// *only* failing test in the whole workspace -- `cargo test --workspace`,
-/// 67 test binaries, one failure, this one. So before #117 a regression
-/// that doubled the leader's fan-out had no instrument at all: the bound
-/// here admitted it and no other test saw it. That is an enumeration over
-/// the workspace as it stands, not over every regression shape.
+/// *only* failing test in the whole workspace -- `cargo test --workspace
+/// --no-fail-fast`, 67 test binaries, one failure, this one. So before #117
+/// a regression that doubled the leader's fan-out had no instrument at all:
+/// the bound here admitted it and no other test saw it. That is an
+/// enumeration over the workspace as it stands, not over every regression
+/// shape.
+///
+/// `--no-fail-fast` is load-bearing in that command, not decoration: plain
+/// `cargo test --workspace` stops after the first failing binary, which
+/// here reports only 22 of the 67. The claim was originally cited to the
+/// plain command, which could not have established it; re-run with the flag
+/// (issue #116's work), the count is unchanged at one.
 #[test]
 fn d2_leader_only_activation_gives_linear_not_quadratic_messaging() {
     for n in [3u32, 5u32, 7u32, 11u32, 21u32] {
@@ -178,6 +185,184 @@ fn d2_leader_only_activation_gives_linear_not_quadratic_messaging() {
             baseline_messages,
             2 * (n as usize) * (n as usize),
             "n={n}: the δ=0 all-active baseline should be exactly 2n^2"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Scenario 1b: P17 -- no destructive interference.
+// ---------------------------------------------------------------------
+
+/// P17: "multiple simultaneously-active proposers never block each other's
+/// progress; concurrent proposals converge on a single decided value."
+///
+/// Before this test (issue #116) nothing asserted P17, and no artifact in
+/// `crates/` named it. It was *exercised* incidentally -- the δ-sweep and
+/// `termination.rs` both run with several proposers live -- but "the run
+/// terminated" is not "the proposers did not interfere". A cluster that
+/// converged despite mutual disruption, slowly, satisfied every assertion
+/// those tests make.
+///
+/// What distinguishes interference from mere concurrency is **round
+/// escalation**: duelling proposers push each other into higher and higher
+/// rounds, so the round count grows with the number of concurrent
+/// proposers. Non-interference is that it does not. So the assertion is on
+/// rounds, and specifically on rounds being *flat in n* -- the same literal
+/// bound at every n, never a bound that has to grow.
+///
+/// Two legs, both with δ=0 and no leader, so every proposer is active from
+/// round 1 and the concurrency is maximal rather than incidental. Each
+/// asserts that every replica actually activated, so neither can pass
+/// vacuously by quietly testing a single-proposer run.
+///
+/// Measured on this sandbox:
+///
+/// - **Synchronous** (`Fifo(1)`, window 300): every replica activates and
+///   the slot decides in **round 1** at n ∈ {3, 5, 7, 9, 11} -- flat, with
+///   max step 6 (round 1, phase 2) at every one of those n.
+/// - **Under 10% loss** (`ContentObliviousAdversary`, seeds 0..99, so 100
+///   runs per n and 500 in total): **zero** runs ended with more than one
+///   distinct decided value, and the worst-case round count was 3, 6, 6, 5,
+///   6 at n = 3, 5, 7, 9, 11. Bounded, and not growing with n -- the
+///   distribution shifts but its tail does not.
+///
+/// `MAX_ROUNDS_UNDER_LOSS` is 8 against that measured worst of 6: headroom
+/// over a sampled maximum, deliberately small. The load-bearing part is not
+/// the constant's value but that **one constant covers every n**; a bound
+/// that had to grow with n is what would falsify P17 here.
+///
+/// Falsifier, run: removing the phase-0 convergence step in
+/// `Proposer::process_phase` -- `self.proposal = best` dropped, so a
+/// proposer keeps re-proposing its own value instead of adopting the best
+/// seen, which is the textbook duelling-proposers defect -- kills this test
+/// **at the round-escalation assertion**: `n=3: 3 simultaneously-active
+/// proposers needed 2 rounds, not 1`, `left: 2, right: 1`.
+///
+/// That the kill lands on the round assertion, not on convergence, is the
+/// part worth checking: it means the test reports interference *as*
+/// interference. It is not the only instrument, though, and this comment
+/// should not imply otherwise -- that mutation also violates safety, so 15
+/// tests fail under it across the workspace (`cargo test --workspace
+/// --no-fail-fast`, 67 binaries), the other 14 reporting it as an agreement
+/// or validity violation.
+///
+/// One further mutation was tried and is recorded because it did *not* do
+/// what was expected. Advancing `self.step += 4` instead of `+= 1` in
+/// `process_quorum` was meant to inflate the round count while leaving the
+/// decision correct -- a pure interference regression that safety tests
+/// would be blind to, which would have shown this test catching something
+/// nothing else can. It does not: it kills this test at the *liveness*
+/// assertion (`not every live replica decided`) rather than the round one,
+/// also kills `concrete_agreement_validity_integrity`, and slows the
+/// workspace suite enough that a full run did not finish. So whether a
+/// round-escalation defect exists that only this test can see is
+/// **unmeasured**; it is not established here, and the honest summary is
+/// that this test adds a *diagnosis* the others lack, not coverage they
+/// lack.
+#[test]
+fn p17_concurrent_proposers_converge_without_destructive_interference() {
+    /// `step` is `4 * round + phase` (see `queso_consensus::proposer`), so
+    /// round 1 spans steps 4..=7.
+    fn round_of(step: u64) -> u64 {
+        step / 4
+    }
+
+    const MAX_ROUNDS_UNDER_LOSS: u64 = 8;
+
+    // Leg 1 -- synchrony. Maximal concurrency, and still one round.
+    for n in [3u32, 5, 7, 9, 11] {
+        let mut c = ConcreteCluster::new_with_schedule(
+            11,
+            SchedulerKind::Oblivious(Box::new(Fifo::new(1))),
+            initial_values(n),
+            None,
+            0,
+        );
+        c.run_slot(300);
+
+        assert!(
+            c.replicas().iter().all(|&id| c.activated(id)),
+            "n={n}: not every proposer activated, so this run is not the \
+             concurrent case P17 is about"
+        );
+        assert!(
+            c.all_live_decided(),
+            "n={n}: not every live replica decided"
+        );
+
+        let decided: BTreeSet<u32> = c
+            .replicas()
+            .iter()
+            .filter_map(|&id| c.decided(id))
+            .collect();
+        assert_eq!(
+            decided.len(),
+            1,
+            "n={n}: {} concurrently-active proposers converged on {} distinct \
+             values, not one -- P17's convergence half",
+            n,
+            decided.len()
+        );
+
+        let rounds = c
+            .replicas()
+            .iter()
+            .map(|&id| round_of(c.step(id)))
+            .max()
+            .unwrap();
+        assert_eq!(
+            rounds, 1,
+            "n={n}: {n} simultaneously-active proposers needed {rounds} rounds, \
+             not 1. A round count that grows with the number of concurrent \
+             proposers is destructive interference -- P17 violated"
+        );
+    }
+
+    // Leg 2 -- the same, with 10% of messages dropped. Retries raise the
+    // round count; interference would make that rise track n.
+    for n in [3u32, 5, 7, 9, 11] {
+        let mut worst_rounds = 0;
+        let mut split_seeds = 0;
+
+        for seed in 0..100u64 {
+            let scheduler = ContentObliviousAdversary::new(1, 6).with_drop_probability(0.10);
+            let mut c = ConcreteCluster::new_with_schedule(
+                seed,
+                SchedulerKind::Oblivious(Box::new(scheduler)),
+                initial_values(n),
+                None,
+                0,
+            );
+            c.run_slot(20_000);
+
+            let decided: BTreeSet<u32> = c
+                .replicas()
+                .iter()
+                .filter_map(|&id| c.decided(id))
+                .collect();
+            if decided.len() > 1 {
+                split_seeds += 1;
+            }
+            worst_rounds = worst_rounds.max(
+                c.replicas()
+                    .iter()
+                    .map(|&id| round_of(c.step(id)))
+                    .max()
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(
+            split_seeds, 0,
+            "n={n}: {split_seeds} of 100 seeds decided more than one distinct \
+             value under loss -- P17's convergence half"
+        );
+        assert!(
+            worst_rounds <= MAX_ROUNDS_UNDER_LOSS,
+            "n={n}: worst-case {worst_rounds} rounds over 100 seeds exceeds the \
+             n-independent bound of {MAX_ROUNDS_UNDER_LOSS}. The bound is the same \
+             literal at every n on purpose: one that had to grow with n would be \
+             the round escalation P17 forbids"
         );
     }
 }

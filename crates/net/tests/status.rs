@@ -3,6 +3,44 @@
 //! real, in-process, real-TCP 3-node cluster -- and, separately, that an
 //! ordinary cluster with no status listener configured behaves exactly like
 //! every other `queso-net` test (see [`status_disabled_by_default_still_serves_put_and_get`]).
+//!
+//! # D10, and what checking it actually found (issue #116)
+//!
+//! This file is the **D10 -- observability** evidence, and nothing named
+//! D10 in `crates/` before this comment. But #116 also asked for something
+//! nobody had done: check the endpoint's fields against the metrics §D
+//! actually names. That check finds a gap, so the mapping alone would have
+//! been misleading.
+//!
+//! §D names five metrics for D10: **per-slot rounds, fast-path hit rate,
+//! proposer activations, recovery time, and per-replica latency**. `GET
+//! /metrics` serves five fields -- `events_processed`, `next_slot`,
+//! `save_count`, `ready`, `uptime_secs` (see `queso_net::status`'s
+//! `StatusShared`). The intersection is **empty**: not one of the five
+//! named metrics is exposed. (Enumerated by reading both lists, which are
+//! closed and short; not a sampling.)
+//!
+//! Where the ingredients stand, since "not exposed" and "not tracked" are
+//! different claims:
+//!
+//! - **fast-path hit rate** and **proposer activations** -- the per-slot
+//!   ingredients exist in `queso_consensus` (`decided_via_fast_path`,
+//!   `activated`) but are neither aggregated into a rate nor published.
+//! - **per-slot rounds** -- a proposer's `step` exists internally; no
+//!   counter derives rounds from it.
+//! - **recovery time** -- nothing tracks it anywhere (`grep` finds no
+//!   counter).
+//! - **per-replica latency** -- `queso_net::metrics` does record latency,
+//!   but it is the *bench client's* `Recorder` (used by `queso-bench`,
+//!   `bench.rs` and `nemesis.rs`), i.e. a client-side view of the cluster,
+//!   not a per-replica metric a node publishes about itself.
+//!
+//! So what this file tests is real and worth having -- an observability
+//! surface, its counters moving, its failure modes -- but it is evidence
+//! that the *endpoint* works, not that D10's metric list is implemented.
+//! The five fields served are a liveness/progress/durability set, which is
+//! a different thing from D10's protocol-behaviour set. The matrix row now
+//! says D10 is **partly implemented** rather than merely unmapped.
 
 use std::time::Duration;
 

@@ -3,6 +3,14 @@
 //! (A3) plus crash injection, across many seeds and both `n = 3` and
 //! `n = 5` (crash-stop, `f <= (n-1)/2`).
 //!
+//! **This file is where anti-property N4 is hunted** (issue #116).
+//! `docs/02-properties.md` §E frames N4 -- "reordering under
+//! linearizability: committed operations applied in different orders on
+//! different replicas" -- as a failure mode the project *actively hunts
+//! for*, and names it the negation of P6. The hunt is P6's assertion here;
+//! nothing else in the tree looks for it. Said out loud because a reader
+//! who goes looking for N4 by name otherwise finds nothing.
+//!
 //! This is a black-box property test: it never inspects the consensus
 //! internals, only what every replica's [`queso_smr::SmrCluster::applied_log`]
 //! shows after a randomized run -- exactly the log-level guarantee

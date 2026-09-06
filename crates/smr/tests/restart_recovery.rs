@@ -7,6 +7,14 @@
 //! volatile split these tests exercise, and `queso_smr::replica::SmrNode::
 //! on_restart` for the recovery sequence.
 //!
+//! **This file is where anti-property N2 is hunted** (issue #116).
+//! `docs/02-properties.md` §E frames N2 -- "lost acknowledged write: a
+//! client-acked write that later disappears" -- as a failure mode the
+//! project actively hunts for, and names it the negation of P9. The hunt is
+//! P9's assertion here, and in `queso-net`'s `restart_recovery.rs` for the
+//! same property against real OS processes. Said out loud because a reader
+//! who goes looking for N2 by name otherwise finds nothing.
+//!
 //! Detection power for P10 is measured in the doc comment on
 //! `crates/smr/src/cluster.rs`'s
 //! `read_after_write_on_a_different_replica_still_sees_it` (issue #113):

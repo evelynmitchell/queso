@@ -3,6 +3,14 @@
 //! crash fault injection -- as called for in `docs/03-testing-plan.md §3`
 //! and `docs/00-project-outline.md` Phase 1.
 //!
+//! **P2's assertion here is where anti-property N5 is hunted** (issue
+//! #116). §E's N5 -- "phantom decision: deciding a value no replica
+//! proposed" -- is exactly the negation of Validity, so "every live
+//! replica's decision is some replica's initial input, never an invented
+//! value" below *is* the hunt. It is also model-checked, as
+//! `ValuesFromInputs` in `spec/QuePaxaConcrete.tla`. Said out loud because
+//! a reader who goes looking for N5 by name otherwise finds nothing.
+//!
 //! Each seed:
 //! 1. Builds an n-replica cluster with distinct initial values.
 //! 2. Crashes `f = seed % (max_f + 1)` replicas (0..=f, so both the
