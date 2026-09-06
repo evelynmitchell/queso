@@ -103,7 +103,7 @@ space.
 | **P11** Safety under > f crashes | `smr/tests/log_safety.rs::log_safety_holds_even_without_a_live_majority` — **had measured-zero power until #113** (§6.9): it crashed the majority before submitting anything, so every log was empty and the assertion was vacuous. It now decides a prefix first, asserts that prefix is non-empty, and asserts no further slot decides after quorum is lost; all three P5/P7 mutations now fail it | tested, power measured |
 | | `consensus/tests/partition.rs` | tested, power unmeasured |
 | **P12** Restart safety | `net/tests/durability_faults.rs` (#39) — four real-process fault tests. *Falsifiers, run (§6.8 and the file's "Detection power" docs): disabling the boot-time reload fails the torn-snapshot test 8/8 and the rolling-restart test 8/8, and leaves the disk-full test passing 8/8; swallowing the persist error fails the disk-full test 8/8* | tested, power measured (3 of the 4 tests) |
-| | The fourth, `an_unacknowledged_write_is_lost_or_kept_but_never_split`, dies 7/16 under the reload mutation — but always on its separate "an acknowledged write must survive the crash regardless" check, never on the never-split assertion it exists for. That assertion's power is **unmeasured** | tested, power unmeasured (see §6.8) |
+| | The fourth, `an_unacknowledged_write_is_lost_or_kept_but_never_split`, dies 41/100 under the reload mutation. Re-measured in #115: **5/100 of those are the never-split assertion itself** (9/156 pooled, 5.8%, Wilson 95% CI [3.1%, 10.6%]), 36/100 the separate "an acknowledged write must survive" check, and 0 the burst-acknowledged check, which is structurally dead. The earlier "never-split has no falsifier" reading came from 16 runs; at 5.8% those come back empty 39% of the time | never-split: tested, **power measured** (low). Burst-acknowledged: **measured zero**, mechanically. See §6.8, §6.12 |
 | | `net/tests/persist_fidelity.rs` (#83), `group_commit.rs`; `smr/tests/{restart_recovery,restart_agreement}.rs` | tested, power unmeasured (except `restart_agreement.rs`, above) |
 
 ---
@@ -279,15 +279,18 @@ Listed because an unlabelled property is one nobody can audit.
    stands rather than inherited from a form that has since changed.
 
    Two things came out that the argued version would have hidden. First,
-   **test 3's kills never come from the assertion it exists for**: neither
-   the never-split check nor the burst-acknowledged check fired on any of
-   the 16 runs; all 7 were the separate "an earlier acknowledged write
-   survived" assertion, which is P9-shaped and merely lives in this test. So
-   never-split power is still **unmeasured**, and the row above says so.
-   Second, the 7-in-16 rate is **unexplained** — replica 0 stays up holding
-   the value in memory, which would let a correct read through on some runs,
-   but nobody has shown that is the mechanism. Nothing in CI re-runs any of
-   this; the counts rot silently.
+   **test 3's kills mostly do not come from the assertion it exists for**:
+   over 16 runs all 7 were the separate "an earlier acknowledged write
+   survived" assertion, which is P9-shaped and merely lives in this test.
+   Second, the 7-in-16 rate was **unexplained**.
+
+   Both were followed up in #115, and the first conclusion did not survive:
+   at n=156 the never-split assertion *does* fire, 9 times (5.8%). Sixteen
+   runs come back empty 39% of the time at that rate, so "no falsifier" was
+   a coin flip recorded as a finding. See §6.12 for what the follow-up
+   established, including why the rate is low and which assertion is
+   genuinely dead. Nothing in CI re-runs any of this; the counts rot
+   silently.
 
 9. **Measuring P5, P7, P10 and P11 (#113) turned up one zero-power test and
    one structural blind spot.** Both were invisible from outside; the tests
@@ -346,6 +349,53 @@ Listed because an unlabelled property is one nobody can audit.
     view of the cluster, not a node's view of itself. The endpoint is
     genuinely well tested — this finding is about what it serves, not whether
     it works.
+
+12. **A "no falsifier" finding was itself underpowered, and did not survive
+    re-measurement** (#115). §6.8 recorded that the never-split assertion in
+    `durability_faults.rs` has no falsifier, on the strength of 16 runs in
+    which it never fired. Re-run at n=156, mutation A kills there **9 times
+    (5.8%, Wilson 95% CI [3.1%, 10.6%])**. At that rate a 16-run check comes
+    back empty **39%** of the time — so the original observation was
+    unremarkable, and only its promotion to "has no falsifier" was the error.
+    The overall kill rate reproduced fine (41/100 vs 7/16); the reading of
+    *which* assertion was firing is what needed the sample size. This is
+    CLAUDE.md §5 turned on a null result: an absence needs its power stated
+    just as much as a rate does.
+
+    **The unexplained 7-in-16 has a partial explanation now**, and it is not
+    the one that was guessed. The guess was that surviving replica 0 masks
+    the mutation by holding the value in memory. Probing
+    `SmrNode::from_durable` on the unmutated build (10 runs × 2 restarts,
+    20/20 observations) shows each restarted replica reloads `next_slot=0`,
+    `applied_log=0`, an empty `kv`, and 1–2 slots of recorder state. Nothing
+    applied. So the state mutation A destroys is nearly nothing — enough to
+    explain why destroying it usually changes no answer.
+
+    It stops there deliberately. Mutation A does two things: it discards that
+    (nearly empty) reload, and it makes `is_restart` false, skipping the
+    restart catch-up pass. Given how little state there is, the skipped
+    catch-up is the more plausible source of the kills — but the two were not
+    separated, so which dominates is **unmeasured**, and reading these counts
+    as "durable-state loss is detected at 5.8%" would overstate them. A
+    0/500/2000 ms wait before the reads (n=40 per arm) moved the rate
+    45%/38%/45%, no trend: consistent with catch-up being absent rather than
+    slow, though only a ~20-point difference would have shown at that n.
+
+    **One assertion in that test is dead, not unmeasured.** Over 60 probed
+    runs the pre-crash bookkeeping had `settled == 0` every time, so
+    `acknowledged` is always empty and the burst-acknowledged branch never
+    executes. That follows mechanically from the test's own 5 ms window
+    against a 10–15 ms write, and gets *more* certain on a slower machine.
+    Left as-is deliberately: retuning the window would move the scenario the
+    5.8% was measured on.
+
+    **Two probes returned a false zero before either result was trusted**,
+    the same trap as §6.9's and worth stating in its own right. One printed
+    to a spawned `queso-node`'s stderr, which the harness does not capture;
+    one failed to compile (a `pub(crate)` field read from another crate) and
+    was scored as a test failure by the runner script. Both read as "this
+    code is never reached". Checking that a probe can actually report is part
+    of the measurement, not preparation for it.
 
 ---
 

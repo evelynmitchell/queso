@@ -79,17 +79,59 @@
 //! denominator of 16. Test 2 under mutation A is the control: it shows the
 //! other rows are not "any mutation anywhere reddens the file".
 //!
-//! **Read test 3's row carefully.** The assertion that fires is *not* this
-//! test's stated subject. Test 3 exists for "lost or kept, but **never
-//! split**", and neither the never-split assertion nor the
-//! burst-acknowledged one fired on any of the 16 runs; every kill came from
-//! the separate check that an *earlier, definitely acknowledged* write
-//! survived -- a P9-shaped durability assertion that happens to live in
-//! this test. So what is measured here is that check, and the never-split
-//! half has **no** falsifier. Why the rate is 7 in 16 rather than 16 in 16
-//! is not established: the surviving replica 0 keeps the value in memory,
-//! so the read can still be served correctly on some runs, but nobody has
-//! shown that is the mechanism.
+//! **Read test 3's row carefully -- and note it has since been corrected**
+//! (issue #115). The 16-run measurement above saw every kill land on the
+//! separate check that an *earlier, definitely acknowledged* write survived,
+//! and concluded from that that the never-split assertion -- the one test 3
+//! exists for -- has **no** falsifier. That conclusion was wrong, and wrong
+//! in a way worth keeping on the page rather than quietly editing out.
+//!
+//! Mutation A *is* a falsifier for the never-split assertion. Re-run in
+//! three batches -- 2/16, 5/100, 2/40 -- it kills there **9 times in 156,
+//! 5.8%, Wilson 95% CI [3.1%, 10.6%]**,
+//! reporting e.g. `replicas disagree about key 10: [Some(200), None,
+//! Some(200)]`. At that rate a 16-run check comes back empty **39%** of the
+//! time, so the original run was not unlucky -- it was a coin flip reported
+//! as a fact. The overall kill rate reproduces (41/100 here against 7/16
+//! there); only the "no falsifier" reading of it was mistaken.
+//!
+//! **Why the rate is low.** The old guess -- surviving replica 0 keeps the
+//! value in memory -- is not what the evidence shows. Probing
+//! `SmrNode::from_durable` on the *unmutated* build (10 runs, 2 restarts
+//! each, 20/20 observations) shows each restarted replica reloads
+//! `next_slot=0, applied_log=0`, an empty `kv`, and **1-2 slots of recorder
+//! state**: nothing applied at all. So the state mutation A throws away is
+//! very nearly nothing, which is enough to explain why throwing it away
+//! usually changes no answer.
+//!
+//! That is as far as the measurement goes, and it is worth not going
+//! further, because mutation A does two things, not one. `loaded` becoming
+//! `None` also makes `is_restart` false (`driver.rs`), which skips the
+//! restart catch-up pass entirely. Since the discarded state is nearly
+//! empty, the skipped catch-up is the more plausible source of the kills --
+//! but the two were not separated here, so which dominates is
+//! **unmeasured**, and "mutation A measures durable-state loss" would be
+//! the wrong gloss on these counts.
+//!
+//! One experiment bears on it and is recorded because it constrains the
+//! answer rather than settling it: inserting a 0 / 500 / 2000ms wait
+//! between the restarts and the reads (n=40 per arm) moved the kill rate
+//! 45% / 38% / 45% -- no trend. That is consistent with catch-up being
+//! *absent* rather than merely slow, but at n=40 per arm only a difference
+//! of roughly 20 percentage points would have shown, so a smaller real
+//! effect is not excluded.
+//!
+//! **The burst-acknowledged assertion is not merely unmeasured -- it is
+//! dead here.** Probing the pre-crash bookkeeping over 60 runs found
+//! `settled == 0` every time: no write in the burst is ever acknowledged
+//! before the crash, so `acknowledged` is always empty and the
+//! `if acknowledged.contains(&key)` branch never executes. That is
+//! measured-zero power for a mechanical reason, not an unlucky sample. It
+//! follows from the test's own design (a 5ms window against a 10-15ms
+//! write); that it gets *more* certain on a slower machine is this test's
+//! own reasoning, quoted in the burst comment below, not something measured
+//! here. Left as-is rather than retuned: retuning the window would change
+//! the scenario the 9/156 above was measured on.
 //!
 //! Test 1's eight kills all landed on the assertion above, never on the
 //! `ENOENT` at the snapshot read that issue #111 describes -- worth saying,
@@ -482,16 +524,53 @@ async fn a_failed_durability_write_stops_the_node() {
 /// asserting a race. What is never allowed is the third possibility --
 /// replicas disagreeing about which it was, or the cluster wedging.
 ///
-/// Falsifier, run: mutation A fails this on **7 of 16** runs -- but read
-/// what fires. On all 7, the assertion was the separate check below that an
-/// *earlier, definitely acknowledged* write survived the crash. The
-/// never-split assertion and the burst-acknowledged assertion -- this
-/// test's actual subject -- did **not** fire on any of the 16 runs, so
-/// their detection power is still unmeasured; what the 7/16 measures is a
-/// P9-shaped durability check that happens to live here. The rate itself
-/// is unexplained: replica 0 stays alive and holds the value in memory, so
-/// a correct read is still possible on some runs, but nobody has shown
-/// that is the mechanism.
+/// Falsifier, run: mutation A fails this on **41 of 100** runs, and read
+/// which assertion fires, because the three do not share a fate (#115):
+///
+/// | assertion | kills / 100 |
+/// |---|---|
+/// | the separate "an acknowledged write must survive" check below | 36 |
+/// | **never split** -- this test's subject | **5** |
+/// | the burst-acknowledged check | 0, and structurally so |
+///
+/// **Never-split has a falsifier.** Pooled over 156 runs it is 9, i.e.
+/// 5.8%, Wilson 95% CI [3.1%, 10.6%], reporting e.g. `replicas disagree
+/// about key 10: [Some(200), None, Some(200)]` and once with the
+/// disagreeing replica being the *surviving* one. An earlier 16-run
+/// measurement saw none of these and recorded "no falsifier"; at 5.8% a
+/// 16-run check comes back empty 39% of the time, so that was a coin flip
+/// written down as a fact. The overall rate reproduces (41/100 vs 7/16);
+/// only the reading of it was wrong.
+///
+/// **Why 5.8% and not 100%.** Probing `SmrNode::from_durable` on the
+/// unmutated build -- 10 runs, 2 restarts each, 20/20 observations -- each
+/// restarted replica reloads `next_slot=0, applied_log=0`, an empty `kv`,
+/// and 1-2 slots of recorder state. Nothing applied. So what mutation A
+/// throws away is nearly nothing, which is enough to explain why throwing
+/// it away usually changes no answer. (The older guess -- that surviving
+/// replica 0 masks it by holding the value in memory -- is not what the
+/// probe shows.)
+///
+/// Note what this does *not* establish. Mutation A also makes `is_restart`
+/// false, skipping the restart catch-up pass; given how little state is
+/// discarded, that is the more plausible source of the kills. The two were
+/// not separated, so which dominates is **unmeasured**. A 0/500/2000ms wait
+/// inserted before the reads (n=40 per arm) moved the rate 45%/38%/45%, no
+/// trend -- consistent with catch-up being absent rather than slow, but
+/// only a ~20-point difference would have shown at that n.
+///
+/// **The burst-acknowledged check never runs.** Over 60 probed runs
+/// `settled == 0` every time, so `acknowledged` is always empty and the
+/// `if acknowledged.contains(&key)` branch is dead. Measured-zero power for
+/// a mechanical reason, and it follows from this test's own 5ms window
+/// against a 10-15ms write, so a slower machine makes it deader. Left
+/// as-is: retuning the window would change the scenario the numbers above
+/// were measured on.
+///
+/// One mutation that does **not** work, recorded so it is not retried:
+/// clearing `kv` in `from_durable` (restore the frontier, forget the state
+/// machine) survives 20/20 -- because the reloaded `kv` is already empty,
+/// per the same probe.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unacknowledged_write_is_lost_or_kept_but_never_split() {
     let data_dir = tempfile::tempdir().expect("tempdir");
