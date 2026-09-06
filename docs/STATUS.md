@@ -345,9 +345,12 @@ Much improved: the top-level `README.md` rewrite (#52) closed the largest gap, a
 deployment runbook, comparison writeup, and licensing all landed.
 
 **Remaining gaps:**
-- **Architecture doc** — one page tying the five crates + specs together with a diagram
-  (submitter → proposer/recorder → log → KV; where the sim/real seam is). The README
-  covers this in prose; a diagram would help.
+- **Architecture doc** — one page tying the nine crates + specs together with a
+  diagram (submitter → proposer/recorder → log → KV; where the sim/real seam is).
+  *Partly closed:* `README.md` now carries a mermaid block diagram of the crates,
+  the two driver `Ctx` implementations, the seam, and `spec/`. Still missing: the
+  request-path view (submitter → proposer/recorder → log → KV), and a standalone
+  architecture page rather than a README section.
 - **Published API docs** (`cargo doc`) — not built or hosted anywhere.
 - **Client guide** — the client library exists; there's no user-facing guide to it.
 - **`CONTRIBUTING.md`, `CHANGELOG.md`, ADRs** — none.

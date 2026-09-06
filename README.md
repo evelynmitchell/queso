@@ -164,6 +164,65 @@ That seam is what makes the correctness work transferable: bugs are hunted in
 the fast, reproducible, adversarial simulator, and the deployable binary inherits
 the fix for free.
 
+```mermaid
+%%{init: {'flowchart': {'wrappingWidth': 460}}}%%
+flowchart TB
+    subgraph SIMD["Simulator driver — crate: sim"]
+        SK["discrete-event kernel: virtual clock,<br/>seeded PRNG, in-memory network,<br/>adversary scheduling, crash / restart /<br/>partition / slow-node injection"]
+        SC["NodeCtx"]
+        SK --- SC
+    end
+
+    subgraph NETD["Real-I/O driver — crate: net"]
+        NK["tokio + TCP, length-delimited bincode frames,<br/>fsync'd on-disk durability, optional mTLS,<br/>in-transport fault injector, status / metrics"]
+        RC["RealCtx"]
+        BIN["binaries: queso-node,<br/>queso-bench, queso-admin"]
+        NK --- RC
+        NK --- BIN
+    end
+
+    HARN["harnesses, outside the seam<br/>conformance: Chain-of-Blocks workload, divergence<br/>and liveness observers, run in-process<br/>soak: that workload against real queso-node processes,<br/>under a TCP turbulence proxy<br/>antithesis: that workload again, against replicas<br/>whose faults the platform owns<br/>compare: Queso vs. etcd/Raft, leader-DoS experiment"]
+    CHAIN["chain: the shared (n, h) chain-hash definition,<br/>so node and observer fold byte-identically"]
+    HARN -- "spawn / drive" --> BIN
+    CHAIN --- BIN
+    CHAIN --- HARN
+
+    CTX{{"trait Ctx — self_id / now / send / schedule_timer / rng"}}
+    SC -- implements --> CTX
+    RC -- implements --> CTX
+
+    subgraph CORE["Deterministic verified core — the same code runs under both drivers"]
+        SMR["smr :: SmrNode<br/>multi-slot log, linearizable KV store, client sessions,<br/>durable vs. volatile split, bandit auto-tuner"]
+        CONS["consensus :: ReplicaNode<br/>Algorithm 1 abstract single-slot core, Algorithm 4 concrete ISR,<br/>threshold logical clocks, leader fast path, hedging"]
+        SMR --> CONS
+    end
+
+    CTX ==> SMR
+    CTX ==> CONS
+
+    SPEC["spec/: TLA+ models of the abstract and concrete cores,<br/>TLC-checked safety properties"]
+    SPEC -.->|"models"| CONS
+```
+
+Reading it: the hexagon is the seam. `Ctx` is defined in
+`crates/sim/src/node.rs` and implemented by `NodeCtx` there and by `RealCtx`
+in `crates/net/src/ctx.rs`; a third implementation, `TestCtx`, exists in
+`crates/consensus/tests/two_h_proposals.rs` for one enumeration test. The
+crates below the seam are the same source under both drivers, not two
+configurations of it: the only conditional compilation in `consensus/src` and
+`smr/src` is the `serde` feature, which adds derives rather than logic
+(`grep -rn '#\[cfg(feature' crates/consensus/src crates/smr/src` finds seven
+sites, all `serde`).
+
+Unlabelled thin lines inside a box are structure within one crate; unlabelled
+thin lines between boxes are crate dependencies, read off the `Cargo.toml`
+graph. The two thick arrows out of the seam mean "driven through this trait",
+and the compile-time dependency underneath them runs the *other* way — `Ctx`
+lives in `sim`, which both core crates depend on. The dashed line is neither:
+`spec/` is a separate TLA+ model of the same algorithms, checked by TLC but
+not generated from or compiled against the Rust — a second description that
+*can* disagree with the code, not a proof about it.
+
 ## Repository layout
 
 ```
@@ -178,11 +237,21 @@ crates/
                key-value store (reads-through-log), idempotent client sessions,
                durable-vs-volatile state split, and the multi-armed-bandit
                auto-tuner.
+  chain/       The Chain-of-Blocks state machine (n, h). Its own crate so that
+               the node and the test harness fold byte-identical chain hashes;
+               queso-net cannot depend on harness code.
   net/         The real-I/O boundary: tokio+TCP transport, the queso-node
                binary, fsync'd on-disk durability, an in-transport fault
                injector, optional app-level TLS, and status/metrics endpoints.
   compare/     A benchmark harness comparing Queso vs. an alternative
                (etcd/Raft), including the leader-DoS behavior experiment.
+  conformance/ Phase 9.1: a port of Antithesis's Chain-of-Blocks workload,
+               plus the divergence and liveness observers that judge it.
+  soak/        Phase 9.2: that workload driven against real queso-node OS
+               processes under a TCP turbulence proxy, with evidence capture
+               for failed seeds.
+  antithesis/  Phase 9.3: the same workload packaged as an Antithesis test
+               template, where the platform — not this repo — owns the faults.
 spec/          TLA+ models of the abstract and concrete consensus cores, with
                TLC configs that model-check the safety properties.
 docs/          Design docs: backgrounder, property model, testing plan,
@@ -192,7 +261,7 @@ deploy/        Dockerfile + fly.toml for deploying a multi-region cluster.
 
 ## Tech stack
 
-- **Rust** (2021 edition), a Cargo workspace of five crates.
+- **Rust** (2021 edition), a Cargo workspace of nine crates.
 - **tokio** for the real async transport; length-delimited framing over TCP with
   `bincode`/`serde` on the wire.
 - **rustls** (pure-Rust, no OpenSSL) for optional mutual-TLS between replicas.
