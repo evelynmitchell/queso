@@ -118,7 +118,7 @@ space.
 | | The ≥ ½ per-round bound itself | **assumed** (paper, §4; not independently derived here) |
 | **P15** Timeout-independent liveness | `consensus/tests/hedging.rs` — four tests named for it: δ-sweep, huge δ, per-proposer misconfiguration, no-live-majority | tested, power unmeasured |
 | **P16** Leader-failure recovery | `consensus/tests/hedging.rs::p16_…`; `compare/tests/leader_dos.rs` (real cluster, leader isolated) | tested, power unmeasured |
-| **P17** No destructive interference | **Nothing names it** — `grep -rlE "\bP17\b" crates/` returns no file. Exercised incidentally where several proposers are active at once (the P15 δ-sweep, `termination.rs`), but no test found by that search asserts non-interference directly | see §6 |
+| **P17** No destructive interference | `consensus/tests/hedging.rs::p17_concurrent_proposers_converge_without_destructive_interference` (#116) — δ=0, leaderless, so every proposer is active; asserts that all activated (anti-vacuity), that the round count is **flat in n** (round 1 at n ∈ {3,5,7,9,11}), and that the decided set is a single value. Under 10% loss, 100 seeds × 5 values of n: 0/500 runs split, worst-case rounds 3/6/6/5/6 — bounded and not growing with n. *Falsifier, run: dropping phase-0's `self.proposal = best` (duelling proposers) kills it at the round assertion, `left: 2, right: 1` at n=3 — though 14 other tests also fail on that mutation, since it violates safety too; see §6.10* | tested, power measured |
 
 ---
 
@@ -151,14 +151,14 @@ measured power for the observer even where the protocol row cannot.
 |---|---|---|
 | **D1** One-round-trip fast path | `consensus/tests/fast_path.rs`; `proposer.rs` unit tests (falsifier above) | tested, power measured (partly) |
 | **D2** Linear messaging under synchrony | `consensus/tests/hedging.rs::d2_…` — at n ∈ {3, 5, 7, 11, 21}, no backup activated and message counts pinned as equalities: `2n` leader-only against `2n²` all-active (6/18, 10/50, 14/98, 22/242, 42/882). *Falsifier, run: doubling the leader's fan-out kills the leader-only pin (`left: 12, right: 6` at n=3); doubling non-leaders' kills the baseline pin (`left: 30, right: 18`); the pre-#117 `≤ 4n` bound passes the first of those, and under it this is the only failing test in the workspace's 67 binaries — so that regression previously had no instrument anywhere.* STATUS.md's formerly unsourced figures are now this test's numbers — see §6.7 | tested, power measured |
-| **D3** Adversarial robustness | `compare/tests/leader_dos.rs` measures the availability gap under leader isolation, now with scheduling-stall attribution (#107). **Nothing maps it to D3 by name** (`grep -rlE "\bD3\b" crates/` is empty), and the paper's ≈30× / blog's ≈10× reference points are not reproduced here | tested, power unmeasured; the comparison against etcd is **assumed** from the paper |
+| **D3** Adversarial robustness | `compare/tests/leader_dos.rs` measures the availability gap under leader isolation, with scheduling-stall attribution (#107), and now names D3 in its module docs (#116). The paper's ≈30× / blog's ≈10× reference points are still **not reproduced here** — this sandbox cannot run etcd — and the file says so rather than letting the mapping imply otherwise | Queso's own gap: tested, power unmeasured. The comparison against etcd: **assumed** from the paper/blog. Two evidence classes, one property |
 | **D4** Auto-tuning | `smr/tests/tuning.rs` | tested, power unmeasured |
 | **D5** Constant-space recorders | Integer ISR by construction (`consensus/src/concrete.rs`); `IsrConsistent` invariant | model-checked / by construction |
 | **D6** Batching & pipelining | Batching: `net/tests/group_commit.rs`. **Pipelining: not implemented** | split — see §6 |
 | **D7** Tunable read freshness | Not implemented (a doc mention in `smr/src/linearizability.rs` only) | not implemented |
 | **D8** Transactions / CAS | Not implemented | not implemented |
 | **D9** Reproducibility | `sim/tests/reproducibility.rs` (the Phase-0 acceptance gate: seed → byte-identical trace); `consensus/tests/{determinism,concrete_determinism}.rs`; enforced by `clippy.toml`'s ban on `Instant::now`, `SystemTime`, threads, `thread_rng`, `HashMap`/`HashSet` | tested + **lint-enforced** |
-| **D10** Observability | `net/tests/status.rs` covers the status/metrics endpoint. **Nothing maps it to D10 by name** (`grep -rlE "\bD10\b" crates/` is empty), and §D's specific list (per-slot rounds, fast-path hit rate, proposer activations, recovery time) is not checked against the endpoint's actual fields | tested, power unmeasured; coverage of the named metrics **unverified** |
+| **D10** Observability | `net/tests/status.rs` covers the status/metrics endpoint and now names D10 (#116). **The metric list has now been checked, and the intersection is empty**: §D names per-slot rounds, fast-path hit rate, proposer activations, recovery time and per-replica latency (five, not the four §6.3 used to say); `/metrics` serves `events_processed`, `next_slot`, `save_count`, `ready`, `uptime_secs`. None of the five is exposed. The endpoint and its failure modes are well tested; D10's metrics are a different claim | endpoint: tested. §D's metric list: **not implemented** (enumerated, both lists closed) |
 | **D11** Reconfiguration | Not implemented (Phase 8 stretch; a doc mention in `smr/src/lib.rs` only) | not implemented |
 
 ---
@@ -168,19 +168,26 @@ measured power for the observer even where the protocol row cannot.
 Nine things, all of them labelling or coverage gaps rather than suspected bugs.
 Listed because an unlabelled property is one nobody can audit.
 
-1. **P17 has no test that names it.** Multiple simultaneously-active proposers
-   converging is exercised incidentally by the P15 δ-sweep and by `termination.rs`,
-   but nothing asserts non-interference as such. Cheapest fix: assert it inside
-   the existing δ-sweep, where several proposers are already live.
-2. **N2, N4 and N5 appear nowhere in the tree** — `grep -rlE "\bN2\b"` and the same for `N4` and `N5`,
-   over `crates/`, each return no file. Each is covered by its positive
-   twin (P9, P6, P2), so this is a traceability gap, not a hole — but §E frames
-   them as things "we actively hunt for", and a reader cannot currently find the
-   hunt.
-3. **D3 and D10 have real coverage that is not mapped to them.** `leader_dos.rs`
-   *is* the D3 evidence and `status.rs` *is* the D10 evidence; neither says so.
-   For D10 specifically, nobody has checked the endpoint against §D's named
-   metrics list.
+1. **P17 now has a test that names it** (#116, was: nothing named it). It
+   asserts non-interference rather than termination, which is the distinction
+   the old incidental coverage missed — a cluster that converged *despite*
+   mutual disruption, slowly, satisfied every assertion the δ-sweep and
+   `termination.rs` make. The discriminator is round escalation, so the test
+   asserts the round count is flat in n; see the P17 row and §6.10.
+2. **N2, N4 and N5 are now named by the tests that hunt them** (#116, was:
+   `grep` returned no file for any of them). Each was already covered by its
+   positive twin (P9, P6, P2) — a traceability gap, not a hole — but §E frames
+   them as things "we actively hunt for" and a reader could not find the hunt.
+   Doc comments only; no test changed.
+3. **D3 and D10 are now mapped — and checking D10 found a gap** (#116). The
+   mapping half was as expected: `leader_dos.rs` is the D3 evidence,
+   `status.rs` the D10 evidence, and both now say so. The check half was not:
+   §D's five named D10 metrics (per-slot rounds, fast-path hit rate, proposer
+   activations, recovery time, per-replica latency — this item previously
+   listed only four, omitting the last) share **no** field with what
+   `/metrics` actually serves. So "real coverage that is not mapped" was the
+   wrong description of D10: the endpoint is well tested, and D10's metric
+   list is unimplemented. See the D10 row and §6.11.
 4. **Most core safety rests on model-checking plus tests of unmeasured power.**
    `grep -rn "Falsifier[,:]" crates/ --include=*.rs` finds 29 markers in 12
    files (23 in 9 before #112, then #114's re-runs and #113's two new ones).
@@ -309,6 +316,36 @@ Listed because an unlabelled property is one nobody can audit.
    the mutation is on the path under test.
 
    What is left unmeasured after #113 is P8, P8a and P14–P16.
+10. **P17's test earns a diagnosis, not exclusive coverage — and one attempt
+    to show otherwise failed** (#116). The test asserts round counts because
+    round escalation is what separates interference from concurrency, and the
+    duelling-proposers mutation kills it *at that assertion*. But the same
+    mutation fails 14 other tests, because not adopting the best proposal
+    violates safety as well. A second mutation was tried specifically to find
+    a round-escalation defect that safety tests are blind to (`step += 4`:
+    inflate the round, keep the decision correct). It did not isolate one — it
+    killed P17's test at the *liveness* assertion instead of the round one,
+    killed a safety test too, and slowed the suite enough that a full run did
+    not finish. So whether such a defect exists is **unmeasured**, and the
+    honest summary is that P17's test reports interference *as* interference
+    where the others report it as an agreement violation.
+11. **Checking D10's metric list against the endpoint refuted the mapping**
+    (#116). §6.3 had recorded D10 as "real coverage that is not mapped",
+    implying the naming was the whole job. It was not: `/metrics` serves
+    `events_processed`, `next_slot`, `save_count`, `ready`, `uptime_secs`,
+    while §D names per-slot rounds, fast-path hit rate, proposer activations,
+    recovery time and per-replica latency. The intersection is empty. Both
+    lists are closed and short, so this is enumerated, not sampled.
+
+    Worth separating "not exposed" from "not tracked", since they carry
+    different work: the ingredients for fast-path hit rate and proposer
+    activations exist in `queso_consensus` but are never aggregated or
+    published; per-slot rounds is derivable from a proposer's `step` but no
+    counter does it; recovery time is tracked nowhere at all; and the latency
+    that *is* recorded (`queso_net::metrics::Recorder`) is the bench client's
+    view of the cluster, not a node's view of itself. The endpoint is
+    genuinely well tested — this finding is about what it serves, not whether
+    it works.
 
 ---
 

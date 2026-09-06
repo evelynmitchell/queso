@@ -4,6 +4,13 @@
 //! as a contrast, matching the audit's `probe_single.sh`) must keep working
 //! too.
 //!
+//! **This file is one of the two places anti-property N2 is hunted** (issue
+//! #116). §E's N2 -- "a client-acked write that later disappears" -- is the
+//! negation of P9, and P9's assertion here is the hunt, this file being the
+//! real-process half and `queso-smr`'s `restart_recovery.rs` the in-process
+//! half. Said out loud because a reader who goes looking for N2 by name
+//! otherwise finds nothing.
+//!
 //! Unlike `tests/cluster.rs` (which runs each replica as an in-process task
 //! sharing the test binary's own memory), this file spawns the actual
 //! `queso-node` binary as independent OS processes and kills them with a

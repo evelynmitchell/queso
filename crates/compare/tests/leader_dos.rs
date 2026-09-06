@@ -25,6 +25,25 @@
 //! documented for etcd (which this sandbox cannot run -- see that doc's
 //! "environment constraint" section) and for the real numbers this test
 //! produces on the Queso side.
+//!
+//! # This file is the D3 evidence (issue #116)
+//!
+//! `docs/02-properties.md` §D's **D3 -- adversarial robustness** ("under
+//! DoS/asynchrony, throughput degrades gracefully rather than stalling as
+//! leader-based protocols do") is what the availability gap measured here
+//! is evidence for. Nothing named D3 anywhere in `crates/` before this
+//! comment, so a reader tracing the property found no test and a reader of
+//! this test found no property.
+//!
+//! Naming it does **not** make D3's comparative claim measured, and the two
+//! halves should not be read as one. What this file measures is Queso's own
+//! availability gap under leader isolation, with scheduling-stall
+//! attribution (#107). D3's *reference points* -- the paper's ~30x
+//! throughput advantage and sub-380ms median WAN latency, and the Meerkat
+//! blog's ~10x -- are **not reproduced here** and are `assumed` from those
+//! sources; this sandbox cannot run etcd at all (see `docs/compare-etcd.md`).
+//! So D3 is one property with two evidence classes, and the matrix row says
+//! so.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
