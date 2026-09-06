@@ -6,6 +6,11 @@
 //! the log. See `queso_smr::replica::Durable`'s docs for the durable/
 //! volatile split these tests exercise, and `queso_smr::replica::SmrNode::
 //! on_restart` for the recovery sequence.
+//!
+//! Detection power for P10 is measured in the doc comment on
+//! `crates/smr/src/cluster.rs`'s
+//! `read_after_write_on_a_different_replica_still_sees_it` (issue #113):
+//! the read-from-local-state mutation fails 3 of the 7 tests here.
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};

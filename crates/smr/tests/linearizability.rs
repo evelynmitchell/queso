@@ -5,6 +5,14 @@
 //! unsafe "stale local read" (bypassing the log -- exactly what P10
 //! forbids) must be *rejected*, proving the checker has teeth rather than
 //! trivially accepting everything.
+//!
+//! Detection power for P10 is measured in the doc comment on
+//! `crates/smr/src/cluster.rs`'s
+//! `read_after_write_on_a_different_replica_still_sees_it` (issue #113):
+//! the read-from-local-state mutation fails 4 of the 5 tests here. The
+//! survivor is `a_stale_local_read_is_rejected_by_the_checker`, which
+//! builds its stale read by hand and so does not care how `submit`
+//! behaves.
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
