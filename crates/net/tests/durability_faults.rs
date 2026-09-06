@@ -14,7 +14,9 @@
 //! 1. **Crash in the fsync/rename window.** A torn snapshot left by a
 //!    crashed process must not stop the node booting or change what it
 //!    reloads. (`persist.rs`'s own unit tests cover the `Store` level; this
-//!    covers the real boot path.)
+//!    covers the real boot path.) Its majority-crash design needs each
+//!    crashed replica to hold the write on disk first; that precondition is
+//!    established in the test, not assumed -- see issue #111.
 //! 2. **Disk-full / EIO.** That a failed durability write fail-stops the
 //!    node rather than letting it serve state it never persisted was
 //!    verified only by reading a `?` in `driver.rs`.
@@ -91,7 +93,13 @@
 //!
 //! Test 1's eight kills all landed on the assertion above, never on the
 //! `ENOENT` at the snapshot read that issue #111 describes -- worth saying,
-//! because that flake would otherwise inflate a mutation count here.
+//! because that flake would otherwise inflate a mutation count here. That
+//! flake is since fixed: test 1 now establishes the precondition it needs
+//! instead of assuming it, and 20 runs under the load that reproduced the
+//! `ENOENT` (1 in 20 before the fix) came back clean. Mutation A was re-run
+//! against the fixed form, 8/8 on the same assertion, so test 1's count
+//! above is measured on the test as it stands rather than inherited from a
+//! form that has since changed.
 //!
 //! Counts are from this sandbox; nothing in CI re-runs them, so they rot
 //! silently. Re-running them is the way to check this section.
@@ -192,12 +200,22 @@ fn read_value(outcome: &Outcome) -> Option<i64> {
 /// test passed with the boot-time reload disabled entirely. Crashing the
 /// majority leaves reloaded-from-disk state as the only possible source.
 ///
+/// That design needs a precondition, and the test now *establishes* it
+/// rather than assuming it (issue #111): before the kills, the value is
+/// read back from replicas 1 and 2, which forces each to have the write on
+/// disk. See the comment at that read for why an ack alone does not imply
+/// it, and how the read does -- an argument from two premises checked in
+/// the code it names, not an enumeration, which is why the `fs::read`
+/// below still fails loudly and by name if it ever stops holding.
+///
 /// Falsifier, run: mutation A (see the module docs) fails this 8/8, every
 /// time at `replica {i} lost an acknowledged write after finding a torn
-/// temp file` -- never at the `ENOENT` of issue #111. That is the committed
-/// majority-crash form under the same mutation the one-replica form
-/// survived, so the design argument above is now measured rather than
-/// inferred.
+/// temp file`. That 8/8 was measured on *this* form, after the #111 fix; it
+/// matches the pre-fix count recorded in the module docs, which is carried
+/// over from that run rather than re-measured here. The added pre-crash
+/// read did not intercept the mutation on any of the 8 -- expected, since
+/// it runs before any restart and mutation A only discards boot-time
+/// reload, but the 8/8 is the evidence, not the expectation.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_torn_snapshot_left_by_a_crash_does_not_affect_recovery() {
     let data_dir = tempfile::tempdir().expect("tempdir");
@@ -211,14 +229,66 @@ async fn a_torn_snapshot_left_by_a_crash_does_not_affect_recovery() {
     .await;
     assert!(matches!(acked, Outcome::Put), "write should be acked");
 
+    // Establish -- not assume -- the precondition the majority-crash design
+    // rests on (issue #111): each replica about to be killed must already
+    // hold the acked write *on disk*, or the reboot has nothing to reload
+    // and this test measures catch-up instead of recovery.
+    //
+    // It cannot be assumed, because an ack needs only a majority: replica 0
+    // plus *one* of {1, 2}. The other is not on the critical path and may
+    // not have processed a single peer message yet. A replica persists only
+    // when a batch mutated durable state, and only an incoming peer
+    // `Message` can do that (`driver.rs`'s `may_mutate_durable`), so
+    // `node-{i}.durable.bin` need not exist at all -- which is exactly how
+    // this test used to fail, with an `ENOENT` at the `fs::read` below that
+    // read as an I/O accident rather than as "the precondition was never
+    // established".
+    //
+    // Reading the value back from each replica is what forces it, provided
+    // two things that hold in the code today and are checked there:
+    //
+    //  - `SmrNode::submit` queues *every* command, `Get` included, with no
+    //    local short-circuit, so the read goes through the log (P10) and
+    //    replica `i` must apply it -- a durable mutation, driven by peer
+    //    messages.
+    //  - `driver.rs` persists a batch's durable state before releasing
+    //    anything it produced, the client `Outcome` included; that ordering
+    //    is held by a release-build `assert!`, not just by comment.
+    //
+    // Given both, when this read returns, replica `i` has persisted a
+    // snapshot covering a slot after the put's -- so the put is in it. That
+    // is an argument, not an enumeration: if either premise goes, the
+    // `fs::read` below is the thing that says so.
+    for i in [1usize, 2] {
+        let outcome = submit_with_retry(
+            cluster.client_addr(i),
+            &get(3, i as u64, 42),
+            Duration::from_secs(20),
+        )
+        .await;
+        assert_eq!(
+            read_value(&outcome),
+            Some(7),
+            "replica {i} did not hold the acked write before being crashed, so the reboot \
+             below would have had nothing to reload"
+        );
+    }
+
     cluster.kill(1);
     cluster.kill(2);
 
     // Plant exactly what a crash partway through each replica's next write
     // would have left: a truncated temp file alongside its intact snapshot.
     for i in [1usize, 2] {
-        let snapshot =
-            std::fs::read(cluster.snapshot_path(i)).unwrap_or_else(|e| panic!("replica {i}: {e}"));
+        let path = cluster.snapshot_path(i);
+        let snapshot = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "replica {i} has no snapshot at {} ({e}). The pre-crash read above is \
+                 supposed to guarantee one; if this fires, that precondition no longer \
+                 holds and the test cannot plant a torn file beside real state.",
+                path.display()
+            )
+        });
         assert!(
             snapshot.len() > 16,
             "the snapshot should be substantial enough to truncate meaningfully"

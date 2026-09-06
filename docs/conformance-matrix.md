@@ -250,7 +250,12 @@ Listed because an unlabelled property is one nobody can audit.
    is the control, so the other rows are not "any mutation reddens the file".
    Test 1's eight kills all landed on the assertion named, never on the
    `ENOENT` that issue #111 describes — which would otherwise have inflated
-   the count.
+   the count. #111 is since fixed: test 1 establishes on-disk state in each
+   replica before crashing it rather than assuming it, and 20 runs under the
+   load that reproduced the `ENOENT` (1 in 20 before the fix) came back
+   clean. Mutation A was re-run against the fixed form, 8/8 on the same
+   assertion, so this row's test-1 count is measured on the test as it
+   stands rather than inherited from a form that has since changed.
 
    Two things came out that the argued version would have hidden. First,
    **test 3's kills never come from the assertion it exists for**: neither
