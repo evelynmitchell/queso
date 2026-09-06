@@ -191,7 +191,7 @@ flowchart TB
     SC -- implements --> CTX
     RC -- implements --> CTX
 
-    subgraph CORE["Deterministic verified core — the same code runs under both drivers"]
+    subgraph CORE["Deterministic verified core — one source tree, both drivers"]
         SMR["smr :: SmrNode<br/>multi-slot log, linearizable KV store, client sessions,<br/>durable vs. volatile split, bandit auto-tuner"]
         CONS["consensus :: ReplicaNode<br/>Algorithm 1 abstract single-slot core, Algorithm 4 concrete ISR,<br/>threshold logical clocks, leader fast path, hedging"]
         SMR --> CONS
@@ -206,22 +206,35 @@ flowchart TB
 
 Reading it: the hexagon is the seam. `Ctx` is defined in
 `crates/sim/src/node.rs` and implemented by `NodeCtx` there and by `RealCtx`
-in `crates/net/src/ctx.rs`; a third implementation, `TestCtx`, exists in
-`crates/consensus/tests/two_h_proposals.rs` for one enumeration test. The
-crates below the seam are the same source under both drivers, not two
-configurations of it: the only conditional compilation in `consensus/src` and
-`smr/src` is the `serde` feature, which adds derives rather than logic
-(`grep -rn '#\[cfg(feature' crates/consensus/src crates/smr/src` finds seven
-sites, all `serde`).
+in `crates/net/src/ctx.rs`; a third implementation, `TestCtx`, backs the three
+tests in `crates/consensus/tests/two_h_proposals.rs`. Those are the only three
+`grep -rn 'impl.*Ctx<.*> for' crates/` finds — a textual match, so an `impl`
+whose signature wraps across lines would escape it.
 
-Unlabelled thin lines inside a box are structure within one crate; unlabelled
-thin lines between boxes are crate dependencies, read off the `Cargo.toml`
-graph. The two thick arrows out of the seam mean "driven through this trait",
-and the compile-time dependency underneath them runs the *other* way — `Ctx`
-lives in `sim`, which both core crates depend on. The dashed line is neither:
-`spec/` is a separate TLA+ model of the same algorithms, checked by TLC but
-not generated from or compiled against the Rust — a second description that
-*can* disagree with the code, not a proof about it.
+The crates below the seam are one source tree driven two ways, which is not
+the same as being compiled identically: `net` enables their `serde` feature
+and `sim` does not. What differs is narrow, and enumerable —
+`grep -rn '#\[cfg' crates/consensus/src crates/smr/src` returns 30 sites: 18
+are `serde` (7 import guards, 11 `cfg_attr` derives), 11 are `#[cfg(test)]`,
+and one is neither. That one is worth knowing about rather than rounding away:
+`crates/consensus/src/algorithm.rs:262` guards the crux-invariant assertions
+with `#[cfg(debug_assertions)]`, so a release build of the core *checks* less
+than a debug build. None of the 30 selects between two implementations of the
+protocol logic — but that is this grep's scope, and it covers those two source
+directories only, not `sim` and not either driver.
+
+Unlabelled thin lines are structure: inside the `sim` and `net` boxes they
+join parts of one crate, and between boxes they are crate dependencies read
+off the `Cargo.toml` graph (`smr` → `consensus`; `chain` ← its users, though
+the harness box is a composite — `conformance`, `soak` and `antithesis` depend
+on `chain`, `compare` does not). The two thick arrows out of the seam mean
+"driven through this trait", and the compile-time dependency underneath them
+runs the *other* way: `Ctx` lives in `sim`, which both core crates depend on.
+The dashed line is neither kind: `spec/` is a separate TLA+ model of the
+algorithms the core implements, checked by TLC but not generated from or
+compiled against the Rust (there is no `build.rs` anywhere in the tree, and
+`spec/` holds only `.tla`, `.cfg`, `tla2tools.jar` and a README) — a second
+description that *can* disagree with the code, not a proof about it.
 
 ## Repository layout
 
