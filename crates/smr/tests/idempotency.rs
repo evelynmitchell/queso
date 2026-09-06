@@ -4,6 +4,11 @@
 //! relative to a later command from the same client -- must have
 //! exactly-once effect, and the resulting operation history must still be
 //! linearizable.
+//!
+//! Detection power for P10 is measured in the doc comment on
+//! `crates/smr/src/cluster.rs`'s
+//! `read_after_write_on_a_different_replica_still_sees_it` (issue #113):
+//! the read-from-local-state mutation fails all 3 tests here.
 
 use queso_sim::ids::NodeId;
 use queso_sim::scheduler::{Fifo, SchedulerKind};

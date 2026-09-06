@@ -34,18 +34,20 @@ The evidence classes are [`CLAUDE.md`](https://github.com/evelynmitchell/queso/b
 | **not implemented** | The feature does not exist; there is nothing to verify. |
 
 **Provenance of the "power measured" rows.** Each cites the falsifier documented
-at that location in-tree. As of #114 all **27** markers say `Falsifier, run:`,
-but they do not all rest on the same evidence, and the difference matters:
+at that location in-tree. All **29** markers say `Falsifier, run:`, but they do
+not all rest on the same evidence, and the difference matters:
 
 - **20 were executed in #114**, each mutation applied and its outcome observed,
   with the observed values recorded in the marker. Before #114 these described a
   mutation without saying whether anyone had run it, so this matrix classed rows
   as "power measured" partly on the strength of predictions. All 20 predictions
   held once the described mutation was faithfully reconstructed.
+- **2 were executed in #113** (`log_safety.rs`, `cluster.rs`), which measured
+  P5/P6/P7, P10 and P11 from scratch rather than checking an existing marker.
 - **7 were already marked `Falsifier, run:`** by the changes that introduced them
-  (`durability_faults.rs` ×4, `proposer.rs` ×2, `restart_agreement.rs`). #114 did
-  **not** re-run these; their counts are carried over as recorded — *assumed*
-  from the introducing change, not re-measured here.
+  (`durability_faults.rs` ×4, `proposer.rs` ×2, `restart_agreement.rs`). Neither
+  #113 nor #114 re-ran these; their counts are carried over as recorded —
+  *assumed* from the introducing change, not re-measured here.
 
 Two markers record something other than a plain kill, and say so where they sit:
 `postmortem.rs`'s `identical_logs_agree_on_every_slot_they_share` (the loop-only
@@ -83,16 +85,23 @@ space.
 | **P4** Stability | `DecideOnce` (defined as "a decision, once made, is never changed"); `Monotone`, concrete | model-checked |
 | | `consensus/tests/proposer_start_contract.rs` (#13) — re-kicking a *decided* proposer must change nothing: not the decision, not the step, not the fast-path provenance, not one byte on the wire — *falsifiers: removing the `decided.is_some()` guard from `Proposer::start` fails the message-count and step assertions on the first seed, and makes every replica report `decided_via_fast_path() == true`* | tested, power measured |
 | | same consensus test files | tested, power unmeasured |
-| **P5** Log matching / prefix consistency | `smr/tests/log_safety.rs`; `conformance/tests/faults.rs`; `soak/` real-process observers | tested, power unmeasured |
-| **P6** Total order | `smr/tests/log_safety.rs`; `conformance/` observer; `chain/` hash chain | tested, power unmeasured |
-| **P7** Gap-free application | `smr/tests/log_safety.rs`; `chain/src/lib.rs` | tested, power unmeasured |
+| **P5** Log matching / prefix consistency | `smr/tests/log_safety.rs` — *falsifier, run (#113): making `finish_attempt` record the replica's own proposal instead of the decided command fails all 7, at the P5/P6 slot compare* | tested, power measured |
+| | `conformance/tests/faults.rs` — the same mutation fails 5 of its 6 | tested, power measured |
+| | `soak/` real-process observers | tested, power unmeasured |
+| **P6** Total order | `smr/tests/log_safety.rs` — same assertion, same falsifier as P5. **P6 has no mutation of its own**: `finish_attempt` only appends at the current frontier, so two replicas can apply in different orders only by applying different commands, which is a P5 violation. Stated because a separate P6 row would otherwise imply separate evidence | tested, power measured (via the P5 mutation) |
+| | `conformance/` observer; `chain/` hash chain | tested, power unmeasured |
+| **P7** Gap-free application | `smr/tests/log_safety.rs` — *falsifiers, run (#113): advancing `next_slot` without appending fails all 7; applying each decided command twice also fails all 7 — both at the frontier-vs-log-length check* | tested, power measured |
+| | `conformance/tests/faults.rs` catches the first (2 of 6) and **none** of the second: a defect that inflates every replica's log identically produces no divergence, and that suite has no frontier-vs-length assertion. Cross-replica comparison cannot see uniform wrongness | argued from both assertion sets; the counts are measured |
+| | `chain/src/lib.rs` | tested, power unmeasured |
 | **P8** Linearizability | `smr/tests/linearizability.rs` (randomized concurrent put/get, checked offline) | tested, power unmeasured |
 | **P8a** Idempotent commands | `smr/tests/idempotency.rs` | tested, power unmeasured |
 | **P9** No lost committed writes | `smr/tests/restart_recovery.rs`; `net/tests/restart_recovery.rs` (#36, majority reboot of real OS processes) | tested, power unmeasured |
 | | `net/tests/durability_faults.rs::acknowledged_writes_survive_rolling_restarts_under_load` — *falsifier, run: disabling the boot-time reload in `driver.rs` fails it 8/8, every time at the lost-write assertion* | tested, power measured |
 | | Write-before-reply is asserted at runtime in `driver.rs` by a **release-mode** assert, so the check is in the shipped artifact rather than only under `cargo test`. No falsifier has been run for the assert itself | tested, power unmeasured; enforcement **in-build** |
-| **P10** Read safety under lag | `smr/tests/{linearizability,idempotency,restart_recovery}.rs` | tested, power unmeasured |
-| **P11** Safety under > f crashes | `consensus/tests/partition.rs`; `smr/tests/log_safety.rs` | tested, power unmeasured |
+| **P10** Read safety under lag | `smr/src/cluster.rs::read_after_write_on_a_different_replica_still_sees_it` (the most direct P10 test; **was not in this row before #113**) plus `smr/tests/{linearizability,idempotency,restart_recovery}.rs` — *falsifier, run: short-circuiting a `Get` from local state in `SmrCluster::submit` fails 13 in-process tests* | tested, power measured |
+| | `net/` real-process suite — the same defect written into `SmrNode::submit` (whose only caller is `net/src/driver.rs`, the shipped path) kills **15 `queso-net` tests across 8 files and 0 of the 60 `queso-smr` tests**. The crate has two independent submit implementations, so each suite is the *only* instrument for its own site — see §6.9 | tested, power measured |
+| **P11** Safety under > f crashes | `smr/tests/log_safety.rs::log_safety_holds_even_without_a_live_majority` — **had measured-zero power until #113** (§6.9): it crashed the majority before submitting anything, so every log was empty and the assertion was vacuous. It now decides a prefix first, asserts that prefix is non-empty, and asserts no further slot decides after quorum is lost; all three P5/P7 mutations now fail it | tested, power measured |
+| | `consensus/tests/partition.rs` | tested, power unmeasured |
 | **P12** Restart safety | `net/tests/durability_faults.rs` (#39) — four real-process fault tests. *Falsifiers, run (§6.8 and the file's "Detection power" docs): disabling the boot-time reload fails the torn-snapshot test 8/8 and the rolling-restart test 8/8, and leaves the disk-full test passing 8/8; swallowing the persist error fails the disk-full test 8/8* | tested, power measured (3 of the 4 tests) |
 | | The fourth, `an_unacknowledged_write_is_lost_or_kept_but_never_split`, dies 7/16 under the reload mutation — but always on its separate "an acknowledged write must survive the crash regardless" check, never on the never-split assertion it exists for. That assertion's power is **unmeasured** | tested, power unmeasured (see §6.8) |
 | | `net/tests/persist_fidelity.rs` (#83), `group_commit.rs`; `smr/tests/{restart_recovery,restart_agreement}.rs` | tested, power unmeasured (except `restart_agreement.rs`, above) |
@@ -156,7 +165,7 @@ measured power for the observer even where the protocol row cannot.
 
 ## 6. What building this matrix found
 
-Eight things, all of them labelling or coverage gaps rather than suspected bugs.
+Nine things, all of them labelling or coverage gaps rather than suspected bugs.
 Listed because an unlabelled property is one nobody can audit.
 
 1. **P17 has no test that names it.** Multiple simultaneously-active proposers
@@ -173,20 +182,21 @@ Listed because an unlabelled property is one nobody can audit.
    For D10 specifically, nobody has checked the endpoint against §D's named
    metrics list.
 4. **Most core safety rests on model-checking plus tests of unmeasured power.**
-   `grep -rn "Falsifier[,:]" crates/ --include=*.rs` finds 27 markers in 10
-   files (23 in 9 before this change added four). They cluster where bugs were
-   actually found: #83 (`proposer.rs` three of five, `restart_agreement.rs`
+   `grep -rn "Falsifier[,:]" crates/ --include=*.rs` finds 29 markers in 12
+   files (23 in 9 before #112, then #114's re-runs and #113's two new ones).
+   They cluster where bugs were actually found: #83 (`proposer.rs` three of five, `restart_agreement.rs`
    24/24, `proposer_start_contract.rs`), #92 (`two_h_proposals.rs`,
    enumerated), the observer/postmortem machinery (`postmortem.rs`,
    `observer.rs`, `soak.rs`, `evidence.rs`, `chain.rs`, `stall.rs`), and
    `durability_faults.rs` as of finding 8. That is the expected shape — power
-   gets measured where someone was already suspicious — but it means P5–P8,
-   P8a, P10, P11 and P14–P16 currently have **no demonstrated ability to
-   detect their own failure** (P13's measured row covers the re-kick contract
-   only, not majority progress as such).
+   gets measured where someone was already suspicious — but it means P8, P8a
+   and P14–P16 currently have **no demonstrated ability to detect their own
+   failure** (P13's measured row covers the re-kick contract only, not
+   majority progress as such). P5, P6, P7, P10 and P11 were on that list
+   too until #113 measured them — see finding 9.
 
-   The second-order gap in the convention itself is **closed** (#114). All 27
-   markers now say `Falsifier, run:`; the 20 that previously described a
+   The second-order gap in the convention itself is **closed** (#114). Every
+   marker in the tree now says `Falsifier, run:`; the 20 that previously described a
    mutation without recording whether anyone ran it were each executed, and
    every one of the 20 predictions held — no marker turned out to be a
    prediction that fails.
@@ -201,14 +211,14 @@ Listed because an unlabelled property is one nobody can audit.
    In all three cases the first, obvious one-line edit survived; the marker's
    own stated behavior did not.
 
-   That closes the provenance question, not the coverage one: the markers
-   cluster where bugs were found, so P5–P8, P8a, P10, P11 and P14–P16 still
-   have no demonstrated ability to detect their own failure. CLAUDE.md's
+   That closed the provenance question, not the coverage one. CLAUDE.md's
    cautionary example is 60 sim scenarios with measured-*zero* power for #83
-   being read as reassurance for weeks. The cheapest next step is not to mutate
-   everything; it is to pick the two or three properties whose failure would be
-   most catastrophic and least visible (P5 and P10 are the candidates, tracked
-   in #113) and measure those.
+   being read as reassurance for weeks. The cheapest next step was not to
+   mutate everything but to pick the two properties whose failure would be
+   most catastrophic and least visible — P5 and P10 — and measure those. That
+   is what #113 did; finding 9 records what it turned up, and P8, P8a and
+   P14–P16 are what remain.
+
 5. **The `>= ½` per-round termination bound (P14) is assumed, not derived here.**
    The tests show termination happens; they do not establish the probability
    bound. That is a legitimate `assumed` — it is the paper's theorem — but it
@@ -271,6 +281,34 @@ Listed because an unlabelled property is one nobody can audit.
    the value in memory, which would let a correct read through on some runs,
    but nobody has shown that is the mechanism. Nothing in CI re-runs any of
    this; the counts rot silently.
+
+9. **Measuring P5, P7, P10 and P11 (#113) turned up one zero-power test and
+   one structural blind spot.** Both were invisible from outside; the tests
+   are green either way.
+
+   **A vacuous green.** `log_safety.rs::log_safety_holds_even_without_a_live_majority`
+   crashed a majority *before* submitting any work. Measured: every replica
+   finished at `next_slot=0, log_len=0`, so the assertion compared five empty
+   logs. It survived all three mutations that kill the file's other six tests
+   — the signature of zero detection power, not of robustness. It now decides
+   a prefix first, asserts that prefix is non-empty, and asserts nothing
+   further decides once quorum is lost; all three mutations now fail it.
+
+   **Two submit paths, each invisible to the other's tests.**
+   `SmrCluster::submit` and `SmrNode::submit` are independent implementations
+   of the same contract. The P10 defect (answer a `Get` from local state)
+   written into `SmrNode::submit` alone — the path `net/src/driver.rs` uses,
+   i.e. the shipped node — leaves **all 60 `queso-smr` tests passing** and
+   kills 15 `queso-net` tests. Written into `SmrCluster::submit` alone it
+   kills 13 in-process tests and never reaches `queso-net`. Neither suite is
+   redundant here; each is the only instrument for its own site. The first
+   attempt at this measurement mutated `SmrNode::submit`, ran the sim suite,
+   and would have recorded **zero power for P10** — a false finding produced
+   by a mutation sitting in code the instrument never executes. Same lesson
+   as §6.8 from the other direction: check which assertion fired, and check
+   the mutation is on the path under test.
+
+   What is left unmeasured after #113 is P8, P8a and P14–P16.
 
 ---
 
