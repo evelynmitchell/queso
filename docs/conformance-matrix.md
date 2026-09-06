@@ -141,7 +141,7 @@ measured power for the observer even where the protocol row cannot.
 | Property | Verified by | Class |
 |---|---|---|
 | **D1** One-round-trip fast path | `consensus/tests/fast_path.rs`; `proposer.rs` unit tests (falsifier above) | tested, power measured (partly) |
-| **D2** Linear messaging under synchrony | `consensus/tests/hedging.rs::d2_…` — asserts leader-only cost `≤ 4n` and that no backup activated, at n ∈ {3, 5, 7, 11}. The concrete message counts STATUS.md used to quote are **not** this test's numbers; see §6.7 | tested, power unmeasured |
+| **D2** Linear messaging under synchrony | `consensus/tests/hedging.rs::d2_…` — at n ∈ {3, 5, 7, 11, 21}, no backup activated and message counts pinned as equalities: `2n` leader-only against `2n²` all-active (6/18, 10/50, 14/98, 22/242, 42/882). *Falsifier, run: doubling the leader's fan-out kills the leader-only pin (`left: 12, right: 6` at n=3); doubling non-leaders' kills the baseline pin (`left: 30, right: 18`); the pre-#117 `≤ 4n` bound passes the first of those, and under it this is the only failing test in the workspace's 67 binaries — so that regression previously had no instrument anywhere.* STATUS.md's formerly unsourced figures are now this test's numbers — see §6.7 | tested, power measured |
 | **D3** Adversarial robustness | `compare/tests/leader_dos.rs` measures the availability gap under leader isolation, now with scheduling-stall attribution (#107). **Nothing maps it to D3 by name** (`grep -rlE "\bD3\b" crates/` is empty), and the paper's ≈30× / blog's ≈10× reference points are not reproduced here | tested, power unmeasured; the comparison against etcd is **assumed** from the paper |
 | **D4** Auto-tuning | `smr/tests/tuning.rs` | tested, power unmeasured |
 | **D5** Constant-space recorders | Integer ISR by construction (`consensus/src/concrete.rs`); `IsrConsistent` invariant | model-checked / by construction |
@@ -226,9 +226,13 @@ Listed because an unlabelled property is one nobody can audit.
    since. They are not shown to be wrong; they are **unsourced**, which is the
    failure mode CLAUDE.md §5 is about. The cheap half of the fix landed with
    this matrix: STATUS now states what the test actually asserts and marks the
-   figures *asserted, unmeasured*. The other half — re-measuring them into
-   `d2_…` as pinned counts at n=5 and n=21 — is open, and would upgrade the D2
-   row.
+   figures *asserted, unmeasured*. **The other half has since landed (#117)**:
+   `d2_…` now runs n ∈ {3, 5, 7, 11, 21} and pins both counts as equalities,
+   `2n` and `2n²`. Re-measured, the old figures were *right* — 10/50 at n=5
+   and 42/882 at n=21 reproduce exactly — so what was wrong with them was
+   their provenance, not their value, which is the whole point of §5: an
+   unsourced number is not a false one, it is an unfalsifiable one. The pins
+   were then themselves mutated, and the D2 row is *power measured*.
 8. **`durability_faults.rs` claimed measured power it did not have — so it was
    measured.** Building this matrix, the P9/P12 rows were first written as
    "power measured" from the file's own note that a *one-replica* version of the

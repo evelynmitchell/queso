@@ -70,15 +70,19 @@ real traffic. See §4 for the honest remaining gaps.
   activating only if no earlier progress is seen; **unbounded retry with exponential
   backoff** (issue #13 — backoff bounds the retry *rate*, never the *count*, so a
   network that heals arbitrarily late still resumes the slot). `O(n)` rather than
-  `O(n²)` messaging under synchrony — *tested, power unmeasured*:
-  `hedging.rs::d2_…` asserts, at n ∈ {3, 5, 7, 11}, that no backup activated,
-  that leader-only cost is `≤ 4n`, and that it is strictly below the δ=0
-  all-active baseline over the identical scenario (by more than 2× for n ≥ 5).
+  `O(n²)` messaging under synchrony — *tested, power measured* (#117):
+  `hedging.rs::d2_…` asserts, at n ∈ {3, 5, 7, 11, 21}, that no backup
+  activated and that the message counts are **exactly** `2n` leader-only
+  against `2n²` for the δ=0 all-active baseline over the identical scenario —
+  6/18, 10/50, 14/98, 22/242, 42/882. Pinned as equalities, not bounds, and
+  the pins are measured: doubling the leader's fan-out is caught (`left: 12,
+  right: 6` at n=3) where the `≤ 4n` bound they replace passed it.
   (The figures "10 vs 50 msgs at n=5; 42 vs 882 at n=21" stood here from this
-  file's first commit and trace to no test: that test runs no 21-replica
-  cluster, and no other test in `crates/` constructs one either — searched for
-  `21` as a numeric literal, whose one hit is a slot count in
-  `observer_detects.rs`. They are *asserted, unmeasured* and are not repeated.)
+  file's first commit and traced to no test — #117 was opened because they
+  were *unsourced*, not because they were wrong. Re-measured into the test,
+  they are exactly right; the n=21 case that no test used to construct now
+  exists. The `2n` figure is the leader-only cost within a budget shorter
+  than δ, which the test asserts as a premise.)
 
 ### `crates/smr` — replicated log + linearizable KV (Phases 4, 6)
 - Multi-slot log (prefix consistency, total order, gap-free apply) chaining per-slot

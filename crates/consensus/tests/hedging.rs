@@ -43,15 +43,81 @@ fn initial_values(n: u32) -> BTreeMap<NodeId, u32> {
 /// Under `Fifo(1)` (a fixed 1-tick-per-hop, lossless network -- round-trip
 /// is a handful of ticks) with δ far larger than that round-trip, only the
 /// leader should ever activate: every backup's `Proposer::activated()`
-/// stays `false`, and the total message count stays a small multiple of
-/// `n` -- nowhere near the `n * n`-ish cost an all-active (δ=0) run over
-/// the same tick budget produces.
+/// stays `false`, and the message count is exactly `2n` against the `2n^2`
+/// an all-active (δ=0) run over the same tick budget produces.
+///
+/// Both counts are **pinned exactly, not bounded** (issue #117). Measured
+/// on this sandbox, and the closed forms hold at every n in the sweep:
+///
+/// | n | hedged | baseline |
+/// |---|---|---|
+/// | 3 | 6 | 18 |
+/// | 5 | 10 | 50 |
+/// | 7 | 14 | 98 |
+/// | 11 | 22 | 242 |
+/// | 21 | 42 | 882 |
+///
+/// The n=5 and n=21 rows are the figures `docs/STATUS.md` carried from its
+/// first commit and that traced to no test -- #117 exists because they were
+/// unsourced, not because they were wrong. Re-measured here, they are right.
+///
+/// Determinism was checked rather than assumed, because a pinned number
+/// that is really a sample is worse than a bound: identical over 5 repeats
+/// at n ∈ {5, 21}, and identical across seeds 0..11 at both. That is 12
+/// seeds, not all seeds -- but the seed has no route to these numbers that
+/// is visible here: `Fifo(1)` is a fixed schedule, and while the seed does
+/// perturb the priorities `draw_priority` hands the baseline's backups, a
+/// priority changes which proposal wins, never who sends to whom, which is
+/// all a message count sees.
+///
+/// The two counts rest on different premises, which is why only one of them
+/// needs the budget guarded:
+///
+/// - `baseline == 2n^2` held at *every* budget measured (100, 200, 400,
+///   1_000, 4_000, 6_000, 20_000 ticks): all-active fan-out happens once and
+///   `Fifo` never drops, so there is nothing to retry.
+/// - `hedged == 2n` is the *leader-only* cost, and holds only while the
+///   budget stays inside δ. Measured, it doubles to `4n` by 6_000 ticks and
+///   `8n` by 20_000 as backups activate on schedule -- which is the hedging
+///   design working, not a regression. The test asserts `ticks < base_delay`
+///   so that premise cannot drift silently; at 200 vs 5_000 the margin is
+///   25x.
+///
+/// Falsifier, run: both pins were mutated, one run each -- repeats add
+/// nothing here, given the determinism measured just above -- and each pin
+/// is killed by a mutation aimed at it:
+///
+/// - `begin_step` sending every `record` request twice kills the leader-only
+///   pin at n=3, `left: 12, right: 6`.
+/// - the same doubling applied to non-leaders only kills the baseline pin at
+///   n=3, `left: 30, right: 18` -- and the leader-only pin passes first,
+///   which is what shows the two are measured independently rather than one
+///   masking the other.
+///
+/// The first mutation is also what measures the pins as *sharper than the
+/// bounds they replace*, rather than that being an argument: with the
+/// pre-#117 assertions restored (`hedged <= 4n`, `hedged < baseline`, and
+/// `baseline > 2 * hedged` for n >= 5) that same doubling **passes** -- 2n
+/// doubled is 4n, which sits exactly on the old bound.
+///
+/// And nothing else in the tree covers it. Under that mutation this is the
+/// *only* failing test in the whole workspace -- `cargo test --workspace`,
+/// 67 test binaries, one failure, this one. So before #117 a regression
+/// that doubled the leader's fan-out had no instrument at all: the bound
+/// here admitted it and no other test saw it. That is an enumeration over
+/// the workspace as it stands, not over every regression shape.
 #[test]
 fn d2_leader_only_activation_gives_linear_not_quadratic_messaging() {
-    for n in [3u32, 5u32, 7u32, 11u32] {
+    for n in [3u32, 5u32, 7u32, 11u32, 21u32] {
         let seed = 42;
         let base_delay = 5_000; // far above Fifo(1)'s few-tick round-trip
         let ticks = 200; // enough for the leader to fast-path decide, far short of base_delay
+        assert!(
+            ticks < base_delay,
+            "test premise: the budget must stay inside δ. Past it the backups activate on \
+             schedule and the pinned leader-only count stops describing what is measured -- \
+             measured, the hedged count doubles to 4n by 6_000 ticks and 8n by 20_000"
+        );
 
         let mut hedged = ConcreteCluster::new_with_schedule(
             seed,
@@ -80,12 +146,14 @@ fn d2_leader_only_activation_gives_linear_not_quadratic_messaging() {
             }
         }
 
-        // Leader-only cost: n requests + n responses (plus, in principle, a
-        // handful of retries -- none needed here since Fifo never drops).
+        // Leader-only cost, pinned exactly rather than bounded (issue #117):
+        // n requests + n responses, no retries, since `Fifo` never drops.
         let hedged_messages = hedged.message_count();
-        assert!(
-            hedged_messages <= 4 * n as usize,
-            "n={n}: leader-only message count {hedged_messages} was not O(n)"
+        assert_eq!(
+            hedged_messages,
+            2 * n as usize,
+            "n={n}: leader-only cost should be exactly 2n -- n `record` requests out, \
+             n responses back, with no backup ever activating"
         );
 
         // Contrast against the unhedged (δ=0) baseline over the identical
@@ -100,21 +168,17 @@ fn d2_leader_only_activation_gives_linear_not_quadratic_messaging() {
         baseline.run_slot(ticks);
         let baseline_messages = baseline.message_count();
 
-        assert!(
-            hedged_messages < baseline_messages,
-            "n={n}: hedged message count {hedged_messages} should be strictly \
-             below the all-active baseline's {baseline_messages}"
+        // Pinned exactly too: every one of the n proposers fans out to every
+        // one of the n recorders and is answered, so 2n^2. Together with the
+        // 2n above this states the O(n)-vs-O(n^2) claim as an equality --
+        // strictly stronger than the `<= 4n` bound and the `> 2x` contrast
+        // this replaces, both of which a regression that merely doubled the
+        // constant would have slipped through.
+        assert_eq!(
+            baseline_messages,
+            2 * (n as usize) * (n as usize),
+            "n={n}: the δ=0 all-active baseline should be exactly 2n^2"
         );
-        if n >= 5 {
-            // For n >= 5 the gap should already be substantial (roughly a
-            // factor of n): guard against a regression that merely trims a
-            // constant rather than eliminating the O(n) backup fan-out.
-            assert!(
-                baseline_messages > hedged_messages * 2,
-                "n={n}: all-active baseline ({baseline_messages}) was not \
-                 meaningfully larger than leader-only hedged cost ({hedged_messages})"
-            );
-        }
     }
 }
 
