@@ -365,8 +365,19 @@ deployment runbook, comparison writeup, and licensing all landed.
   coverage that is not mapped to them; and the 27 `Falsifier` markers in
   `crates/` sit in 10 files, all of them where a bug had already been found
   (and only 7 of the 27 record that the mutation was actually run) — leaving **P5–P8, P8a, P10, P11 and P14–P16** resting on tests of
-  unmeasured power. Read §6 there rather than this summary; the matrix is
-  the version that gets updated.
+  unmeasured power.
+
+  Those are since measured — P5/P6/P7/P10/P11 by #113, P8/P8a/P14–P16 by
+  #125 — and measuring them changed what several of them are worth rather
+  than just confirming them: **P14 has a measured zero** (removing the
+  randomization it is named for kills 0 of 441 tests, for structural
+  reasons §6.13 sets out), P15's self-described "crux" test could not
+  detect a permanent stall, P8a's exact-duplicate test had no power until
+  it was repaired, and P8's power covers one of the several violation
+  classes its property admits. Two tests were added and two doc-comment
+  claims withdrawn. **P13 is now the outstanding unmeasured one.** Read §6
+  there rather than this summary; the matrix is the version that gets
+  updated.
 
 ### 4c. CI/CD
 
