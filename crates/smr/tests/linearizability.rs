@@ -13,6 +13,44 @@
 //! survivor is `a_stale_local_read_is_rejected_by_the_checker`, which
 //! builds its stale read by hand and so does not care how `submit`
 //! behaves.
+//!
+//! # Detection power for P8 (#125)
+//!
+//! Four mutations, whole-file runs, 8 each:
+//!
+//! | Mutation | Genuine P8 violation? | Kills here |
+//! |---|---|---|
+//! | **P10-A** `Get` served from local state | yes (stale read) | **4/5** |
+//! | **B1** catch-up learns the slot into the log but never applies it to the KV | yes (replica's KV goes stale) | **0/5** |
+//! | **A1** `Kv::apply` dedup disabled | yes (a retry re-applies) | **0/5** |
+//! | **B2** `is_linearizable` returns `true` unconditionally | no -- breaks the instrument | 2/5 |
+//!
+//! P10-A's 4/5 is re-verified here rather than carried over from #113; it
+//! reproduces exactly, survivor included.
+//!
+//! **What this file's power actually rests on.** Every demonstrated kill
+//! against a real violation comes from the stale-read class. Two mutations
+//! that produce genuine linearizability violations -- B1 and A1 -- leave
+//! all five tests green, and are caught elsewhere entirely: B1 by seven
+//! restart/durability tests (`smr/tests/restart_recovery.rs`,
+//! `net/tests/restart_recovery.rs`, `net/tests/tutorial.rs`,
+//! `net/tests/durability_faults.rs`), A1 by `tests/idempotency.rs` and
+//! `kv`'s unit tests.
+//!
+//! The reason is structural rather than an oversight, and worth stating so
+//! nobody reads this file as P8's sole guard: the randomized workload
+//! never crashes or restarts a replica, so catch-up staleness cannot arise
+//! in it; and its `ClientSession`s never reissue a `(client, seq)`, so a
+//! dedup defect cannot arise either. Both violation classes are real, and
+//! both are only reachable in workloads this file does not run. P8's
+//! coverage is the union of this file and those, not this file alone.
+//!
+//! **The positive control has teeth, measured.** B2 -- a checker that
+//! accepts everything -- fails `a_stale_local_read_is_rejected_by_the_
+//! checker` 8/8 and `a_causally_ordered_submission_never_ties_a_prior_
+//! completion` 8/8. The three randomized-workload tests pass under B2, as
+//! they must: a vacuous checker cannot be caught by a history it was going
+//! to accept anyway. That asymmetry is the control's whole purpose.
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
