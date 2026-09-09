@@ -676,6 +676,10 @@ mod tests {
     ///
     /// The 13: this module 3/7 (including this test), `tests/linearizability.rs`
     /// 4/5, `tests/idempotency.rs` 3/3, `tests/restart_recovery.rs` 3/7.
+    /// (`tests/idempotency.rs` is **4/4** as of #125, which added a fourth
+    /// test there and re-ran P10-A rather than carrying this count forward;
+    /// the count in this row is the one #113 measured, on the file as it
+    /// stood then. The total is therefore 14 against the tree today.)
     /// `tests/log_safety.rs` survives 0/7, correctly -- it asserts on logs,
     /// never on read outcomes.
     ///
