@@ -10,6 +10,26 @@
 //! asserts the same shape of bound the paper's Theorem (Liveness) predicts:
 //! comfortably under a handful of rounds in expectation, with every replica
 //! terminating with probability 1 within a generous cap.
+//!
+//! # Detection power (#125): none demonstrated
+//!
+//! Mutation **C1**, at `proposer.rs`'s `draw_priority`: return the
+//! constant `1`, keeping the draw so the PRNG stream is consumed
+//! identically. This is the site the *concrete* driver executes (the
+//! abstract driver's priorities come from `node.rs` instead -- see
+//! `termination.rs`, which records why the two must be measured apart).
+//!
+//! | | n=3 mean | n=3 max | n=5 mean | n=5 max |
+//! |---|---|---|---|---|
+//! | unmutated | 1.263 | 3 | 1.607 | 5 |
+//! | C1 | 1.177 | 3 | 1.407 | 4 |
+//!
+//! On-path, and **0 of 441 tests in the tree fail**. Removing the
+//! randomization makes convergence *faster* here, which is exactly why the
+//! `mean < 4.0` assertion cannot detect it: the bound is one-sided and the
+//! defect moves the statistic the safe way. See `termination.rs`'s module
+//! docs for the full reasoning and for what would be needed to falsify
+//! this property (a content-aware adversary; unmeasured).
 
 use std::collections::BTreeMap;
 

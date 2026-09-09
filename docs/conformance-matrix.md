@@ -93,8 +93,8 @@ space.
 | **P7** Gap-free application | `smr/tests/log_safety.rs` — *falsifiers, run (#113): advancing `next_slot` without appending fails all 7; applying each decided command twice also fails all 7 — both at the frontier-vs-log-length check* | tested, power measured |
 | | `conformance/tests/faults.rs` catches the first (2 of 6) and **none** of the second: a defect that inflates every replica's log identically produces no divergence, and that suite has no frontier-vs-length assertion. Cross-replica comparison cannot see uniform wrongness | argued from both assertion sets; the counts are measured |
 | | `chain/src/lib.rs` | tested, power unmeasured |
-| **P8** Linearizability | `smr/tests/linearizability.rs` (randomized concurrent put/get, checked offline) | tested, power unmeasured |
-| **P8a** Idempotent commands | `smr/tests/idempotency.rs` | tested, power unmeasured |
+| **P8** Linearizability | `smr/tests/linearizability.rs` (randomized concurrent put/get, checked offline) — *falsifier, run (#125): the P10-A stale-read mutation kills 4/5, re-verified rather than inherited. Two mutations that produce genuine P8 violations, catch-up-skips-apply and dedup-off, kill **0/5** here and are caught by restart/durability tests and by `idempotency.rs` instead; the workload never crashes a replica and never reissues a `(client, seq)`, so neither class is reachable in it. A vacuous checker is caught 8/8 by this file's own control. See §6.13* | tested, power measured — **for the stale-read class only**; P8's coverage is this file ∪ the restart and idempotency suites |
+| **P8a** Idempotent commands | `smr/tests/idempotency.rs` — *falsifier, run (#125): dedup disabled kills 3/4 8/8 on their own value assertions; the `>= ` → `>` off-by-one kills 1/4. Both counts are post-repair: the file's exact-duplicate test had **zero** power before #125 and the fourth test did not exist. See §6.13* | tested, power measured |
 | **P9** No lost committed writes | `smr/tests/restart_recovery.rs`; `net/tests/restart_recovery.rs` (#36, majority reboot of real OS processes) | tested, power unmeasured |
 | | `net/tests/durability_faults.rs::acknowledged_writes_survive_rolling_restarts_under_load` — *falsifier, run: disabling the boot-time reload in `driver.rs` fails it 8/8, every time at the lost-write assertion* | tested, power measured |
 | | Write-before-reply is asserted at runtime in `driver.rs` by a **release-mode** assert, so the check is in the shipped artifact rather than only under `cargo test`. No falsifier has been run for the assert itself | tested, power unmeasured; enforcement **in-build** |
@@ -114,10 +114,10 @@ space.
 |---|---|---|
 | **P13** Majority progress | `consensus/tests/partition.rs` | tested, power unmeasured |
 | | `consensus/tests/proposer_start_contract.rs` (#13) — re-kicking an *undecided* proposer restarts round 1, so a driver can un-stall one that spent its whole first push partitioned from every quorum — *falsifier: making `start` fully idempotent leaves the replicas parked at their pre-kick step and the rewind assertion fails* | tested, power measured |
-| **P14** Randomized termination | `consensus/tests/termination.rs`, `concrete_termination.rs` — content-oblivious adversary, per A3 | tested, power unmeasured |
+| **P14** Randomized termination | `consensus/tests/termination.rs`, `concrete_termination.rs` — content-oblivious adversary, per A3. *Falsifier, run (#125): **none exists**. Replacing the drawn priority with a constant, at each of the two randomization sites separately, is on-path (both distributions move) and kills **0 of 441** tests in the tree. `mean < 4.0` is one-sided and the defect moves the mean **down**; and under a content-oblivious adversary a deterministic tie-break by `origin` converges as well as a random draw. See §6.13* | tested, power measured — **zero**, structurally |
 | | The ≥ ½ per-round bound itself | **assumed** (paper, §4; not independently derived here) |
-| **P15** Timeout-independent liveness | `consensus/tests/hedging.rs` — four tests named for it: δ-sweep, huge δ, per-proposer misconfiguration, no-live-majority | tested, power unmeasured |
-| **P16** Leader-failure recovery | `consensus/tests/hedging.rs::p16_…`; `compare/tests/leader_dos.rs` (real cluster, leader isolated) | tested, power unmeasured |
+| **P15** Timeout-independent liveness | `consensus/tests/hedging.rs` — five tests named for it (δ-sweep, huge δ, per-proposer misconfiguration, no-live-majority, and #125's huge-δ-with-a-dead-leader). *Falsifier, run (#125): dropping the freshness test in `maybe_activate_after_hedge` — a proposer that defers forever behind a frozen recorder step — kills the misconfiguration test and the new crux test 8/8 on their own assertions, and **0/8** the δ-sweep and huge-δ tests. The huge-δ test called itself "P15's crux" and cannot detect a permanent stall: its leader stays alive, so the decision arrives regardless. See §6.13* | tested, power measured — 2 of the 5 named tests carry it |
+| **P16** Leader-failure recovery | `consensus/tests/hedging.rs::p16_…`; `compare/tests/leader_dos.rs` (real cluster, leader isolated). *Falsifier, run (#125): the hedge-gate freshness mutation kills `p16_…` 8/8 on its own first assertion — "small δ did not recover within 300 ticks". With the leader dead, a backup's own activation is the only route to a decision, which is P16's claim exactly* | tested, power measured |
 | **P17** No destructive interference | `consensus/tests/hedging.rs::p17_concurrent_proposers_converge_without_destructive_interference` (#116) — δ=0, leaderless, so every proposer is active; asserts that all activated (anti-vacuity), that the round count is **flat in n** (round 1 at n ∈ {3,5,7,9,11}), and that the decided set is a single value. Under 10% loss, 100 seeds × 5 values of n: 0/500 runs split, worst-case rounds 3/6/6/5/6 — bounded and not growing with n. *Falsifier, run: dropping phase-0's `self.proposal = best` (duelling proposers) kills it at the round assertion, `left: 2, right: 1` at n=3 — though 14 other tests also fail on that mutation, since it violates safety too; see §6.10* | tested, power measured |
 
 ---
@@ -189,18 +189,22 @@ Listed because an unlabelled property is one nobody can audit.
    wrong description of D10: the endpoint is well tested, and D10's metric
    list is unimplemented. See the D10 row and §6.11.
 4. **Most core safety rests on model-checking plus tests of unmeasured power.**
-   `grep -rn "Falsifier[,:]" crates/ --include=*.rs` finds 29 markers in 12
-   files (23 in 9 before #112, then #114's re-runs and #113's two new ones).
+   `grep -rn "Falsifier[,:]" crates/ --include=*.rs` finds 39 markers in 14
+   files (23 in 9 before #112, then #114's re-runs, #113's two new ones, and
+   #125's ten).
    They cluster where bugs were actually found: #83 (`proposer.rs` three of five, `restart_agreement.rs`
    24/24, `proposer_start_contract.rs`), #92 (`two_h_proposals.rs`,
    enumerated), the observer/postmortem machinery (`postmortem.rs`,
    `observer.rs`, `soak.rs`, `evidence.rs`, `chain.rs`, `stall.rs`), and
    `durability_faults.rs` as of finding 8. That is the expected shape — power
-   gets measured where someone was already suspicious — but it means P8, P8a
-   and P14–P16 currently have **no demonstrated ability to detect their own
-   failure** (P13's measured row covers the re-kick contract only, not
-   majority progress as such). P5, P6, P7, P10 and P11 were on that list
-   too until #113 measured them — see finding 9.
+   gets measured where someone was already suspicious. P5, P6, P7, P10 and
+   P11 came off that list with #113 (finding 9); P8, P8a and P14–P16 came
+   off it with #125 (finding 13), which is where the remaining "no
+   demonstrated ability to detect their own failure" text used to point.
+   What survives is narrower and worse: P14 now has a *measured zero*, and
+   P8's measured power covers one violation class of the several its
+   property admits. P13's measured row still covers the re-kick contract
+   only, not majority progress as such.
 
    The second-order gap in the convention itself is **closed** (#114). Every
    marker in the tree now says `Falsifier, run:`; the 20 that previously described a
@@ -318,7 +322,8 @@ Listed because an unlabelled property is one nobody can audit.
    as §6.8 from the other direction: check which assertion fired, and check
    the mutation is on the path under test.
 
-   What is left unmeasured after #113 is P8, P8a and P14–P16.
+   What was left unmeasured after #113 — P8, P8a and P14–P16 — is measured
+   in finding 13 (#125). P13 remains the outstanding one.
 10. **P17's test earns a diagnosis, not exclusive coverage — and one attempt
     to show otherwise failed** (#116). The test asserts round counts because
     round escalation is what separates interference from concurrency, and the
@@ -425,3 +430,81 @@ Two rules make that visible rather than silent:
   `soak/`, `proposer.rs`, `proposer_start_contract.rs`, `restart_agreement.rs`
   and `compare/src/stall.rs`), and in this matrix second. The doc comment is
   what survives a file move; this table is the index.
+
+13. **Measuring the last five (#125) found one zero, one blind artifact, one
+    test with no power at all, and one uncovered boundary.** P8, P8a and
+    P14–P16 were what #113 left. All five are now measured, and only two of
+    the five came back the way the matrix implied they would.
+
+    **P14 has a measured zero, and a structural one.** Replacing the drawn
+    priority with a constant — at *both* randomization sites, separately —
+    kills **0 of 441** tests. Two reasons, and neither is an oversight:
+    `mean < 4.0` is a one-sided bound and losing randomization moves the
+    mean *down* (with equal priorities `Proposal::Ord` still totally orders
+    by `origin`, and converging on "highest origin" is measurably faster in
+    the concrete driver: n=5 mean 1.607 → 1.407); and both tests run
+    `ContentObliviousAdversary`, the class A3 names, which by construction
+    cannot exploit a deterministic tie-break. Randomization earns its keep
+    against a content-aware adversary, and no termination test uses that
+    class though `crates/sim` provides it. Whether such an adversary can
+    livelock the constant-priority variant is **unmeasured** — a real open
+    question, tracked separately rather than guessed at.
+
+    This one nearly recorded a false zero the same way #113's P10 nearly
+    did. The first attempt mutated `proposer.rs`, ran `termination.rs`, and
+    saw a byte-identical histogram — because that file drives the
+    *abstract* `Cluster`, whose priorities come from `node.rs`. Each site
+    is now shown on-path by a moved distribution rather than by inspection.
+    Same lesson, third occurrence: check the mutation is on the path the
+    instrument runs, and check it by observing behavior change, not by
+    reading the call graph.
+
+    **P15's "crux" test could not detect the thing it named.**
+    `p15_huge_delta_eventually_converges_and_never_permanently_stalls`
+    described itself as P15's crux; under a hedge gate that defers forever
+    behind a frozen recorder step, its activation *and* decision state is
+    byte-identical to the unmutated build — all five replicas activated and
+    decided, both ways — because its leader stays alive and delivers the
+    decision regardless of whether hedging ever fires. The claim is
+    withdrawn in the doc comment and
+    `p15_huge_delta_still_decides_when_the_leader_never_delivers` (huge δ
+    *and* a dead leader) now carries it, failing that mutation 8/8. Of the
+    five tests named for P15, two can detect the stall defect and three
+    cannot.
+
+    **P8a's exact-duplicate test had zero power, for a reason worth
+    remembering.** Its "duplicate" went to a replica whose `next_slot` was
+    still 0, so the retry proposed slot 0, found it already decided
+    carrying a byte-identical command, and completed — never becoming a
+    second log entry, so `Kv::apply` was never asked to apply it twice.
+    Under dedup-off its observable behavior was byte-identical to the
+    unmutated build. It went red anyway, on the linearizability assertion,
+    because `Kv` is *also* the checker's reference spec: the mutation broke
+    the spec, and the spec then disagreed with a system that had behaved
+    correctly. **A count taken from "the file went red" would have recorded
+    power this test did not have** — §6.9's failure mode reached from a new
+    direction, and an argument for reading which assertion fired *and*
+    whether behavior changed, not just the exit code. Repaired with a
+    warm-up read plus a slot guard so the power cannot be lost silently
+    again. The `>= ` → `>` off-by-one — a client retrying its own latest
+    command, the most ordinary retry there is — was caught by exactly one
+    test in the tree and by nothing at integration level; a fourth test now
+    covers it, 8/8.
+
+    **P8's artifact is blind to two of the three violation classes it
+    admits.** `smr/tests/linearizability.rs`'s demonstrated power is
+    entirely the stale-read class (P10-A, 4/5, re-verified). Catch-up
+    staleness and dedup-off both produce genuine linearizability violations
+    and kill **0/5** there — caught by restart/durability tests and by
+    `idempotency.rs` instead. Structural again: the randomized workload
+    never crashes a replica and never reissues a `(client, seq)`, so
+    neither class is reachable in it. P8's coverage is the union of those
+    suites, not this file; the matrix row now says so. The file's positive
+    control does have measured teeth — a vacuous checker fails it 8/8.
+
+    **The pattern across all four.** In three of the five, the artifact the
+    matrix named was not the artifact carrying the power, and in two of
+    those the doc comment actively claimed otherwise. Mapping a property to
+    a test whose *name* matches it is not evidence about that test; only
+    mutation is. Reading the name is how P14's zero, P15's crux and P8a's
+    vacuous scenario survived this long.

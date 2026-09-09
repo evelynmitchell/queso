@@ -379,6 +379,14 @@ fn p17_concurrent_proposers_converge_without_destructive_interference() {
 /// budget (demonstrating recovery time is gated by δ, not instantaneous
 /// regardless of configuration) -- yet still recovers once enough ticks
 /// pass, however large δ was configured.
+///
+/// Falsifier, run: dropping the freshness test in
+/// `Proposer::maybe_activate_after_hedge` fails this 8/8 on the *first*
+/// assertion -- "small δ did not recover within 300 ticks". With the
+/// leader dead, a backup's own activation is the only route to a
+/// decision, and a gate that defers against the step the dead leader left
+/// behind never opens. P16's own assertion, firing for P16's own reason:
+/// recovery via a backup, with no view change to fall back on.
 #[test]
 fn p16_leader_failure_recovery_is_gated_by_delta_but_never_lost() {
     let n = 5;
@@ -427,9 +435,11 @@ fn p16_leader_failure_recovery_is_gated_by_delta_but_never_lost() {
     // last-ranked backup's delay to elapse (crashed leader aside, the
     // last-ranked live backup here is rank n-1, i.e. delay
     // `(n-1) * large_delta`), the slot still decides for every live
-    // replica. This is the crux of P15: no δ, however large, causes a
-    // *permanent* stall -- it only ever costs latency, bounded by the
-    // configured schedule.
+    // replica. This is P15's crux -- no δ, however large, causes a
+    // *permanent* stall; it only ever costs latency, bounded by the
+    // configured schedule -- and, per #125's measurement, this test is one
+    // of the two places the tree actually checks it: the crashed leader is
+    // what makes a backup's own activation the only route to a decision.
     slow.advance(large_delta * n as u64 + 1_000);
     assert!(
         slow.all_live_decided(),
@@ -504,11 +514,29 @@ fn p15_delta_sweep_always_makes_progress_and_redundant_effort_shrinks() {
     );
 }
 
-/// A single huge δ must never cause a *permanent* stall (P15's crux):
+/// A huge δ costs latency, not liveness, **while the leader is alive**:
 /// within a short window the leader (delay 0, so unaffected by δ) decides
 /// while backups correctly have not yet activated, but given enough ticks
 /// for the schedule to fully play out, every live replica eventually
-/// decides too -- the delay only ever costs latency, never liveness.
+/// decides too.
+///
+/// This test used to describe itself as "P15's crux". Measurement (#125)
+/// says otherwise, so the claim is withdrawn: with the freshness test
+/// removed from `Proposer::maybe_activate_after_hedge` -- a defect that
+/// makes a hedged proposer defer forever behind a frozen recorder step --
+/// this test's activation *and* decision state is byte-identical to the
+/// unmutated build (all five replicas activated, all five decided, under
+/// both). The leader's fast path never advances the recorders past the
+/// backups' own step here, so the mutated branch is never the deciding
+/// one. A permanent stall is not something this arrangement can exhibit,
+/// because the leader delivers the decision either way.
+///
+/// Falsifier, run: none known. The stall defect above is inert here (0/8,
+/// and identical observable state rather than merely a passing run). What
+/// this test does establish is the *latency* half -- backups have not
+/// piled on early under a large δ -- for which the short-window assertion
+/// below is load-bearing. The crux itself is exercised by
+/// `p15_huge_delta_still_decides_when_the_leader_never_delivers`.
 #[test]
 fn p15_huge_delta_eventually_converges_and_never_permanently_stalls() {
     let n = 5;
@@ -539,10 +567,67 @@ fn p15_huge_delta_eventually_converges_and_never_permanently_stalls() {
     );
 }
 
+/// P15's crux in the arrangement where it is actually load-bearing: a huge
+/// δ **and** a leader that never delivers. `p15_huge_delta_eventually_
+/// converges_and_never_permanently_stalls` above keeps its leader alive, so
+/// the decision reaches every backup regardless of whether hedging ever
+/// activates them -- measured (#125): with the hedge gate's freshness test
+/// removed, that test's activation and decision state is byte-identical to
+/// the unmutated build, because the leader's fast path never advances the
+/// recorders past the backups' own step and the mutated branch is simply
+/// never the deciding one. It cannot detect a permanent stall.
+///
+/// With the leader crashed, a backup's own activation is the only way the
+/// slot can progress, and "no δ, however large, causes a permanent stall"
+/// becomes a claim with something to falsify it.
+///
+/// Falsifier, run: dropping the freshness test in
+/// `Proposer::maybe_activate_after_hedge` (so a proposer defers whenever
+/// the recorders are ahead of it, not only when they *advanced* since its
+/// last check) fails this 8/8 on the assertion below -- the backups defer
+/// against a recorder step that a dead leader left behind and that nothing
+/// will ever move again. That is the permanent stall P15 forbids.
+#[test]
+fn p15_huge_delta_still_decides_when_the_leader_never_delivers() {
+    let n = 5;
+    let seed = 23;
+    let huge_delta = 50_000;
+
+    let mut c = ConcreteCluster::new_with_schedule(
+        seed,
+        SchedulerKind::Oblivious(Box::new(Fifo::new(1))),
+        initial_values(n),
+        Some(NodeId(0)),
+        huge_delta,
+    );
+    c.crash(NodeId(0));
+
+    // Long enough for every live backup's delay to elapse several times
+    // over: the last-ranked live backup sits at `(n-1) * δ`, so anything
+    // past that is schedule-complete, and what remains is whether the
+    // gate ever lets them through.
+    c.run_slot(1_000);
+    c.advance(huge_delta * n as u64 + 50_000);
+
+    assert!(
+        c.all_live_decided(),
+        "huge δ={huge_delta} with a crashed leader: every live replica must \
+         still decide once the schedule has played out -- a δ that large may \
+         cost latency, never liveness (P15)"
+    );
+}
+
 /// A deliberately non-monotonic, per-proposer-misconfigured schedule (not
 /// expressible as `rank * δ` for any single δ) must still decide, as long
 /// as a majority of replicas are alive -- P15/N6 do not carve out an
 /// exception for "sensible" schedules.
+///
+/// Falsifier, run: the freshness-test mutation fails this 8/8 on its own
+/// "must still decide -- P15/N6 violated" assertion. Of the four tests in
+/// this file named for P15, this and
+/// `p15_huge_delta_still_decides_when_the_leader_never_delivers` are the
+/// two that can detect the stall defect; the δ-sweep and the
+/// leader-alive huge-δ test survive it (see their doc comments).
 #[test]
 fn p15_per_proposer_misconfigured_schedule_still_decides() {
     let n = 5;
