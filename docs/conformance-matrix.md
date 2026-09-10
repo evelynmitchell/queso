@@ -114,7 +114,7 @@ space.
 |---|---|---|
 | **P13** Majority progress | `consensus/tests/partition.rs` | tested, power unmeasured |
 | | `consensus/tests/proposer_start_contract.rs` (#13) — re-kicking an *undecided* proposer restarts round 1, so a driver can un-stall one that spent its whole first push partitioned from every quorum — *falsifier: making `start` fully idempotent leaves the replicas parked at their pre-kick step and the rewind assertion fails* | tested, power measured |
-| **P14** Randomized termination | `consensus/tests/termination.rs`, `concrete_termination.rs` — content-oblivious adversary, per A3. *Falsifier, run (#125): **none exists**. Replacing the drawn priority with a constant, at each of the two randomization sites separately, is on-path (both distributions move) and kills **0 of 441** tests in the tree. `mean < 4.0` is one-sided and the defect moves the mean **down**; and under a content-oblivious adversary a deterministic tie-break by `origin` converges as well as a random draw. See §6.13* | tested, power measured — **zero**, structurally |
+| **P14** Randomized termination | `consensus/tests/termination.rs`, `concrete_termination.rs` — content-oblivious adversary, per A3. *Falsifier, run (#125): **none exists**. Replacing the drawn priority with a constant, at each of the two randomization sites separately, is on-path (both distributions move) and kills **0 of 441** tests in the tree. `mean < 4.0` is one-sided and the defect moves the mean **down**; and under a content-oblivious adversary a deterministic tie-break by `origin` converges as well as a random draw. See §6.13. #150 then built the content-aware adversary §6.13 conjectured would detect it: it separates the builds in the **opposite** direction, costing the randomized build rounds and the constant one none — see `consensus/tests/termination_under_targeted_adversaries.rs` and §6.14* | tested, power measured — **zero**, structurally; no falsifier known after a bounded search |
 | | The ≥ ½ per-round bound itself | **assumed** (paper, §4; not independently derived here) |
 | **P15** Timeout-independent liveness | `consensus/tests/hedging.rs` — five tests named for it (δ-sweep, huge δ, per-proposer misconfiguration, no-live-majority, and #125's huge-δ-with-a-dead-leader). *Falsifier, run (#125): dropping the freshness test in `maybe_activate_after_hedge` — a proposer that defers forever behind a frozen recorder step — kills the misconfiguration test and the new crux test 8/8 on their own assertions, and **0/8** the δ-sweep and huge-δ tests. The huge-δ test called itself "P15's crux" and cannot detect a permanent stall: its leader stays alive, so the decision arrives regardless. See §6.13* | tested, power measured — 2 of the 5 named tests carry it |
 | **P16** Leader-failure recovery | `consensus/tests/hedging.rs::p16_…`; `compare/tests/leader_dos.rs` (real cluster, leader isolated). *Falsifier, run (#125): the hedge-gate freshness mutation kills `p16_…` 8/8 on its own first assertion — "small δ did not recover within 300 ticks". With the leader dead, a backup's own activation is the only route to a decision, which is P16's claim exactly* | tested, power measured |
@@ -508,3 +508,52 @@ Two rules make that visible rather than silent:
     a test whose *name* matches it is not evidence about that test; only
     mutation is. Reading the name is how P14's zero, P15's crux and P8a's
     vacuous scenario survived this long.
+
+14. **P14's conjectured falsifier was built, and points the other way**
+    (#150). §6.13 closed by conjecturing that randomization "earns its keep
+    against an adversary that *can* see priorities and schedule on them",
+    and left open whether such an adversary livelocks the constant-priority
+    variant. It was built. It does separate the two builds — in the
+    direction that makes the **randomized** build the slower one.
+
+    Four adversaries, each run against both builds, n ∈ {3,5,7}, 100 seeds
+    per cell, two delay magnitudes (which changed nothing):
+
+    | Adversary | Sees | Real build | Constant-priority (C1) |
+    |---|---|---|---|
+    | hold the top-origin node back | metadata | 1.000 rounds | 1.000 |
+    | …back toward half the cluster | metadata | 1.35–1.41 | **1.000** |
+    | hold a different node back per message | metadata | 1.21–1.33 | **1.000** |
+    | hold the **highest-priority request** back toward half | payload | 1.29–1.43, worst round 4 | **1.000, worst round 1** |
+
+    Not one arm made the mutation slower, which is what a falsifier
+    requires. The mechanism is the same one §6.13 identified, seen from the
+    other side: with equal priorities `Proposal::Ord` still yields a unique
+    maximum in every set, so `best` stays a deterministic function of what a
+    recorder received and convergence needs no unpredictability.
+    Randomization is what lets recorders *disagree* about the maximum, and
+    that disagreement is what costs the extra rounds. It buys safety against
+    an adversary that adapts to the draw — which is exactly what reading
+    priorities off the wire is, and exactly what A3's private channels
+    exclude.
+
+    **One arm looked like a falsifier and was not.** A two-sided *drop*
+    split left C1 undecided in 200/200 seeds — and the unmutated build
+    undecided in 200/200 too. It is a partition that violates P13's
+    "a majority can communicate" precondition, not an exploitation of
+    determinism. It is recorded in the test file because it is the shape of
+    thing that gets written up as a result by someone who does not run the
+    control, and #125's method notes exist to force exactly that step.
+
+    **What this does not establish.** That no adversary separates them. The
+    strategy space is unbounded; this was four strategies, two delay
+    magnitudes, three cluster sizes, one leaderless slot, no crashes, no
+    hedging. Per §6.12's lesson about null results, the honest statement is
+    "no falsifier found within these bounds", never "no falsifier exists".
+    P14's row stays a measured zero.
+
+    Two tests came out of it, pinning the real build's termination under
+    targeted adversaries — coverage nothing else in the tree has, since
+    `fast_path.rs`'s aware adversary targets D1's fast path rather than
+    termination. Their own power against C1 is measured, and it is zero;
+    each says so.

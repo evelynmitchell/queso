@@ -56,10 +56,23 @@
 //!
 //! So: P14's evidence class stays *tested, power unmeasured* -- with the
 //! measurement now done and the answer being "zero, for a structural
-//! reason", not "nobody looked". Whether a content-aware adversary can
-//! actually livelock the constant-priority variant is **unmeasured**; it
-//! is a genuine open question, not a formality, and building that
-//! adversary is tracked separately rather than guessed at here.
+//! reason", not "nobody looked".
+//!
+//! **The conjecture this file used to end on was wrong** (#150). It read:
+//! "randomization earns its keep against an adversary that *can* see
+//! priorities and schedule on them", with whether such an adversary
+//! livelocks the constant-priority variant left open. It was built and
+//! run. It does separate the two builds -- in the direction that makes the
+//! *randomized* build the slower one (mean rounds 1.29–1.43 and a worst
+//! round of 4 at n=7, against 1.000 and round 1 for the constant-priority
+//! build). Three metadata-only adversaries came back the same way. See
+//! `termination_under_targeted_adversaries.rs` for the four arms, the
+//! bounds of the search, and the arm that looked like a falsifier until
+//! its control was run.
+//!
+//! No falsifier for P14 is known. That is *not* the same as none existing:
+//! the strategy space is unbounded and the search was four strategies at
+//! n ∈ {3,5,7}, one slot, no crashes.
 
 use std::collections::BTreeMap;
 
