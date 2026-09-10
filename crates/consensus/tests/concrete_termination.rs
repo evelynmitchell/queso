@@ -28,8 +28,11 @@
 //! randomization makes convergence *faster* here, which is exactly why the
 //! `mean < 4.0` assertion cannot detect it: the bound is one-sided and the
 //! defect moves the statistic the safe way. See `termination.rs`'s module
-//! docs for the full reasoning and for what would be needed to falsify
-//! this property (a content-aware adversary; unmeasured).
+//! docs for the full reasoning. What that file conjectured would falsify
+//! this property -- a content-aware adversary -- was built and run in
+//! #150, and it does the opposite: it costs the *randomized* build rounds
+//! and the constant-priority build nothing. See
+//! `termination_under_targeted_adversaries.rs`.
 
 use std::collections::BTreeMap;
 
