@@ -375,7 +375,10 @@ deployment runbook, comparison writeup, and licensing all landed.
   detect a permanent stall, P8a's exact-duplicate test had no power until
   it was repaired, and P8's power covers one of the several violation
   classes its property admits. Two tests were added and two doc-comment
-  claims withdrawn. **P13 is now the outstanding unmeasured one.** Read §6
+  claims withdrawn. **P13 is since measured too (#152), which leaves no property in the
+  matrix's §§1–3 at *power unmeasured*** — though "measured" spans a wide
+  range of outcomes there, from P16's clean falsifier to P14's structural
+  zero. Read §6
   there rather than this summary; the matrix is the version that gets
   updated.
 

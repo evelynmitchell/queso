@@ -36,6 +36,62 @@
 //! this is a loud panic, not silent divergence -- an acceptable (if noisy)
 //! degradation for a driver that was never designed to be partition-aware.
 
+//! # Detection power for P13 (#152)
+//!
+//! Mutation **Q**: make the quorum rule demand the whole membership
+//! instead of a majority. Safety-preserving by construction (a larger
+//! quorum still intersects), liveness-destroying the moment any replica is
+//! unreachable -- which is exactly the situation this file builds.
+//!
+//! The rule has **two implementations**, and they are measured apart
+//! because `termination.rs` records what happens when they are not
+//! (#125's P14 arm nearly recorded a false zero by mutating the site the
+//! instrument does not execute):
+//!
+//! | Site | Serves | Kills in this file |
+//! |---|---|---|
+//! | `proposer.rs::quorum_threshold` | `ConcreteCluster` (sections 1-3) | **2 of 8**, 8/8 runs |
+//! | `tcast.rs`'s `majority_threshold` | abstract `Cluster` (section 4) | **0 of 8**, 8/8 runs |
+//!
+//! **The concrete site: the progress assertion fires, and it is the right
+//! one.** Both `majority_decides_…` tests die at the "majority replica
+//! never decided under partition" panic -- P13's own claim, not a
+//! neighbouring safety assertion. That was the specific risk #152 flagged,
+//! since `run_majority_minority_then_heal` asserts progress *and* safety in
+//! one body; it did not materialise. Across `queso-consensus` and
+//! `queso-smr` the mutation kills 16 tests, and every one of them except
+//! the three noted below dies on a liveness assertion ("did not decide
+//! within the tick budget" and its variants). The real-node equivalent
+//! fails too: `net/tests/cluster.rs`'s
+//! `cluster_survives_at_its_fault_tolerance_boundary`, on "put must
+//! complete using only the live majority (2 of 3)".
+//!
+//! Three of the 16 are **not** detections and should not be counted as
+//! P13 power: `two_h_proposals.rs`'s two enumeration tests construct
+//! explicit quorums of size 2 at n=3, which the mutation stops being
+//! quorums at all -- their fixtures become invalid rather than their
+//! property failing -- and `tuning.rs`'s leader-targeting test dies at its
+//! own anti-vacuity guard.
+//!
+//! **The abstract site: this file is blind, for a reason worth stating.**
+//! Sections 1-3 drive `ConcreteCluster` and never reach `tcast`. Section 4
+//! does, and its two tests are `#[should_panic(expected = "tcast failed to
+//! converge")]` -- a quorum that can never be gathered produces *that same
+//! panic*, so the mutated and unmutated worlds are observationally
+//! identical there. This is not a missing `expected =` filter; the filter
+//! is present and correct. The defect is caught elsewhere in the crate (7
+//! tests: `tcast`'s own unit tests, abstract agreement/validity/integrity,
+//! and the determinism pair), just not here.
+//!
+//! **One assertion in this file has zero power against Q and is worth
+//! knowing about.** `run_varied_partition_timing`'s `all_live_decided`
+//! check -- the one its own comment calls "a progress bonus check, not the
+//! core safety property" -- survives the concrete mutation 0/8. It heals
+//! before it checks, and once healed a quorum of *n* is satisfiable again,
+//! so it cannot see a rule that demands more than a majority. Only an
+//! assertion made *while the cut is in place* can, which is what
+//! `majority_decides_…` does and why those two are the ones that fire.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use queso_consensus::{Cluster, ConcreteCluster};
@@ -154,6 +210,12 @@ fn run_majority_minority_then_heal(n: u32, seed: u64) {
     }
 }
 
+/// Falsifier, run: inflating `Proposer::quorum_threshold` from a majority
+/// to the whole membership fails this 8/8, on the "majority replica never
+/// decided under partition" panic -- P13's own assertion, while the cut is
+/// still in place. The same mutation at the *abstract* site (`tcast`)
+/// leaves it green; see the module docs for why the two sites are measured
+/// apart.
 #[test]
 fn majority_decides_under_partition_minority_catches_up_after_heal_n3() {
     for seed in 0..SEED_CORPUS_SIZE {
@@ -223,6 +285,12 @@ fn run_varied_partition_timing(n: u32, seed: u64) {
     );
 }
 
+/// Falsifier, run: **survives** the quorum-inflation mutation 0/8 at both
+/// sites. Its `all_live_decided` check runs after the heal, and a healed
+/// cluster can gather a quorum of *n*, so this test cannot detect a
+/// progress rule that demands more than a majority. Its safety assertion
+/// is the load-bearing one; the progress check is a bonus, and measurement
+/// says to read it as one.
 #[test]
 fn no_divergence_under_varied_partition_timing_n3() {
     for seed in 0..TIMING_SEED_CORPUS_SIZE {
