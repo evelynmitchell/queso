@@ -112,7 +112,8 @@ space.
 
 | Property | Verified by | Class |
 |---|---|---|
-| **P13** Majority progress | `consensus/tests/partition.rs` | tested, power unmeasured |
+| **P13** Majority progress | `consensus/tests/partition.rs` — *falsifier, run (#152): inflating the quorum rule from a majority to the whole membership (safety-preserving, liveness-destroying) kills the two `majority_decides_…` tests 8/8, on P13's own "majority replica never decided under partition" assertion. The same mutation at the **abstract** site (`tcast`) leaves this file green 0/8 — sections 1–3 never reach `tcast`, and section 4's `should_panic(expected = "tcast failed to converge")` matches the mutant's panic too. See §6.15* | tested, power measured — for the concrete driver; **zero** for the abstract site |
+| | P13's coverage is much wider than this row used to imply, and the mutation maps it: 16 tests across `queso-consensus` and `queso-smr` (incl. `concrete.rs`'s and `smr/cluster.rs`'s `progresses_with_a_crashed_minority`, `fast_path.rs`'s crashed-leader fallback, `smr/tests/restart_recovery.rs`), plus `net/tests/cluster.rs::cluster_survives_at_its_fault_tolerance_boundary` at the real-node level | tested, power measured |
 | | `consensus/tests/proposer_start_contract.rs` (#13) — re-kicking an *undecided* proposer restarts round 1, so a driver can un-stall one that spent its whole first push partitioned from every quorum — *falsifier: making `start` fully idempotent leaves the replicas parked at their pre-kick step and the rewind assertion fails* | tested, power measured |
 | **P14** Randomized termination | `consensus/tests/termination.rs`, `concrete_termination.rs` — content-oblivious adversary, per A3. *Falsifier, run (#125): **none exists**. Replacing the drawn priority with a constant, at each of the two randomization sites separately, is on-path (both distributions move) and kills **0 of 441** tests in the tree. `mean < 4.0` is one-sided and the defect moves the mean **down**; and under a content-oblivious adversary a deterministic tie-break by `origin` converges as well as a random draw. See §6.13. #150 then built the content-aware adversary §6.13 conjectured would detect it: it separates the builds in the **opposite** direction, costing the randomized build rounds and the constant one none — see `consensus/tests/termination_under_targeted_adversaries.rs` and §6.14* | tested, power measured — **zero**, structurally; no falsifier known after a bounded search |
 | | The ≥ ½ per-round bound itself | **assumed** (paper, §4; not independently derived here) |
@@ -557,3 +558,58 @@ Two rules make that visible rather than silent:
     `fast_path.rs`'s aware adversary targets D1's fast path rather than
     termination. Their own power against C1 is measured, and it is zero;
     each says so.
+
+15. **P13 is measured, and the trap it was flagged for did not fire**
+    (#152). P13 was the last property whose row read *tested, power
+    unmeasured*. The instrument was a quorum rule inflated from a majority
+    to the whole membership — safety-preserving by construction, since a
+    larger quorum still intersects, and liveness-destroying the moment any
+    replica is unreachable.
+
+    | Site | Serves | Kills in `partition.rs` |
+    |---|---|---|
+    | `proposer.rs::quorum_threshold` | `ConcreteCluster` | **2 of 8**, 8/8 runs |
+    | `tcast.rs`'s `majority_threshold` | abstract `Cluster` | **0 of 8**, 8/8 runs |
+
+    **The risk #152 named did not materialise.** `run_majority_minority_
+    then_heal` asserts progress *and* safety in one body — four assertion
+    classes in one test — so a liveness mutation reddening it at a safety
+    assertion would have been a miscount of exactly the kind §6.13 records
+    twice. Both kills land on the "majority replica never decided under
+    partition" panic: P13's own claim, while the cut is still in place.
+    Across the two sim crates the mutation kills 16 tests and all but three
+    die on liveness assertions.
+
+    Three of the 16 are **not** P13 detections and are recorded so nobody
+    counts them: `two_h_proposals.rs`'s two enumeration tests build explicit
+    size-2 quorums at n=3 that the mutation stops being quorums at all
+    (invalid fixtures, not a failing property), and `tuning.rs`'s
+    leader-targeting test dies at its own anti-vacuity guard.
+
+    **The abstract site is a clean zero, and not from sloppiness.**
+    `partition.rs`'s first three sections drive `ConcreteCluster` and never
+    reach `tcast`; its fourth is two `#[should_panic(expected = "tcast
+    failed to converge")]` tests, and a quorum that can never be gathered
+    produces *that same panic*. The `expected =` filter is present and
+    correct — the two worlds are simply observationally identical there.
+    The defect is caught by 7 other tests in the crate. This is the
+    two-site lesson landing the other way up from §6.13's P14: there the
+    artifact was blind to the site it did not execute; here it is blind to
+    a site it does execute, because the observable does not distinguish.
+
+    **One assertion in the file has zero power and now says so.**
+    `run_varied_partition_timing`'s `all_live_decided` check — its own
+    comment already called it "a progress bonus check, not the core safety
+    property" — survives 0/8. It heals before checking, and a healed
+    cluster can gather a quorum of *n*. Only an assertion made while the cut
+    is in place can see this defect.
+
+    **What the measurement changed about the row.** P13's coverage is far
+    wider than the matrix implied: 16 sim tests plus the real-node
+    `cluster_survives_at_its_fault_tolerance_boundary`. The row listed
+    `partition.rs` and the re-kick contract. It now lists what the mutation
+    actually found, which is the useful version — mapping a property to the
+    test whose *name* matches it was the recurring error of §6.13 and
+    §6.14, and this is the same correction applied to the last row.
+
+    With this, **no property in §§1–3 is left at *power unmeasured*.**
