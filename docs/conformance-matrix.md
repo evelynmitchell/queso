@@ -294,8 +294,11 @@ Listed because an unlabelled property is one nobody can audit.
    runs come back empty 39% of the time at that rate, so "no falsifier" was
    a coin flip recorded as a finding. See §6.12 for what the follow-up
    established, including why the rate is low and which assertion is
-   genuinely dead. Nothing in CI re-runs any of this; the counts rot
-   silently.
+   genuinely dead. **Nothing in CI re-ran any of this and the counts rotted
+   silently — until #128**, which registers the exact edit for nine
+   mutations and replays them nightly, with a no-build anchor check on
+   every commit. Thirty-four markers remain unregistered and still rot; see
+   §6.16 and `falsifiers/README.md`.
 
 9. **Measuring P5, P7, P10 and P11 (#113) turned up one zero-power test and
    one structural blind spot.** Both were invisible from outside; the tests
@@ -613,3 +616,45 @@ Two rules make that visible rather than silent:
     §6.14, and this is the same correction applied to the last row.
 
     With this, **no property in §§1–3 is left at *power unmeasured*.**
+
+16. **The recorded counts are now asserted rather than pasted, for nine of
+    43 markers** (#128). §6.8 closed on "the counts rot silently". It is
+    the same defect the TLA+ state counts had before #78 — a number sitting
+    in prose that nothing re-derives — and it gets the same fix:
+    `falsifiers/registry.toml` carries the exact edit for each registered
+    mutation, and `falsifiers/replay.py` applies it and checks the recorded
+    outcome still holds.
+
+    Split by cost, as the TLA+ checks are. `ci.yml` runs `--check-anchors`
+    on every commit: no build, milliseconds, and it asserts each mutation's
+    `find` string still occurs exactly once in its file. That catches the
+    commonest rot — the code moving out from under a mutation nobody
+    re-ran, which is precisely the condition §6.4 records for 3 of the 20
+    markers #114 re-ran. `falsifiers-nightly.yml` does the expensive half.
+
+    **Both directions are asserted.** Each entry names the tests that must
+    still fail *and* controls that must still pass. Without controls a
+    mutation that reddens everything reads as a precise instrument, which
+    is §6.8's mistake in miniature. Four of the nine entries are recorded
+    **zeros** (P8's catch-up staleness, P14's two randomization sites,
+    P13's abstract site): there the claim is that nothing named detects it,
+    and a zero that silently becomes a kill means coverage was added and
+    these docs are now wrong.
+
+    **The checker was itself measured**, since shipping an unmeasured
+    checker here would be the wrong kind of irony. Three negative controls:
+    a `find` pointed at absent text is reported as drift (exit 1); a test
+    added to `expect_fail` that does not fail is reported as `LOST POWER`;
+    a test added to `expect_pass` that does fail is reported as `CONTROL
+    BROKE`. All three fire, with the exit codes CI needs.
+
+    **What is not covered, and why it is not an oversight.** 34 of the 43
+    markers are unregistered — their edit has not been transcribed, and
+    writing one down from prose *without re-running it* would recreate the
+    exact problem this closes. Separately, the genuinely stochastic markers
+    (`9/156`, `41/100`, `7/16`, `3/7`, `5/100`) are excluded on purpose:
+    most recorded counts are deterministic and a single run gates them
+    honestly, but gating a 5.8% rate on one run produces a flaky job that
+    teaches everyone to ignore it. §6.12 warns against reading a null
+    result without its power; the same caution applies to gating on one.
+    Those need a per-entry sample size and tolerance.

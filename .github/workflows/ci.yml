@@ -23,6 +23,15 @@ jobs:
       - name: Cache cargo registry & build artifacts
         uses: Swatinem/rust-cache@v2
 
+      # The cheap half of issue #128. Every registered falsifier mutation
+      # records an exact `find` string; this asserts each still occurs
+      # exactly once in its file. No build, milliseconds -- and it catches
+      # the commonest way a `Falsifier, run:` marker rots, which is the
+      # code moving out from under a mutation nobody re-ran. The expensive
+      # half (actually replaying them) is falsifiers-nightly.yml.
+      - name: falsifier anchors still match
+        run: python3 falsifiers/replay.py --check-anchors
+
       - name: cargo fmt --check
         run: cargo fmt --all --check
 

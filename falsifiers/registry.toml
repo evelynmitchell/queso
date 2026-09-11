@@ -1,0 +1,119 @@
+# Registered falsifier mutations -- see replay.py for what this is and why.
+#
+# Each entry is a mutation that some `Falsifier, run:` marker in `crates/`
+# describes in prose. Prose is not machine-applicable (§6.4 records that 3
+# of 20 re-runs needed their mutation reconstructed first), so the exact
+# edit lives here instead, and `replay.py` applies it verbatim.
+#
+# `expect_fail` is what must still die. `expect_pass` are controls: without
+# them a mutation that reddens everything would read as a precise
+# instrument. An empty `expect_fail` is a recorded **zero** -- the claim is
+# that nothing named detects this, and a new kill is a finding to write up.
+
+[[mutation]]
+id = "p8a-dedup-off"
+property = "P8a"
+issue = 125
+note = "Dedup disabled entirely: every retry re-applies."
+file = "crates/smr/src/kv.rs"
+find = "let is_duplicate = self.last_seq.get(client).is_some_and(|&s| s >= *seq);"
+replace = "let is_duplicate = false;"
+scope = ["-p", "queso-smr", "--test", "idempotency"]
+expect_fail = ["a_late_duplicate_does_not_clobber_a_later_write", "a_reordered_lower_seq_does_not_undo_a_higher_seq_already_applied", "an_exact_retry_of_the_latest_command_does_not_reapply"]
+expect_pass = ["duplicate_reads_agree_and_are_linearizable"]
+
+[[mutation]]
+id = "p8a-gte-to-gt"
+property = "P8a"
+issue = 125
+note = "Off-by-one exempting a client's retry of its own latest command."
+file = "crates/smr/src/kv.rs"
+find = ".is_some_and(|&s| s >= *seq)"
+replace = ".is_some_and(|&s| s > *seq)"
+scope = ["-p", "queso-smr", "--test", "idempotency"]
+expect_fail = ["an_exact_retry_of_the_latest_command_does_not_reapply"]
+expect_pass = ["a_late_duplicate_does_not_clobber_a_later_write", "a_reordered_lower_seq_does_not_undo_a_higher_seq_already_applied", "duplicate_reads_agree_and_are_linearizable"]
+
+[[mutation]]
+id = "p8-checker-vacuous"
+property = "P8"
+issue = 125
+note = "The instrument itself: a checker that accepts every history."
+file = "crates/smr/src/linearizability.rs"
+find = "pub fn is_linearizable(history: &[HistoryOp]) -> bool {\n    let n = history.len();"
+replace = "pub fn is_linearizable(history: &[HistoryOp]) -> bool {\n    return true;\n    #[allow(unreachable_code)]\n    let n = history.len();"
+scope = ["-p", "queso-smr", "--test", "linearizability"]
+expect_fail = ["a_stale_local_read_is_rejected_by_the_checker", "a_causally_ordered_submission_never_ties_a_prior_completion"]
+expect_pass = ["randomized_concurrent_workload_is_linearizable_n3", "randomized_concurrent_workload_is_linearizable_n5", "genuinely_concurrent_submissions_stay_untied_and_the_history_is_still_accepted"]
+
+[[mutation]]
+id = "p8-catchup-skips-apply"
+property = "P8"
+issue = 125
+note = "RECORDED ZERO. A catch-up probe learns the slot into the log but never applies it. A genuine P8 violation that linearizability.rs cannot see, because its workload never crashes a replica."
+file = "crates/smr/src/replica.rs"
+find = "let applied = st.durable.kv.apply(&decided);"
+replace = "let applied = if matches!(attempt.origin, AttemptOrigin::CatchUp) {\n            match &decided {\n                Command::Get { key, .. } => crate::kv::Applied::Get(st.durable.kv.get(*key)),\n                Command::Put { .. } => crate::kv::Applied::PutNew,\n            }\n        } else {\n            st.durable.kv.apply(&decided)\n        };"
+scope = ["-p", "queso-smr", "--test", "linearizability"]
+expect_fail = []
+expect_pass = ["randomized_concurrent_workload_is_linearizable_n3", "randomized_concurrent_workload_is_linearizable_n5", "a_stale_local_read_is_rejected_by_the_checker", "a_causally_ordered_submission_never_ties_a_prior_completion", "genuinely_concurrent_submissions_stay_untied_and_the_history_is_still_accepted"]
+
+[[mutation]]
+id = "p14-constant-priority-concrete"
+property = "P14"
+issue = 125
+note = "RECORDED ZERO. Randomization removed from the concrete driver; the draw is still consumed so the PRNG stream is unchanged."
+file = "crates/consensus/src/proposer.rs"
+find = "    ctx.rng().gen_range(1..H)\n}"
+replace = "    let _discarded = ctx.rng().gen_range(1..H);\n    1\n}"
+scope = ["-p", "queso-consensus", "--test", "concrete_termination"]
+expect_fail = []
+expect_pass = ["randomized_termination_n3", "randomized_termination_n5"]
+
+[[mutation]]
+id = "p14-constant-priority-abstract"
+property = "P14"
+issue = 125
+note = "RECORDED ZERO. Same defect at the abstract driver's own draw site. Measured apart from the concrete one because mutating the wrong site is how a false zero gets recorded (#125)."
+file = "crates/consensus/src/node.rs"
+find = "            let priority: u64 = ctx.rng().gen();"
+replace = "            let _discarded: u64 = ctx.rng().gen();\n            let priority: u64 = 1;"
+scope = ["-p", "queso-consensus", "--test", "termination"]
+expect_fail = []
+expect_pass = ["randomized_termination_n3", "randomized_termination_n5"]
+
+[[mutation]]
+id = "p15-hedge-defers-on-stale-progress"
+property = "P15/P16"
+issue = 125
+note = "Hedge gate defers whenever the recorders are ahead, not only when they advanced: a backup parks forever behind a step a dead leader left behind."
+file = "crates/consensus/src/proposer.rs"
+find = "            Some(step) if step > self.step && Some(step) != self.last_seen_progress"
+replace = "            Some(step) if step > self.step"
+scope = ["-p", "queso-consensus", "--test", "hedging"]
+expect_fail = ["p15_per_proposer_misconfigured_schedule_still_decides", "p15_huge_delta_still_decides_when_the_leader_never_delivers", "p16_leader_failure_recovery_is_gated_by_delta_but_never_lost", "safety_holds_under_hedging_with_adversary_and_crashes"]
+expect_pass = ["p15_delta_sweep_always_makes_progress_and_redundant_effort_shrinks", "p15_huge_delta_eventually_converges_and_never_permanently_stalls"]
+
+[[mutation]]
+id = "p13-quorum-all-concrete"
+property = "P13"
+issue = 152
+note = "Quorum inflated from a majority to the whole membership: safety-preserving, liveness-destroying."
+file = "crates/consensus/src/proposer.rs"
+find = "    fn quorum_threshold(&self) -> usize {\n        self.total_replicas / 2 + 1\n    }"
+replace = "    fn quorum_threshold(&self) -> usize {\n        self.total_replicas\n    }"
+scope = ["-p", "queso-consensus", "--test", "partition"]
+expect_fail = ["majority_decides_under_partition_minority_catches_up_after_heal_n3", "majority_decides_under_partition_minority_catches_up_after_heal_n5"]
+expect_pass = ["no_divergence_under_varied_partition_timing_n3", "no_divergence_under_varied_partition_timing_n5", "safety_holds_with_no_majority_on_either_side_of_a_partition_n4", "safety_holds_with_no_majority_on_either_side_of_a_partition_n6"]
+
+[[mutation]]
+id = "p13-quorum-all-abstract"
+property = "P13"
+issue = 152
+note = "RECORDED ZERO for partition.rs. Its concrete sections never reach tcast, and its abstract pair is should_panic(expected = \"tcast failed to converge\") -- which the mutant also produces."
+file = "crates/consensus/src/tcast.rs"
+find = "    let majority_threshold = total_replicas / 2 + 1;"
+replace = "    let majority_threshold = total_replicas;"
+scope = ["-p", "queso-consensus", "--test", "partition"]
+expect_fail = []
+expect_pass = ["majority_decides_under_partition_minority_catches_up_after_heal_n3", "no_divergence_under_varied_partition_timing_n3", "abstract_cluster_panics_loudly_rather_than_diverging_under_majority_minority_partition"]

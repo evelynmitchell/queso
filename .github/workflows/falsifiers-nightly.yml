@@ -1,0 +1,52 @@
+# Re-measure the recorded falsifier counts, on a timer.
+#
+# `crates/` carries ~43 `Falsifier, run:` markers, each recording a mutation
+# and the kill count it produced at some past commit. Until #128 nothing
+# re-ran any of them: a refactor that quietly removed a test's detection
+# power left its marker still asserting the old number, and the marker is
+# exactly what a later reader -- or a later agent -- treats as established
+# fact. `docs/conformance-matrix.md` §6.8 recorded the problem as "the
+# counts rot silently".
+#
+# This is the same move tlc-nightly.yml made for the TLA+ state counts:
+# turn a pasted number into an asserted one.
+#
+# Split by cost, the same way the TLA+ checks are: `ci.yml` runs
+# `--check-anchors` on every commit (no build, milliseconds), and this
+# workflow replays the mutations for real -- one rebuild each, so it is the
+# wrong shape for a commit gate and the right shape for a schedule.
+#
+# A failure here is not necessarily a bug in the code. It means a recorded
+# measurement no longer describes the tree, which is worth a human look
+# either way: either a test lost power (bad), or it gained some (good, and
+# the docs should say so).
+name: Falsifier replay
+
+on:
+  schedule:
+    # 03:00 UTC daily -- offset from tlc-nightly (05:00) and nightly-soak
+    # (07:00) so the three long workflows never compete for the runner pool.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  replay:
+    name: replay registered falsifier mutations
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Build once up front so the per-mutation rebuilds are incremental;
+      # otherwise the first mutation pays for the whole dependency graph.
+      - name: cargo build
+        run: cargo build --all --tests
+
+      - name: replay
+        run: python3 falsifiers/replay.py --replay
