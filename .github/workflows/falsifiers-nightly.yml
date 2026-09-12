@@ -11,10 +11,18 @@
 # This is the same move tlc-nightly.yml made for the TLA+ state counts:
 # turn a pasted number into an asserted one.
 #
-# Split by cost, the same way the TLA+ checks are: `ci.yml` runs
-# `--check-anchors` on every commit (no build, milliseconds), and this
-# workflow replays the mutations for real -- one rebuild each, so it is the
-# wrong shape for a commit gate and the right shape for a schedule.
+# `ci.yml` runs both checks on every commit: `--check-anchors` before the
+# build (milliseconds) and `--replay` after the test suite is known green.
+#
+# This workflow was originally the *only* place the replay ran, on the
+# reasoning that one rebuild per mutation made it the wrong shape for a
+# commit gate. Its own first scheduled run refuted that: 12 seconds for all
+# nine mutations, against the ~10 minutes estimated -- cheaper than the
+# abstract TLA+ model check that already gates every commit. So the replay
+# moved onto the commit gate too, and this schedule is now the copy that
+# keeps working as the registry grows. Nine entries is not forty-three;
+# when the per-commit cost stops being negligible, the per-commit step is
+# what gets dropped and this one stays.
 #
 # A failure here is not necessarily a bug in the code. It means a recorded
 # measurement no longer describes the tree, which is worth a human look
@@ -33,7 +41,10 @@ jobs:
   replay:
     name: replay registered falsifier mutations
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Measured: 1m40s for the whole job at nine entries (63s of it the
+    # workspace build). Generous headroom for a cold cache and a bigger
+    # registry, without letting a hung job sit for the best part of an hour.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 

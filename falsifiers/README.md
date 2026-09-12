@@ -19,7 +19,50 @@ state counts.
 | | What it does | Cost | Where it runs |
 |---|---|---|---|
 | `--check-anchors` | Every registered mutation's `find` string still occurs **exactly once** in its file | no build, milliseconds | `ci.yml`, every commit |
-| `--replay` | Applies each mutation, runs its scoped tests, asserts the named kills still happen and the named controls still pass | one rebuild per mutation, ~10 min | `falsifiers-nightly.yml`, 03:00 UTC |
+| `--replay` | Applies each mutation, runs its scoped tests, asserts the named kills still happen and the named controls still pass | **12s for all nine** (measured, see below) | `ci.yml` every commit **and** `falsifiers-nightly.yml`, 03:00 UTC |
+
+## What the replay actually costs
+
+When this landed the estimate was "one rebuild per mutation, ~10 minutes",
+and the split between a per-commit anchor check and a nightly replay rested
+on it. The workflow's first scheduled run refuted it: the replay step took
+**12 seconds** for all nine mutations (2026-09-12, run 1; job total 1m40s,
+of which 1m03s was the workspace build).
+
+It is fast because the pre-build warms the cache and each mutation rebuilds
+one small crate against one narrow `--test` target -- not because it skipped
+anything. The run observed every recorded kill (`p15-hedge-defers-on-stale-
+progress` 4, `p13-quorum-all-concrete` 2, and so on); a replay that silently
+did nothing would report `LOST POWER` and exit 1, since most entries assert
+kills that only a real build can produce.
+
+So the replay now runs **per commit as well**, because the argument for
+keeping it off the commit gate was a cost argument and the cost is not
+there. Measured side by side in one `ci.yml` run (2026-09-12, PR #155), at
+nine entries:
+
+| Step | Duration |
+|---|---|
+| `--check-anchors` | 1s |
+| `--replay` | **12s** |
+| `Model-check QuePaxaAbstract` (already a commit gate) | 68s |
+| whole `fmt, clippy, test` job | 2m07s |
+
+The replay is a twelfth of the commit gate's cheapest formal check and about
+9% of the job it sits in. The nightly stays: it is the thing that keeps
+working as the registry grows, and the day the per-commit cost stops being
+negligible, the per-commit step is what gets dropped, not the nightly.
+
+Two caveats on the number. It **varies with the machine** -- the same nine
+mutations take ~28s in a slower dev container, against 12s on the GitHub
+runner -- and it **scales with the registry**: nine entries is not
+forty-three. Both figures are tens of seconds rather than ten minutes,
+which is the part the design rests on; neither is a constant. Re-measure
+before assuming either still holds.
+
+The anchor check is still worth keeping separately, even though a replay
+subsumes it: it fails in milliseconds with a precise message, before the
+build, rather than after it.
 
 The anchor check is the cheap one and catches the commonest rot: code moved out
 from under a mutation, so the recorded edit no longer describes anything. §6.4
