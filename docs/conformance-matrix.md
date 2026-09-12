@@ -635,8 +635,10 @@ Two rules make that visible rather than silent:
     own first run.** The replay was put on a schedule rather than the
     commit gate because "one rebuild per mutation" was estimated at ~10
     minutes. Measured on `falsifiers-nightly.yml` run 1 (2026-09-12): the
-    replay step took **12 seconds** for all nine mutations — cheaper than
-    the abstract TLC check that already gates every commit. Not because it
+    replay step took **12 seconds** for all nine mutations. Measured again
+    side by side in one `ci.yml` run: anchors 1s, replay 12s, TLC's
+    abstract model 68s, whole job 2m07s — so the replay costs a twelfth of
+    the cheapest formal check already on the commit gate. Not because it
     skipped anything: the run observed every recorded kill, and a replay
     that did nothing would report `LOST POWER` and exit 1, since most
     entries assert kills only a real build can produce. So the replay now

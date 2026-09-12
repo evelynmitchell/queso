@@ -38,8 +38,18 @@ kills that only a real build can produce.
 
 So the replay now runs **per commit as well**, because the argument for
 keeping it off the commit gate was a cost argument and the cost is not
-there. At nine entries it is cheaper than the TLA+ abstract-model check that
-already gates every commit. The nightly stays: it is the thing that keeps
+there. Measured side by side in one `ci.yml` run (2026-09-12, PR #155), at
+nine entries:
+
+| Step | Duration |
+|---|---|
+| `--check-anchors` | 1s |
+| `--replay` | **12s** |
+| `Model-check QuePaxaAbstract` (already a commit gate) | 68s |
+| whole `fmt, clippy, test` job | 2m07s |
+
+The replay is a twelfth of the commit gate's cheapest formal check and about
+9% of the job it sits in. The nightly stays: it is the thing that keeps
 working as the registry grows, and the day the per-commit cost stops being
 negligible, the per-commit step is what gets dropped, not the nightly.
 
