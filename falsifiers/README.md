@@ -43,9 +43,12 @@ already gates every commit. The nightly stays: it is the thing that keeps
 working as the registry grows, and the day the per-commit cost stops being
 negligible, the per-commit step is what gets dropped, not the nightly.
 
-Two caveats on the number. It is **one measurement on a warm cache**, and it
-**scales with the registry** -- nine entries is not forty-three. Re-measure
-before assuming it still holds.
+Two caveats on the number. It **varies with the machine** -- the same nine
+mutations take ~28s in a slower dev container, against 12s on the GitHub
+runner -- and it **scales with the registry**: nine entries is not
+forty-three. Both figures are tens of seconds rather than ten minutes,
+which is the part the design rests on; neither is a constant. Re-measure
+before assuming either still holds.
 
 The anchor check is still worth keeping separately, even though a replay
 subsumes it: it fails in milliseconds with a precise message, before the
