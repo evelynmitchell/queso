@@ -52,6 +52,23 @@ jobs:
       - name: cargo test
         run: cargo test --all
 
+      # The other half of #128, and it runs here rather than only nightly
+      # because the cost argument for keeping it off the commit gate did
+      # not survive its own first scheduled run: 12s for all nine
+      # mutations, against the ~10 min estimated. That is cheaper than the
+      # abstract TLC check below.
+      #
+      # It runs *after* `cargo test` deliberately. The replay asserts that
+      # named tests fail under a mutation; against a tree whose tests were
+      # already failing, that reads as a pass. A green baseline first is
+      # what makes the result mean anything.
+      #
+      # `falsifiers-nightly.yml` keeps running it too: that is the copy
+      # that survives the registry growing past the point where this step
+      # is negligible, at which point this step goes and the nightly stays.
+      - name: falsifier replay
+        run: python3 falsifiers/replay.py --replay
+
   # The abstract TLA+ model, checked rather than pasted (issue #78). ~20s
   # of TLC, so it fits the commit gate; the concrete model (~15 min) runs
   # on a schedule in tlc-nightly.yml -- same per-PR/nightly split, and the

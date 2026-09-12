@@ -625,12 +625,27 @@ Two rules make that visible rather than silent:
     mutation, and `falsifiers/replay.py` applies it and checks the recorded
     outcome still holds.
 
-    Split by cost, as the TLA+ checks are. `ci.yml` runs `--check-anchors`
-    on every commit: no build, milliseconds, and it asserts each mutation's
-    `find` string still occurs exactly once in its file. That catches the
-    commonest rot — the code moving out from under a mutation nobody
-    re-ran, which is precisely the condition §6.4 records for 3 of the 20
-    markers #114 re-ran. `falsifiers-nightly.yml` does the expensive half.
+    `ci.yml` runs `--check-anchors` on every commit: no build,
+    milliseconds, and it asserts each mutation's `find` string still occurs
+    exactly once in its file. That catches the commonest rot — the code
+    moving out from under a mutation nobody re-ran, which is precisely the
+    condition §6.4 records for 3 of the 20 markers #114 re-ran.
+
+    **The cost split this was originally built around did not survive its
+    own first run.** The replay was put on a schedule rather than the
+    commit gate because "one rebuild per mutation" was estimated at ~10
+    minutes. Measured on `falsifiers-nightly.yml` run 1 (2026-09-12): the
+    replay step took **12 seconds** for all nine mutations — cheaper than
+    the abstract TLC check that already gates every commit. Not because it
+    skipped anything: the run observed every recorded kill, and a replay
+    that did nothing would report `LOST POWER` and exit 1, since most
+    entries assert kills only a real build can produce. So the replay now
+    runs per commit as well, and the nightly is the copy that keeps working
+    as the registry grows (nine entries is not forty-three; when the
+    per-commit cost stops being negligible, the per-commit step goes and
+    the schedule stays). The estimate is corrected wherever it was written
+    down rather than left to be read as measured — §5's rule applied to a
+    number this matrix itself produced.
 
     **Both directions are asserted.** Each entry names the tests that must
     still fail *and* controls that must still pass. Without controls a
