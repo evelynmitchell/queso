@@ -551,13 +551,42 @@ async fn a_failed_durability_write_stops_the_node() {
 /// replica 0 masks it by holding the value in memory -- is not what the
 /// probe shows.)
 ///
-/// Note what this does *not* establish. Mutation A also makes `is_restart`
-/// false, skipping the restart catch-up pass; given how little state is
-/// discarded, that is the more plausible source of the kills. The two were
-/// not separated, so which dominates is **unmeasured**. A 0/500/2000ms wait
-/// inserted before the reads (n=40 per arm) moved the rate 45%/38%/45%, no
-/// trend -- consistent with catch-up being absent rather than slow, but
-/// only a ~20-point difference would have shown at that n.
+/// **Which of mutation A's two effects does the damage** (#126). A does two
+/// things at `driver.rs`'s boot reload: it discards the reloaded durable
+/// state, *and* it makes `is_restart` false, skipping the restart catch-up
+/// pass. The note that used to sit here guessed the skipped catch-up was
+/// "the more plausible source of the kills". Split into one-effect arms and
+/// measured at n=156 each, twice for the two split arms:
+///
+/// | arm | any failure | never-split |
+/// |---|---|---|
+/// | control, unmutated | 0/156 | 0/156 |
+/// | full A (both effects) | 66/156, 42.3% [34.8, 50.2] | 5/156, 3.2% [1.4, 7.3] |
+/// | **state discarded, catch-up still runs** | **277/312, 88.8% [84.8, 91.8]** | 2/312, 0.6% [0.2, 2.3] |
+/// | **state kept, catch-up skipped** | **0/312** [0, 1.2] | **0/312** [0, 1.2] |
+///
+/// **The guess was wrong.** Skipping catch-up alone breaks nothing this
+/// test can see: 0 failures of any kind in 312 runs. That is not an
+/// underpowered null -- at the 5.8% rate measured for full A, observing
+/// zero in 312 has probability 8e-7. Losing the durable state is what does
+/// the damage.
+///
+/// **And the two effects are not additive**, in the direction nobody would
+/// have guessed: losing state *while still running catch-up* fails 88.8% of
+/// runs, more than double full A's 42.3%, intervals nowhere near
+/// overlapping. Skipping catch-up partially *masks* the damage. Mechanism
+/// **argued, not measured**: a replica that lost its state and then
+/// announces itself as a restart and participates does more harm than one
+/// that lost its state and stays quiet.
+///
+/// **The never-split column above is censored, and cannot settle its own
+/// question.** The loop below checks never-split first per key and the
+/// acknowledged-survival check second, so a run that dies on the latter at
+/// key 0 never reaches the former for keys 1..BURST. Under the
+/// state-discarded arm 89% of runs die that way, so its 2/312 is a lower
+/// bound, not a rate. Attributing full A's 3.2% never-split to one effect
+/// is therefore **still unmeasured**, and separating it would need an arm
+/// whose dominant failure mode does not truncate the loop.
 ///
 /// **The burst-acknowledged check never runs.** Over 60 probed runs
 /// `settled == 0` every time, so `acknowledged` is always empty and the
