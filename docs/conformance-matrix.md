@@ -819,7 +819,7 @@ Two rules make that visible rather than silent:
 
     **What is not claimed.** The two one-line wrappers themselves are still
     uncovered on a path that restarts; closing that needs a restart in the
-    real-process status suite, tracked separately. Recovery time and a
+    real-process status suite, tracked in #159. Recovery time and a
     node's self-observed latency remain unimplemented — §6.11's "tracked
     nowhere" stands for both. And the counters are *volatile*: they answer
     "what has this process done", not "what has this replica ever done",

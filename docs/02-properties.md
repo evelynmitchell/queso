@@ -172,7 +172,7 @@ These improve efficiency/operability. None may be pursued at the expense of B/C.
   publish path.
 
   **Recovery time** and **per-replica self-observed latency** are still not
-  served, and neither is a counter away: recovery time needs a measurement
+  served (#159), and neither is a counter away: recovery time needs a measurement
   point (restart → caught up) that exists nowhere, and the latency that
   `queso_net::metrics::Recorder` records is the bench *client's* view of the
   cluster, not a node's view of itself.

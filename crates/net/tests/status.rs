@@ -40,7 +40,7 @@
 //!   not a per-replica metric a node publishes about itself.
 //!
 //! So D10 is **three of five served**, not done: the matrix row says so,
-//! and the two that remain are tracked separately rather than folded into
+//! and the two that remain are tracked in #159 rather than folded into
 //! this file's claim.
 
 use std::time::Duration;

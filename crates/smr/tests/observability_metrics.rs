@@ -6,7 +6,7 @@
 //! are counted here -- per-slot rounds, fast-path hit rate and proposer
 //! activations -- as the raw counters they are derived from. The other two
 //! (recovery time, per-replica self-observed latency) need a new
-//! measurement point rather than a new counter and are tracked separately;
+//! measurement point rather than a new counter and are tracked in #159;
 //! see `docs/02-properties.md`'s D10 and the matrix's §6.19.
 //!
 //! # What these tests are for, and what they are not
@@ -73,8 +73,8 @@
 //!
 //! What remains uncovered, stated rather than glossed: the two one-line
 //! wrappers themselves, on a path with a restart. Closing that needs a
-//! restart in the real-process status suite, which is tracked separately
-//! rather than claimed here.
+//! restart in the real-process status suite, tracked in #159 rather than
+//! claimed here.
 
 use queso_sim::ids::NodeId;
 use queso_sim::scheduler::{Fifo, SchedulerKind};
