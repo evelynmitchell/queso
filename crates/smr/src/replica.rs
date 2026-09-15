@@ -322,13 +322,24 @@ impl CurrentAttempt {
 ///
 /// # What `decisions` counts, precisely
 ///
-/// Only slots *this replica drove to a decision through its own attempt*,
-/// which is the population the other three counters are about. A replica
-/// also advances its frontier by learning decisions made elsewhere (see
-/// [`SmrNode::begin_catch_up`]); those are visible as `next_slot` moving
-/// without `decisions` moving, and are deliberately not mixed in -- a
-/// fast-path hit rate whose denominator included slots this replica never
-/// proposed for would not mean anything.
+/// Slots this replica *finished its own attempt for*: its own proposal, or
+/// a catch-up probe that learned an already-decided value. That is the
+/// population the other three counters are about, and it is the one that
+/// makes a fast-path hit rate mean something -- a denominator including
+/// slots this replica never attempted would report a rate for decisions it
+/// had no part in. A replica that never proposed reports `0` while the
+/// cluster decides around it.
+///
+/// Within one process lifetime that population coincides with "slots this
+/// replica applied", because `finish_attempt` is the only place a slot is
+/// applied (enumerated: the crate has exactly one `applied_log.push`), so
+/// `decisions` advances in lockstep with `durable.next_slot` -- including
+/// through catch-up, which drives a real attempt per slot. The two separate
+/// only across a restart, where the frontier survives and these counters do
+/// not. That is not a redundancy to collapse: it is the reason a mutation
+/// deriving `decisions` from the frontier is invisible to any test that
+/// never restarts (measured; see
+/// `crates/smr/tests/observability_metrics.rs`'s detection-power section).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NodeMetrics {
     /// Slots this replica drove to a decision through its own attempt.
