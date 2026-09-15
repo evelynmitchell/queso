@@ -380,15 +380,13 @@ Listed because an unlabelled property is one nobody can audit.
     applied. So the state mutation A destroys is nearly nothing — enough to
     explain why destroying it usually changes no answer.
 
-    It stops there deliberately. Mutation A does two things: it discards that
-    (nearly empty) reload, and it makes `is_restart` false, skipping the
-    restart catch-up pass. Given how little state there is, the skipped
-    catch-up is the more plausible source of the kills — but the two were not
-    separated, so which dominates is **unmeasured**, and reading these counts
-    as "durable-state loss is detected at 5.8%" would overstate them. A
-    0/500/2000 ms wait before the reads (n=40 per arm) moved the rate
-    45%/38%/45%, no trend: consistent with catch-up being absent rather than
-    slow, though only a ~20-point difference would have shown at that n.
+    It stopped there deliberately. Mutation A does two things: it discards
+    that (nearly empty) reload, and it makes `is_restart` false, skipping the
+    restart catch-up pass. This entry used to guess that "the skipped
+    catch-up is the more plausible source of the kills", with which dominates
+    left **unmeasured**. #126 split the two apart and measured them, and the
+    guess was wrong — skipping catch-up alone is completely inert. See
+    §6.17.
 
     **One assertion in that test is dead, not unmeasured.** Over 60 probed
     runs the pre-crash bookkeeping had `settled == 0` every time, so
@@ -675,3 +673,52 @@ Two rules make that visible rather than silent:
     teaches everyone to ignore it. §6.12 warns against reading a null
     result without its power; the same caution applies to gating on one.
     Those need a per-entry sample size and tolerance.
+
+17. **§6.12's guess about mutation A was wrong, and the two effects turned
+    out non-additive** (#126). Mutation A does two things at once at
+    `driver.rs`'s boot reload — discards the reloaded durable state, and
+    makes `is_restart` false so the restart catch-up pass is skipped. §6.12
+    reasoned that "given how little state there is, the skipped catch-up is
+    the more plausible source of the kills" and left it unmeasured.
+
+    Split into one-effect arms, n=156 each (the split arms run twice):
+
+    | arm | any failure | never-split |
+    |---|---|---|
+    | control, unmutated | 0/156 | 0/156 |
+    | full A (both effects) | 66/156, 42.3% [34.8, 50.2] | 5/156, 3.2% [1.4, 7.3] |
+    | state discarded, catch-up still runs | **277/312, 88.8% [84.8, 91.8]** | 2/312, 0.6% [0.2, 2.3] |
+    | state kept, catch-up skipped | **0/312** [0, 1.2] | **0/312** [0, 1.2] |
+
+    **Skipping catch-up alone breaks nothing this test can see** — zero
+    failures of any kind in 312 runs. Not an underpowered null: at the 5.8%
+    §6.12 measured for full A, observing zero in 312 has probability 8×10⁻⁷.
+    Losing the durable state is what does the damage, which is the opposite
+    of what was guessed.
+
+    **The effects are not additive, in the unguessable direction.** Losing
+    the state *while still running catch-up* fails 88.8% of runs — more than
+    double full A's 42.3%, intervals nowhere near overlapping. Skipping
+    catch-up partially **masks** the damage. The mechanism (a replica that
+    lost its state and then announces itself as a restart and participates
+    does more harm than one that lost its state and stays quiet) is
+    *argued*, not measured.
+
+    **The original question is still not settled, and now we know why.**
+    The test checks never-split first per key and acknowledged-survival
+    second, so a run dying on the latter at key 0 never reaches the former
+    for the remaining keys. In the state-discarded arm 89% of runs die that
+    way, which censors the never-split observation: its 2/312 is a lower
+    bound, not a rate. So *which effect produces the 3.2% never-split* is
+    **still unmeasured**, and separating it needs an arm whose dominant
+    failure mode does not truncate the loop. Recorded rather than papered
+    over: the headline result here (catch-up is inert) is decisive, and the
+    narrower question the issue asked is not.
+
+    Method note, since this was a stochastic measurement: n, the arms, the
+    outcome measures, the power calculation and the decision rule were all
+    written down **before any arm ran** (§5's rule, applied prospectively
+    rather than as a caveat afterwards). The pre-registered rule said an
+    even split could not be distinguished from a lopsided one at this n, and
+    that a mid-range result must be reported as "not resolvable" rather than
+    as a ratio — which is what the censoring finding required.
