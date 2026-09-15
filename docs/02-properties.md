@@ -156,6 +156,26 @@ These improve efficiency/operability. None may be pursued at the expense of B/C.
   (foundational for debugging and testing).
 - **D10 — Observability.** Metrics for per-slot rounds, fast-path hit rate,
   proposer activations, recovery time, and per-replica latency.
+
+  Status: **three of five served** (#129). `GET /metrics` serves the raw
+  counters `decisions`, `rounds_total`, `fast_path_decisions` and
+  `proposer_activations` — per-slot rounds is `rounds_total / decisions`,
+  the fast-path hit rate is `fast_path_decisions / decisions`, and proposer
+  activations is served directly. Raw counters rather than pre-divided
+  rates, so a scraper keeps the denominator. All four are **volatile and
+  per-process**: a restart zeroes them, exactly as `uptime_secs` restarts,
+  and the population they count is *slots this replica finished its own
+  attempt for* — not slots that merely exist in its log. Evidence:
+  `crates/smr/tests/observability_metrics.rs` (tested, power measured — 8
+  mutations, 8 killed) and `crates/net/tests/status.rs`'s
+  `metrics_endpoint_serves_the_consensus_counters` for the end-to-end
+  publish path.
+
+  **Recovery time** and **per-replica self-observed latency** are still not
+  served (#159), and neither is a counter away: recovery time needs a measurement
+  point (restart → caught up) that exists nowhere, and the latency that
+  `queso_net::metrics::Recorder` records is the bench *client's* view of the
+  cluster, not a node's view of itself.
 - **D11 — Reconfiguration.** Membership can change safely via consensus (Phase 8).
 
 ---

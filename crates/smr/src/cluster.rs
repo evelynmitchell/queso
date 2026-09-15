@@ -590,6 +590,16 @@ impl SmrCluster {
         self.states[&replica].borrow().durable.next_slot
     }
 
+    /// `replica`'s own D10 observability counters (#129) -- see
+    /// [`crate::NodeMetrics`] for what each one counts.
+    ///
+    /// Volatile, unlike [`Self::next_slot`]: a `restart(replica)` resets
+    /// these to zero, which is the behaviour a real process restart has and
+    /// `crate::replica::SmrNode::on_restart` therefore reproduces.
+    pub fn metrics(&self, replica: NodeId) -> crate::NodeMetrics {
+        self.states[&replica].borrow().observability()
+    }
+
     /// `replica`'s recorder state for `slot` (the ISR's `(S, F_c, A_p)`
     /// summary), if that recorder has ever been touched. Test/introspection
     /// only -- used to demonstrate write-before-reply (P12) durability

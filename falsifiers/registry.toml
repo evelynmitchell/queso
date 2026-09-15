@@ -117,3 +117,63 @@ replace = "    let majority_threshold = total_replicas;"
 scope = ["-p", "queso-consensus", "--test", "partition"]
 expect_fail = []
 expect_pass = ["majority_decides_under_partition_minority_catches_up_after_heal_n3", "no_divergence_under_varied_partition_timing_n3", "abstract_cluster_panics_loudly_rather_than_diverging_under_majority_minority_partition"]
+
+[[mutation]]
+id = "d10-drop-decisions"
+property = "D10"
+issue = 129
+note = "The decision counter never increments. The broadest of the #129 mutations: it takes out the denominator every other counter is read against. `expect_pass` is deliberately empty -- all three tests in the file read `decisions`, so this file has no control for it. The control for 'does any #129 mutation simply redden everything' is the other four entries here, each of which leaves named tests passing."
+file = "crates/smr/src/replica.rs"
+find = "        st.metrics.decisions += 1;"
+replace = "        // MUTANT: st.metrics.decisions += 1;"
+scope = ["-p", "queso-smr", "--test", "observability_metrics"]
+expect_fail = ["an_uncontended_cluster_decides_on_the_fast_path", "decisions_counts_slots_this_replica_decided", "a_restart_clears_the_counters"]
+expect_pass = []
+
+[[mutation]]
+id = "d10-fast-path-never-counted"
+property = "D10"
+issue = 129
+note = "A fast-path decision is never recognized as one, so the hit rate reads 0 forever -- the failure mode an `is it <= decisions` invariant alone cannot see."
+file = "crates/smr/src/replica.rs"
+find = "        if attempt.proposer.decided_via_fast_path() {"
+replace = "        if false {"
+scope = ["-p", "queso-smr", "--test", "observability_metrics"]
+expect_fail = ["an_uncontended_cluster_decides_on_the_fast_path", "a_restart_clears_the_counters"]
+expect_pass = ["decisions_counts_slots_this_replica_decided"]
+
+[[mutation]]
+id = "d10-no-restart-reset"
+property = "D10"
+issue = 129
+note = "The counters survive a restart, so they stop being per-process. Only the restart test can see this; the control is that the other two still pass, which is what makes it a precise instrument rather than a broad break."
+file = "crates/smr/src/replica.rs"
+find = "        st.metrics = NodeMetrics::default();"
+replace = "        // MUTANT: st.metrics = NodeMetrics::default();"
+scope = ["-p", "queso-smr", "--test", "observability_metrics"]
+expect_fail = ["a_restart_clears_the_counters"]
+expect_pass = ["an_uncontended_cluster_decides_on_the_fast_path", "decisions_counts_slots_this_replica_decided"]
+
+[[mutation]]
+id = "d10-decisions-from-frontier"
+property = "D10"
+issue = 129
+note = "`decisions` derived from the durable frontier instead of counted. Registered because it is the mutation that measured the one-accessor change: while SmrCluster::metrics and SmrNode::metrics were independent one-line reads, mutating the node's accessor survived every test. It separates from a real count only across a restart, so the restart test is the only one that can kill it -- and the other two passing is the point, not a weakness."
+file = "crates/smr/src/replica.rs"
+find = "    pub(crate) fn observability(&self) -> NodeMetrics {\n        self.metrics\n    }"
+replace = "    pub(crate) fn observability(&self) -> NodeMetrics {\n        NodeMetrics { decisions: self.durable.next_slot, ..self.metrics }\n    }"
+scope = ["-p", "queso-smr", "--test", "observability_metrics"]
+expect_fail = ["a_restart_clears_the_counters"]
+expect_pass = ["an_uncontended_cluster_decides_on_the_fast_path", "decisions_counts_slots_this_replica_decided"]
+
+[[mutation]]
+id = "d10-publish-is-a-noop"
+property = "D10"
+issue = 129
+note = "The counters increment correctly but never reach the wire: publish_consensus stores nothing. This is the half the queso-smr tests structurally cannot see, and the controls are the other three status tests -- the endpoint itself must stay entirely healthy."
+file = "crates/net/src/status.rs"
+find = "        self.decisions.store(metrics.decisions, Ordering::Relaxed);"
+replace = "        // MUTANT: self.decisions.store(metrics.decisions, Ordering::Relaxed);"
+scope = ["-p", "queso-net", "--test", "status"]
+expect_fail = ["metrics_endpoint_serves_the_consensus_counters"]
+expect_pass = ["status_endpoints_report_health_ready_and_metrics", "status_server_survives_malformed_requests", "status_disabled_by_default_still_serves_put_and_get"]

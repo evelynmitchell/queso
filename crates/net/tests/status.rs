@@ -4,43 +4,44 @@
 //! ordinary cluster with no status listener configured behaves exactly like
 //! every other `queso-net` test (see [`status_disabled_by_default_still_serves_put_and_get`]).
 //!
-//! # D10, and what checking it actually found (issue #116)
+//! # D10, and what checking it actually found (issue #116), and what #129
+//! then closed
 //!
 //! This file is the **D10 -- observability** evidence, and nothing named
-//! D10 in `crates/` before this comment. But #116 also asked for something
-//! nobody had done: check the endpoint's fields against the metrics §D
-//! actually names. That check finds a gap, so the mapping alone would have
-//! been misleading.
+//! D10 in `crates/` before the #116 comment this section replaces. #116
+//! asked for something nobody had done: check the endpoint's fields against
+//! the metrics §D actually names. That check found a gap.
 //!
 //! §D names five metrics for D10: **per-slot rounds, fast-path hit rate,
-//! proposer activations, recovery time, and per-replica latency**. `GET
-//! /metrics` serves five fields -- `events_processed`, `next_slot`,
-//! `save_count`, `ready`, `uptime_secs` (see `queso_net::status`'s
-//! `StatusShared`). The intersection is **empty**: not one of the five
-//! named metrics is exposed. (Enumerated by reading both lists, which are
-//! closed and short; not a sampling.)
+//! proposer activations, recovery time, and per-replica latency**. Before
+//! #129, `GET /metrics` served five fields -- `events_processed`,
+//! `next_slot`, `save_count`, `ready`, `uptime_secs` -- and the
+//! intersection with §D's list was **empty**: not one of the five named
+//! metrics was exposed. (Enumerated by reading both lists, which are closed
+//! and short; not a sampling.)
 //!
-//! Where the ingredients stand, since "not exposed" and "not tracked" are
-//! different claims:
+//! #129 served three of the five, as raw counters rather than rates (a
+//! scraper divides; a gauge that pre-divides loses the denominator):
+//! `rounds_total` and `decisions` give per-slot rounds,
+//! `fast_path_decisions` over `decisions` gives the fast-path hit rate, and
+//! `proposer_activations` is the third directly. See
+//! [`metrics_endpoint_serves_the_consensus_counters`] below for the
+//! end-to-end evidence, and `crates/smr/tests/observability_metrics.rs` for
+//! the evidence that the counters count the right population.
 //!
-//! - **fast-path hit rate** and **proposer activations** -- the per-slot
-//!   ingredients exist in `queso_consensus` (`decided_via_fast_path`,
-//!   `activated`) but are neither aggregated into a rate nor published.
-//! - **per-slot rounds** -- a proposer's `step` exists internally; no
-//!   counter derives rounds from it.
+//! The remaining two are **still not served**, and are not a counter away:
+//!
 //! - **recovery time** -- nothing tracks it anywhere (`grep` finds no
-//!   counter).
+//!   counter). It needs a measurement point (restart -> caught up), not an
+//!   increment.
 //! - **per-replica latency** -- `queso_net::metrics` does record latency,
 //!   but it is the *bench client's* `Recorder` (used by `queso-bench`,
 //!   `bench.rs` and `nemesis.rs`), i.e. a client-side view of the cluster,
 //!   not a per-replica metric a node publishes about itself.
 //!
-//! So what this file tests is real and worth having -- an observability
-//! surface, its counters moving, its failure modes -- but it is evidence
-//! that the *endpoint* works, not that D10's metric list is implemented.
-//! The five fields served are a liveness/progress/durability set, which is
-//! a different thing from D10's protocol-behaviour set. The matrix row now
-//! says D10 is **partly implemented** rather than merely unmapped.
+//! So D10 is **three of five served**, not done: the matrix row says so,
+//! and the two that remain are tracked in #159 rather than folded into
+//! this file's claim.
 
 use std::time::Duration;
 
@@ -132,6 +133,113 @@ async fn status_endpoints_report_health_ready_and_metrics() {
     assert_eq!(
         code, 200,
         "expected replica 1's /health to be 200, body: {body:?}"
+    );
+}
+
+/// #129: the three D10 consensus counters `queso_smr` now keeps
+/// (`decisions`, `rounds_total`, `fast_path_decisions`,
+/// `proposer_activations`) reach `GET /metrics` on a real cluster over real
+/// TCP -- not just the in-process `SmrCluster` the `queso-smr` unit tests
+/// read them from.
+///
+/// This is the end-to-end half of the wiring: `SmrNode::metrics()` ->
+/// `driver` -> `StatusShared::publish_consensus` -> `MetricsBody` -> JSON.
+/// The `queso-smr` side (`crates/smr/tests/observability_metrics.rs`) owns
+/// the claim that the counters count the right thing; this owns only the
+/// claim that they are *published*, which is a separate way to be broken
+/// (a counter that increments into a field nobody serves).
+///
+/// The non-leader assertion is the anti-vacuity control: if `/metrics`
+/// served a constant, or the driver published the wrong node's numbers,
+/// every replica would report the same thing.
+///
+/// Measured over 8 consecutive local runs: the leader served
+/// `decisions = rounds_total = fast_path_decisions = proposer_activations
+/// = 3` every time, and replica 1 served `0` for all four every time. The
+/// assertions are deliberately looser than that (`>= 3`, `<` the leader's,
+/// plus the schedule-independent inequalities) because a slower machine
+/// can take a contested round or fire a hedged proposer's activation
+/// timer; pinning the measured values would make this a timing
+/// change-detector rather than a wiring test.
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_endpoint_serves_the_consensus_counters() {
+    let (client_addrs, status_addrs) = spawn_cluster_with_status(3, Some(NodeId(0)));
+    let timeout = Duration::from_secs(10);
+
+    // Before any operation the leader has decided nothing, so all four are
+    // zero -- and they are *present*, which `["decisions"] == 0` would also
+    // be true of if serde omitted the field, hence the explicit `is_u64`.
+    let (code, body) = http_get(status_addrs[0], "/metrics").await;
+    assert_eq!(code, 200);
+    let baseline: serde_json::Value =
+        serde_json::from_str(&body).expect("metrics body is valid JSON");
+    for field in [
+        "decisions",
+        "rounds_total",
+        "fast_path_decisions",
+        "proposer_activations",
+    ] {
+        assert!(
+            baseline[field].is_u64(),
+            "/metrics must serve `{field}`, got: {baseline}"
+        );
+        assert_eq!(
+            baseline[field], 0,
+            "a replica that has decided nothing must report `{field}` as 0, got: {baseline}"
+        );
+    }
+
+    for seq in 0..3u64 {
+        let put = Command::Put {
+            client: ClientId(7),
+            seq,
+            key: 100 + seq as u32,
+            value: seq as i64,
+        };
+        assert_eq!(
+            submit_with_retry(client_addrs[0], &put, timeout).await,
+            Outcome::Put
+        );
+    }
+
+    let (code, body) = http_get(status_addrs[0], "/metrics").await;
+    assert_eq!(code, 200);
+    let after: serde_json::Value = serde_json::from_str(&body).expect("metrics body is valid JSON");
+    let decisions = after["decisions"].as_u64().unwrap();
+    let rounds = after["rounds_total"].as_u64().unwrap();
+    let fast = after["fast_path_decisions"].as_u64().unwrap();
+    let activations = after["proposer_activations"].as_u64().unwrap();
+    assert!(
+        decisions >= 3,
+        "the leader drove three Puts to a decision, so it must report at least \
+         three: {after}"
+    );
+    // The rest are the schedule-independent invariants: a real cluster's
+    // round counts and hedging behaviour are timing outcomes, and pinning
+    // them here would make this a flaky change-detector for the network.
+    assert!(
+        rounds >= decisions,
+        "every decision lands in round >= 1: {after}"
+    );
+    assert!(
+        fast <= decisions,
+        "the fast path is a subset of decisions: {after}"
+    );
+    assert!(
+        activations >= decisions,
+        "a proposer cannot decide without having activated: {after}"
+    );
+
+    // Control: a replica that proposed for nothing must not report the
+    // leader's numbers.
+    let (code, body) = http_get(status_addrs[1], "/metrics").await;
+    assert_eq!(code, 200);
+    let bystander: serde_json::Value =
+        serde_json::from_str(&body).expect("metrics body is valid JSON");
+    assert!(
+        bystander["decisions"].as_u64().unwrap() < decisions,
+        "replica 1 never received a client op, so it cannot have driven as many \
+         slots to a decision as the leader: leader={after} replica1={bystander}"
     );
 }
 

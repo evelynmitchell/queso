@@ -444,6 +444,10 @@ async fn run_node_inner(
             store.save_count(),
             !node.is_catching_up(),
         );
+        // D10 (#129): publish the consensus counters from the same vantage
+        // point, so a scrape landing before the first batch sees an honest
+        // all-zero rather than an absent field.
+        shared.publish_consensus(node.metrics());
 
         // Phase 9.2 (issue #56): fold the chain over whatever this boot
         // reloaded from disk, for the same reason the publish above exists
@@ -612,6 +616,11 @@ async fn run_node_inner(
                 store.save_count(),
                 !node.is_catching_up(),
             );
+            // D10 (#129): same vantage point, same reason as the other
+            // fields -- after persist/flush/ack, so a scrape cannot see a
+            // decision counted for a slot this batch has not yet made
+            // durable.
+            shared.publish_consensus(node.metrics());
 
             // Phase 9.2 (issue #56): fold whatever this batch applied into
             // the Chain-of-Blocks hash and publish any checkpoint it

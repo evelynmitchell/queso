@@ -132,6 +132,20 @@ pub struct StatusShared {
     ready: AtomicBool,
     /// Wall-clock instant this [`StatusShared`] was constructed (i.e. this
     /// replica's driver loop starting up) -- fixed for the process's whole
+    /// This replica's own D10 consensus counters, as most recently
+    /// published by the driver -- see [`queso_smr::NodeMetrics`], which
+    /// defines each one and why they are per-process. Held as four plain
+    /// atomics rather than a lock around the struct for the same reason
+    /// every other field here is an atomic: readers are `/metrics` handler
+    /// tasks that must never be able to block the event loop (see the
+    /// module docs). They are published together and read together, but
+    /// nothing depends on the four being mutually consistent to the
+    /// instant -- a scrape that caught `decisions` one batch ahead of
+    /// `fast_path_decisions` computes a hit rate off by at most one batch.
+    decisions: AtomicU64,
+    rounds_total: AtomicU64,
+    fast_path_decisions: AtomicU64,
+    proposer_activations: AtomicU64,
     /// lifetime, used only to compute `/metrics`' `uptime_secs`.
     started_at: Instant,
     /// Phase 9.2 (issue #56): the Chain-of-Blocks checkpoint table `GET
@@ -167,6 +181,10 @@ impl StatusShared {
             events_processed: AtomicU64::new(0),
             next_slot: AtomicU64::new(0),
             save_count: AtomicU64::new(0),
+            decisions: AtomicU64::new(0),
+            rounds_total: AtomicU64::new(0),
+            fast_path_decisions: AtomicU64::new(0),
+            proposer_activations: AtomicU64::new(0),
             ready: AtomicBool::new(false),
             started_at: Instant::now(),
             chain: checkpoint_every.map(ChainCheckpoints::new),
@@ -193,6 +211,28 @@ impl StatusShared {
         self.next_slot.store(next_slot, Ordering::Relaxed);
         self.save_count.store(save_count, Ordering::Relaxed);
         self.ready.store(ready, Ordering::Relaxed);
+    }
+
+    /// Publish this replica's own D10 consensus counters (#129).
+    ///
+    /// Separate from [`Self::publish`] rather than four more positional
+    /// `u64` parameters on an already four-parameter call: these arrive as
+    /// one already-named struct from [`queso_smr::SmrNode::metrics`], and
+    /// four same-typed positional arguments next to three others is the
+    /// shape that gets transposed silently.
+    ///
+    /// Every field is absolute (the node counts, not the driver), so this
+    /// overwrites rather than accumulating -- unlike `publish`'s
+    /// `events_delta`. That also means it is safe to call after a restart
+    /// within one process: the node's counters reset, and so do these.
+    pub fn publish_consensus(&self, metrics: queso_smr::NodeMetrics) {
+        self.decisions.store(metrics.decisions, Ordering::Relaxed);
+        self.rounds_total
+            .store(metrics.rounds_total, Ordering::Relaxed);
+        self.fast_path_decisions
+            .store(metrics.fast_path_decisions, Ordering::Relaxed);
+        self.proposer_activations
+            .store(metrics.proposer_activations, Ordering::Relaxed);
     }
 
     /// Whether `GET /ready` should currently answer `200` (`true`) or `503`
@@ -238,6 +278,10 @@ impl StatusShared {
             events_processed: self.events_processed.load(Ordering::Relaxed),
             next_slot: self.next_slot.load(Ordering::Relaxed),
             save_count: self.save_count.load(Ordering::Relaxed),
+            decisions: self.decisions.load(Ordering::Relaxed),
+            rounds_total: self.rounds_total.load(Ordering::Relaxed),
+            fast_path_decisions: self.fast_path_decisions.load(Ordering::Relaxed),
+            proposer_activations: self.proposer_activations.load(Ordering::Relaxed),
             ready: self.is_ready(),
             uptime_secs: self.started_at.elapsed().as_secs_f64(),
         };
@@ -258,6 +302,15 @@ struct MetricsBody {
     events_processed: u64,
     next_slot: u64,
     save_count: u64,
+    /// D10's four (#129). Served as counters, not as the "rate" and
+    /// "per-slot" figures `docs/02-properties.md` words them as: a scraper
+    /// divides `fast_path_decisions / decisions` and `rounds_total /
+    /// decisions` over whatever window it wants, where a number computed
+    /// here could only ever be the lifetime average.
+    decisions: u64,
+    rounds_total: u64,
+    fast_path_decisions: u64,
+    proposer_activations: u64,
     ready: bool,
     uptime_secs: f64,
 }
