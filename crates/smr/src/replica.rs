@@ -270,6 +270,85 @@ struct CurrentAttempt {
     command: Command,
     slot: u64,
     proposer: Proposer<Command>,
+    /// Whether this attempt's activation has already been added to
+    /// [`NodeMetrics::proposer_activations`]. A proposer activates at most
+    /// once (`Proposer::activated` is set in `begin_step` and never
+    /// cleared), but [`CurrentAttempt::note_activation`] is called after
+    /// *every* drive point, so without this the same activation would be
+    /// counted once per message the attempt goes on to receive.
+    activated_counted: bool,
+}
+
+impl CurrentAttempt {
+    /// Count this attempt's proposer activation, exactly once, if it has
+    /// activated by now.
+    ///
+    /// Call after every point that can drive the proposer -- `start`,
+    /// `on_response`, `on_timer` -- because a hedged proposer may activate
+    /// at any of them (see `queso_consensus::proposer`'s "Hedging"): at
+    /// `start` if it is the leader or unhedged, at `on_timer` when its
+    /// activation delay expires, and never at all if it sees evidence of
+    /// progress first. Counting only at decision time would miss every
+    /// attempt that activated and was then superseded.
+    fn note_activation(&mut self, metrics: &mut NodeMetrics) {
+        if !self.activated_counted && self.proposer.activated() {
+            self.activated_counted = true;
+            metrics.proposer_activations += 1;
+        }
+    }
+}
+
+/// One replica's own view of its consensus activity (D10): the counters
+/// `docs/02-properties.md`'s D10 names, as observed *by this replica about
+/// itself*.
+///
+/// # Volatile, and per-process by construction
+///
+/// These live in [`ReplicaState`]'s volatile half and [`SmrNode::on_restart`]
+/// clears them, because each is a count of what *this run* of the process
+/// did. That matches how `queso_net::status` serves them: a restarted node
+/// is a new process with a new `StatusShared`, whose `uptime_secs` restarts
+/// at zero for the same reason. A scraper that wants rates across a restart
+/// gets them the usual way, by noticing the counter reset.
+///
+/// # Counters, not rates
+///
+/// D10's text names a "fast-path hit rate" and "per-slot rounds". Both are
+/// served as the raw counters they are derived from --
+/// `fast_path_decisions / decisions` and `rounds_total / decisions` -- so a
+/// scraper can compute either over whatever window it cares about. A
+/// single number baked in here would be a lifetime average, which is the
+/// least useful window of the three.
+///
+/// # What `decisions` counts, precisely
+///
+/// Only slots *this replica drove to a decision through its own attempt*,
+/// which is the population the other three counters are about. A replica
+/// also advances its frontier by learning decisions made elsewhere (see
+/// [`SmrNode::begin_catch_up`]); those are visible as `next_slot` moving
+/// without `decisions` moving, and are deliberately not mixed in -- a
+/// fast-path hit rate whose denominator included slots this replica never
+/// proposed for would not mean anything.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NodeMetrics {
+    /// Slots this replica drove to a decision through its own attempt.
+    /// Denominator for the other three.
+    pub decisions: u64,
+    /// Summed over `decisions`: the round each attempt was in when it
+    /// decided (`step / 4`; see `queso_consensus::proposer`'s threshold
+    /// logical clock, `step = 4 * round + phase`). `rounds_total /
+    /// decisions` is D10's "per-slot rounds", and is `>= 1` whenever
+    /// `decisions > 0`.
+    pub rounds_total: u64,
+    /// Of `decisions`, those that decided on the phase-0 fast path --
+    /// `Proposer::decided_via_fast_path`, i.e. without ever leaving round
+    /// 1's first step.
+    pub fast_path_decisions: u64,
+    /// Attempts whose proposer actually sent a `record` request. Under
+    /// hedging a passive proposer may never activate at all, so this is
+    /// strictly `<=` the number of attempts started, and the gap is the
+    /// thing worth watching: it is how often hedging saved a round trip.
+    pub proposer_activations: u64,
 }
 
 /// The durable half of one replica's state (P9/P12): everything that must
@@ -397,6 +476,9 @@ pub struct ReplicaState {
     /// [`SmrNode::on_catch_up_watchdog`]. Volatile: purely a liveness
     /// bookkeeping aid, not part of what a restart needs to recover.
     watchdog_armed_for: Option<(u64, u64)>,
+    /// D10 observability counters -- see [`NodeMetrics`], which documents
+    /// why these are volatile and exactly what each one counts.
+    pub(crate) metrics: NodeMetrics,
     /// Monotonically increasing generation counter, bumped every time a
     /// catch-up attempt is (re)armed -- including by the watchdog re-issuing
     /// catch-up itself -- so a watchdog firing can recognize whether it is
@@ -425,6 +507,24 @@ pub struct SmrNode {
     /// `leader_policy` is `LeaderPolicy::Tuned`; harmlessly unused
     /// otherwise.
     pub(crate) local_step: Rc<Cell<u64>>,
+}
+
+impl ReplicaState {
+    /// The D10 observability counters, read the one way everything reads
+    /// them.
+    ///
+    /// Both public accessors -- [`SmrNode::metrics`] (what `queso-net`'s
+    /// driver publishes to `GET /metrics`) and
+    /// `crate::cluster::SmrCluster::metrics` (what the simulator's tests
+    /// read) -- go through this, so a defect in *how* the counters are read
+    /// has one place to live rather than two, and the sim tests' restart
+    /// scenario covers the same code the real driver runs. Without it the
+    /// two paths were independent one-line reads and only one of them had a
+    /// restart test; see `crates/smr/tests/observability_metrics.rs`'s
+    /// detection-power section for the mutant that measured the difference.
+    pub(crate) fn observability(&self) -> NodeMetrics {
+        self.metrics
+    }
 }
 
 impl SmrNode {
@@ -605,6 +705,17 @@ impl SmrNode {
         )
     }
 
+    /// This replica's own D10 observability counters, as a snapshot -- see
+    /// [`NodeMetrics`] for what each counts and why they are volatile.
+    ///
+    /// Shaped like [`Self::next_slot`]: a cheap read a driver can call once
+    /// per batch to publish (`queso_net::driver` does exactly that, into
+    /// the `GET /metrics` body). Returns a copy rather than a borrow so no
+    /// caller can hold the `RefCell` across a `Node` callback.
+    pub fn metrics(&self) -> NodeMetrics {
+        self.state.borrow().observability()
+    }
+
     /// Submit `command`, tagged `op_id`, as a fresh client-visible
     /// operation this replica should propose -- mirrors
     /// [`crate::cluster::SmrCluster::submit`]'s enqueue-then-kick logic
@@ -710,12 +821,15 @@ impl SmrNode {
         }
         self.leader_policy.note_attempt_start(slot, ctx.now());
         proposer.start(ctx);
-        st.current_attempt = Some(CurrentAttempt {
+        let mut attempt = CurrentAttempt {
             origin: AttemptOrigin::Op(op.op_id),
             command: op.command,
             slot,
             proposer,
-        });
+            activated_counted: false,
+        };
+        attempt.note_activation(&mut st.metrics);
+        st.current_attempt = Some(attempt);
     }
 
     /// Rejoin as a learner after a restart (P12's rejoin policy): start (or
@@ -776,12 +890,15 @@ impl SmrNode {
         }
         self.leader_policy.note_attempt_start(slot, ctx.now());
         proposer.start(ctx);
-        st.current_attempt = Some(CurrentAttempt {
+        let mut attempt = CurrentAttempt {
             origin: AttemptOrigin::CatchUp,
             command,
             slot,
             proposer,
-        });
+            activated_counted: false,
+        };
+        attempt.note_activation(&mut st.metrics);
+        st.current_attempt = Some(attempt);
         self.arm_catch_up_watchdog(st, ctx, slot);
     }
 
@@ -898,6 +1015,18 @@ impl SmrNode {
             "an attempt always targets the current frontier -- P7 gap-free application"
         );
 
+        // D10 observability (see `NodeMetrics`), recorded here because this
+        // is the one place a slot this replica proposed for is known to
+        // have decided, and `attempt.proposer` is still in hand to say
+        // *how*. `step / 4` is the round it decided in -- the threshold
+        // logical clock's `step = 4 * round + phase`, with round 1's first
+        // step at 4, so a fast-path decision contributes exactly 1.
+        st.metrics.decisions += 1;
+        st.metrics.rounds_total += attempt.proposer.step() / 4;
+        if attempt.proposer.decided_via_fast_path() {
+            st.metrics.fast_path_decisions += 1;
+        }
+
         let applied = st.durable.kv.apply(&decided);
         st.durable.applied_log.push(decided.clone());
         st.durable.next_slot += 1;
@@ -1009,9 +1138,15 @@ impl Node<ConcreteMsg<Command>> for SmrNode {
             }
             ConcreteMsg::Response(resp) => {
                 let mut st = self.state.borrow_mut();
+                // Reborrow as a plain `&mut ReplicaState` so the field
+                // borrows below (`current_attempt` and `metrics`) are seen
+                // as disjoint; going through `RefMut`'s `DerefMut` each
+                // time would borrow the whole struct instead.
+                let st = &mut *st;
                 let decided = match st.current_attempt.as_mut() {
                     Some(attempt) if attempt.slot == resp.slot => {
                         attempt.proposer.on_response(from, resp, ctx);
+                        attempt.note_activation(&mut st.metrics);
                         attempt.proposer.decided().cloned()
                     }
                     // Either idle, or this reply targets a slot we've since
@@ -1021,7 +1156,7 @@ impl Node<ConcreteMsg<Command>> for SmrNode {
                     _ => None,
                 };
                 if let Some(decided_command) = decided {
-                    self.finish_attempt(&mut st, decided_command, ctx);
+                    self.finish_attempt(st, decided_command, ctx);
                 }
             }
         }
@@ -1044,11 +1179,16 @@ impl Node<ConcreteMsg<Command>> for SmrNode {
             self.on_catch_up_watchdog(&mut st, ctx);
             return;
         }
+        let st = &mut *st;
         if let Some(attempt) = st.current_attempt.as_mut() {
             // A retry timer for the live attempt's current step. Retries
             // never decide by themselves (only `on_response`'s quorum check
-            // does), so there is nothing to chain afterward.
+            // does), so there is nothing to chain afterward -- but a hedged
+            // proposer's *activation* delay fires here, so this is the one
+            // drive point where a previously-passive attempt starts
+            // talking (see `CurrentAttempt::note_activation`).
             attempt.proposer.on_timer(timer_id, ctx);
+            attempt.note_activation(&mut st.metrics);
         }
     }
 
@@ -1088,6 +1228,13 @@ impl Node<ConcreteMsg<Command>> for SmrNode {
         let mut st = self.state.borrow_mut();
         st.queue.clear();
         st.current_attempt = None;
+        // D10 counters are per-process observability, not recoverable state
+        // (see [`NodeMetrics`]): a real restart is a new process with a
+        // fresh `queso_net::status::StatusShared`, so clearing them here is
+        // what keeps the in-process model faithful to it. Done before
+        // `begin_catch_up` so the probe's own activation, if it activates,
+        // is counted against the new lifetime rather than lost.
+        st.metrics = NodeMetrics::default();
         self.begin_catch_up(&mut st, ctx);
     }
 }
