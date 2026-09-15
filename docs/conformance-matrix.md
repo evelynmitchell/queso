@@ -103,7 +103,7 @@ space.
 | **P11** Safety under > f crashes | `smr/tests/log_safety.rs::log_safety_holds_even_without_a_live_majority` — **had measured-zero power until #113** (§6.9): it crashed the majority before submitting anything, so every log was empty and the assertion was vacuous. It now decides a prefix first, asserts that prefix is non-empty, and asserts no further slot decides after quorum is lost; all three P5/P7 mutations now fail it | tested, power measured |
 | | `consensus/tests/partition.rs` | tested, power unmeasured |
 | **P12** Restart safety | `net/tests/durability_faults.rs` (#39) — four real-process fault tests. *Falsifiers, run (§6.8 and the file's "Detection power" docs): disabling the boot-time reload fails the torn-snapshot test 8/8 and the rolling-restart test 8/8, and leaves the disk-full test passing 8/8; swallowing the persist error fails the disk-full test 8/8* | tested, power measured (3 of the 4 tests) |
-| | The fourth, `an_unacknowledged_write_is_lost_or_kept_but_never_split`, dies 41/100 under the reload mutation. Re-measured in #115: **5/100 of those are the never-split assertion itself** (9/156 pooled, 5.8%, Wilson 95% CI [3.1%, 10.6%]), 36/100 the separate "an acknowledged write must survive" check, and 0 the burst-acknowledged check, which is structurally dead. The earlier "never-split has no falsifier" reading came from 16 runs; at 5.8% those come back empty 39% of the time | never-split: tested, **power measured** (low). Burst-acknowledged: **measured zero**, mechanically. See §6.8, §6.12 |
+| | The fourth, `an_unacknowledged_write_is_lost_or_kept_but_never_split`, dies 41/100 under the reload mutation. Re-measured in #115: **5/100 of those are the never-split assertion itself** (9/156 pooled, 5.8%, Wilson 95% CI [3.1%, 10.6%]), 36/100 the separate "an acknowledged write must survive" check, and 0 the burst-acknowledged check, which never ran and has since been deleted (#127). The earlier "never-split has no falsifier" reading came from 16 runs; at 5.8% those come back empty 39% of the time | never-split: tested, **power measured** (low). Burst-acknowledged: **measured zero** over 100/100 runs, then removed. See §6.8, §6.12, §6.18 |
 | | `net/tests/persist_fidelity.rs` (#83), `group_commit.rs`; `smr/tests/{restart_recovery,restart_agreement}.rs` | tested, power unmeasured (except `restart_agreement.rs`, above) |
 
 ---
@@ -166,8 +166,11 @@ measured power for the observer even where the protocol row cannot.
 
 ## 6. What building this matrix found
 
-Nine things, all of them labelling or coverage gaps rather than suspected bugs.
-Listed because an unlabelled property is one nobody can audit.
+Eighteen things, all of them labelling, coverage or measurement defects rather
+than suspected bugs in the algorithm. Listed because an unlabelled property is
+one nobody can audit. (The count said "nine" until #127; items 10–18 were
+appended without updating it, which is the same class of stale number this
+section exists to catch.)
 
 1. **P17 now has a test that names it** (#116, was: nothing named it). It
    asserts non-interference rather than termination, which is the distinction
@@ -388,13 +391,12 @@ Listed because an unlabelled property is one nobody can audit.
     guess was wrong — skipping catch-up alone is completely inert. See
     §6.17.
 
-    **One assertion in that test is dead, not unmeasured.** Over 60 probed
-    runs the pre-crash bookkeeping had `settled == 0` every time, so
-    `acknowledged` is always empty and the burst-acknowledged branch never
-    executes. That follows mechanically from the test's own 5 ms window
-    against a 10–15 ms write, and gets *more* certain on a slower machine.
-    Left as-is deliberately: retuning the window would move the scenario the
-    5.8% was measured on.
+    **One assertion in that test was dead, not unmeasured — #127 removed
+    it.** Over 60 probed runs the pre-crash bookkeeping had `settled == 0`
+    every time, so `acknowledged` was always empty and the
+    burst-acknowledged branch never executed. #127 re-measured (40 more
+    runs, still 0, for **100/100**) and replaced the mechanical argument
+    with a measurement. See §6.18.
 
     **Two probes returned a false zero before either result was trusted**,
     the same trap as §6.9's and worth stating in its own right. One printed
@@ -722,3 +724,52 @@ Two rules make that visible rather than silent:
     even split could not be distinguished from a lopsided one at this n, and
     that a mid-range result must be reported as "not resolvable" rather than
     as a ratio — which is what the censoring finding required.
+
+18. **The dead assertion §6.12 found is gone, and the margin that killed it
+    is now measured** (#127). §6.12 recorded that
+    `durability_faults.rs`'s burst-acknowledged branch —
+    `if acknowledged.contains(&key) { assert_eq!(answers[0], …) }` — never
+    executed, because `settled == 0` in all 60 probed runs. That reproduced:
+    40 further runs, still 0, for **100/100, Wilson 95% CI [0, 3.7%]**.
+
+    **The mechanism was an argument; it is a measurement now.** §6.12
+    explained the deadness as "a 5 ms window against a 10–15 ms write",
+    which is an *argued* premise about latency that nothing here had
+    measured. Running the burst unchanged but without the crash: the 8
+    writes complete in **9.1–30.0 ms (n=96, median 18.1), and none of the 96
+    inside 5 ms** — the fastest was 1.8× the window. So the branch was dead
+    by **timing margin, not by construction**, which is the distinction that
+    decides what to do about it: hardware quick enough to finish a burst
+    write inside 5 ms would reach it — whether any exists is not measured
+    here — so this was never "unreachable code" that a compiler or a reader
+    could rule out. It also corrects §6.12's direction-of-travel remark —
+    "gets *more* certain on a slower machine" is right, but the converse is
+    what mattered and went unsaid.
+
+    **It was deleted rather than revived, and the reason is measured too.**
+    Nothing the branch would have checked was ever checked, so the deletion
+    removes no coverage that existed. The property it was written for — a
+    write acknowledged *shortly* before the crash survives it — is already
+    checked in the same test by
+    the key-1 assertion, which is not merely live but a **known falsifier**
+    (mutation A fires there, 36/100 in §6.12's table). And key 1 is
+    acknowledged **6.4–7.8 ms before the kill (n=15, median 7.6)**, a
+    *tighter* margin than the ≥9.1 ms the dead branch could ever have
+    achieved. So the deletion removes a duplicate of an existing check, not
+    a gap. Retuning the window instead would have moved the scenario the
+    5.8% and §6.17's four arms were measured on.
+
+    **The falsifier survives the deletion, checked rather than assumed.**
+    Removing code that never ran cannot change a run it never ran in — but
+    that is an argument, and the cheap version of the check was available:
+    mutation A against the post-deletion test kills **24/40 (60%, Wilson
+    95% CI [44.6, 73.7])**, 23 on the key-1 assertion and 1 on never-split.
+    Both live assertions still fire. The rate sits above §6.12's 41/100
+    ([31.9, 50.8]) with the intervals overlapping, if barely, on a
+    different container; a weakened test would kill *less*, not more, so
+    this is not evidence of damage, and 1 never-split kill in 40 is
+    unremarkable at 5.8% (P(≥1) ≈ 0.91).
+
+    **Evidence class:** the 100/100, the latency distributions and the
+    post-deletion falsifier run are *measured*; that no machine anywhere
+    reaches the branch is **not** claimed — the opposite is, explicitly.

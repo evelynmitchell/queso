@@ -121,17 +121,22 @@
 //! of roughly 20 percentage points would have shown, so a smaller real
 //! effect is not excluded.
 //!
-//! **The burst-acknowledged assertion is not merely unmeasured -- it is
-//! dead here.** Probing the pre-crash bookkeeping over 60 runs found
-//! `settled == 0` every time: no write in the burst is ever acknowledged
-//! before the crash, so `acknowledged` is always empty and the
-//! `if acknowledged.contains(&key)` branch never executes. That is
-//! measured-zero power for a mechanical reason, not an unlucky sample. It
-//! follows from the test's own design (a 5ms window against a 10-15ms
-//! write); that it gets *more* certain on a slower machine is this test's
-//! own reasoning, quoted in the burst comment below, not something measured
-//! here. Left as-is rather than retuned: retuning the window would change
-//! the scenario the 9/156 above was measured on.
+//! **The burst-acknowledged assertion was not merely unmeasured -- it was
+//! dead, and #127 removed it.** Probing the pre-crash bookkeeping found
+//! `settled == 0` in **100/100 runs** (60 at #115, 40 re-measured at
+//! #127): no write in the burst was ever acknowledged before the crash, so
+//! `acknowledged` was always empty and the `if acknowledged.contains(&key)`
+//! branch never executed. Measured-zero power for a mechanical reason, not
+//! an unlucky sample -- and the mechanism is measured now rather than
+//! inferred from the window: without the crash the 8 burst writes take
+//! **9.1-30.0ms (n=96, median 18.1ms)**, none inside the 5ms window, the
+//! fastest 1.8x it. So it was dead by timing margin, not by construction.
+//!
+//! It was deleted rather than revived because the property it was written
+//! for is already checked in the same test, by a live assertion that is a
+//! known falsifier, against a write acknowledged 6.4-7.8ms before the kill
+//! -- a tighter margin than the branch could have had. Test 3's doc
+//! comment carries the numbers and the reasoning.
 //!
 //! Test 1's eight kills all landed on the assertion above, never on the
 //! `ENOENT` at the snapshot read that issue #111 describes -- worth saying,
@@ -531,7 +536,7 @@ async fn a_failed_durability_write_stops_the_node() {
 /// |---|---|
 /// | the separate "an acknowledged write must survive" check below | 36 |
 /// | **never split** -- this test's subject | **5** |
-/// | the burst-acknowledged check | 0, and structurally so |
+/// | the burst-acknowledged check | 0 -- it never ran; removed in #127 |
 ///
 /// **Never-split has a falsifier.** Pooled over 156 runs it is 9, i.e.
 /// 5.8%, Wilson 95% CI [3.1%, 10.6%], reporting e.g. `replicas disagree
@@ -588,13 +593,41 @@ async fn a_failed_durability_write_stops_the_node() {
 /// is therefore **still unmeasured**, and separating it would need an arm
 /// whose dominant failure mode does not truncate the loop.
 ///
-/// **The burst-acknowledged check never runs.** Over 60 probed runs
-/// `settled == 0` every time, so `acknowledged` is always empty and the
-/// `if acknowledged.contains(&key)` branch is dead. Measured-zero power for
-/// a mechanical reason, and it follows from this test's own 5ms window
-/// against a 10-15ms write, so a slower machine makes it deader. Left
-/// as-is: retuning the window would change the scenario the numbers above
-/// were measured on.
+/// **The burst-acknowledged check is gone (#127); this is what it was, so
+/// that nobody re-adds it.** The per-key loop below used to carry an
+/// `if acknowledged.contains(&key) { assert_eq!(answers[0], ...) }`,
+/// meant to check that a write acknowledged *moments* before the crash
+/// survived it. It did not execute in any of the 100 runs anyone has
+/// probed. `acknowledged` was populated only from writes already finished
+/// at the 5ms snapshot, and `settled == 0` in **100/100 runs** -- 60 at
+/// #115, 40 re-measured at #127 -- so the set was always empty. Wilson 95%
+/// CI on that zero: [0, 3.7%].
+///
+/// The mechanism is measured now, not inferred from the window. Run
+/// unchanged but without the crash, the 8 burst writes complete in
+/// **9.1-30.0ms (n=96, median 18.1ms), and none of the 96 inside 5ms** --
+/// the fastest was 1.8x the window. So the branch was dead by *timing
+/// margin*, not by construction: hardware quick enough to finish a burst
+/// write inside 5ms would reach it, and whether any exists is not measured
+/// here. It is deleted rather than left in place precisely because that
+/// distinction is invisible to a reader, who would otherwise count it as
+/// coverage.
+///
+/// **Deleting it removes no coverage that existed** -- the branch never
+/// ran, so nothing it would have checked was ever checked -- **and the
+/// property it aimed at is checked here anyway, live and closer to the
+/// crash.** The key-1 assertion at
+/// the end of this test (`an acknowledged write must survive the crash
+/// regardless`) is a *measured* falsifier: it is the assertion mutation A
+/// fires on, 36/100 in the table above. And key 1 is acknowledged
+/// **6.4-7.8ms before the kill (n=15, median 7.6ms)** -- a tighter margin
+/// than the >=9.1ms the burst branch would have needed. The
+/// recently-acknowledged case the dead branch was written for is the case
+/// that check already covers, deterministically rather than by race.
+///
+/// The window was deliberately not retuned to revive the branch: that
+/// would move the scenario the 9/156 and §6.17's tables were measured on,
+/// in order to duplicate a check that already exists.
 ///
 /// One mutation that does **not** work, recorded so it is not retried:
 /// clearing `kv` in `from_durable` (restore the frontier, forget the state
@@ -636,20 +669,18 @@ async fn an_unacknowledged_write_is_lost_or_kept_but_never_split() {
     tokio::time::sleep(Duration::from_millis(5)).await;
 
     // Snapshot which writes the client had heard back about *before* the
-    // crash -- those, and only those, the cluster promised to keep.
+    // crash. Measured at 0 of 8 in 100/100 runs (see the doc comment), so
+    // this feeds the anti-vacuity check below and nothing else: the branch
+    // that once consumed it could never run, and is gone (#127).
     let settled: Vec<bool> = in_flight.iter().map(|h| h.is_finished()).collect();
     cluster.kill(1);
     cluster.kill(2);
 
-    let mut acknowledged: Vec<u32> = Vec::new();
-    for (k, handle) in in_flight.into_iter().enumerate() {
-        if settled[k] {
-            if let Ok(Ok(Outcome::Put)) = handle.await {
-                acknowledged.push(10 + k as u32);
-            }
-        } else {
-            handle.abort();
-        }
+    // Nothing here reads their results -- the point of the burst is writes
+    // whose fate the client never learned. `abort` on an already-finished
+    // task is a no-op, so this is correct whether or not any settled.
+    for handle in in_flight {
+        handle.abort();
     }
 
     // Anti-vacuity: this test is about writes whose fate the client never
@@ -684,13 +715,6 @@ async fn an_unacknowledged_write_is_lost_or_kept_but_never_split() {
             "replicas disagree about key {key}: {answers:?} -- an unacknowledged write \
              is free to be lost or kept, but not to be both"
         );
-        if acknowledged.contains(&key) {
-            assert_eq!(
-                answers[0],
-                Some(200 + k as i64),
-                "key {key} was acknowledged before the crash and must have survived it"
-            );
-        }
     }
 
     // The acknowledged write from before is not free to vanish.
