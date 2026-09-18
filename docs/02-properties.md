@@ -157,7 +157,7 @@ These improve efficiency/operability. None may be pursued at the expense of B/C.
 - **D10 — Observability.** Metrics for per-slot rounds, fast-path hit rate,
   proposer activations, recovery time, and per-replica latency.
 
-  Status: **three of five served** (#129). `GET /metrics` serves the raw
+  Status: **five of five served** (#129, #159). `GET /metrics` serves the raw
   counters `decisions`, `rounds_total`, `fast_path_decisions` and
   `proposer_activations` — per-slot rounds is `rounds_total / decisions`,
   the fast-path hit rate is `fast_path_decisions / decisions`, and proposer
@@ -171,11 +171,42 @@ These improve efficiency/operability. None may be pursued at the expense of B/C.
   `metrics_endpoint_serves_the_consensus_counters` for the end-to-end
   publish path.
 
-  **Recovery time** and **per-replica self-observed latency** are still not
-  served (#159), and neither is a counter away: recovery time needs a measurement
-  point (restart → caught up) that exists nowhere, and the latency that
-  `queso_net::metrics::Recorder` records is the bench *client's* view of the
-  cluster, not a node's view of itself.
+  **Recovery time** and **per-replica self-observed latency** (#159) needed
+  a measurement point rather than a counter, and each needed its interval
+  *chosen* — the candidates do not measure the same thing, so the interval
+  is part of the metric's definition, not an implementation detail:
+
+  - `restarted` and `recovery_secs` — from the driver's restart branch
+    (immediately before `on_restart`, which starts the catch-up probe) to
+    the first publish at which `SmrNode::is_catching_up()` reads false.
+    This is **this boot's rejoin**, recorded once and never updated; it is
+    *not* a claim that the replica had caught up with everything the
+    cluster had decided by then, which is the same bound `GET /ready`
+    states and for the same reason. `recovery_secs` is `null` when this
+    process has measured no recovery, and `restarted` is what separates
+    "never restarted" from "restarted, still catching up".
+  - `client_ops_completed`, `client_latency_micros_total` and
+    `client_latency_micros_max` — from this replica decoding a client's
+    command off its socket to dispatching that operation's `Outcome`,
+    which includes its own inbox queueing, the op queue, the consensus
+    round trips and the write-before-reply fsync. A node's view of
+    *itself*; `queso_net::metrics::Recorder`'s histograms remain the bench
+    *client's* view of the cluster, and both are worth having. The
+    denominator is client operations this replica answered — **not**
+    `decisions`' population, so the two must not be divided into each
+    other.
+
+  Both are volatile and per-process, like the four counters. Evidence:
+  `crates/net/tests/status.rs`'s
+  `metrics_endpoint_serves_the_self_observed_latency` and
+  `a_real_process_restart_resets_the_counters_and_reports_a_recovery_time`
+  (tested, power measured — 8 mutations, 7 killed; the eighth is a measured
+  zero whose reason is structural, recorded in that file and in the
+  matrix's §6.20).
+
+  What "five of five served" does **not** claim: that these are the right
+  five metrics to expose. That is this section's question, and nothing
+  above answers it.
 - **D11 — Reconfiguration.** Membership can change safely via consensus (Phase 8).
 
 ---
