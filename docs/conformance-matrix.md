@@ -159,7 +159,7 @@ measured power for the observer even where the protocol row cannot.
 | **D7** Tunable read freshness | Not implemented (a doc mention in `smr/src/linearizability.rs` only) | not implemented |
 | **D8** Transactions / CAS | Not implemented | not implemented |
 | **D9** Reproducibility | `sim/tests/reproducibility.rs` (the Phase-0 acceptance gate: seed → byte-identical trace); `consensus/tests/{determinism,concrete_determinism}.rs`; enforced by `clippy.toml`'s ban on `Instant::now`, `SystemTime`, threads, `thread_rng`, `HashMap`/`HashSet` | tested + **lint-enforced** |
-| **D10** Observability | `net/tests/status.rs` covers the status/metrics endpoint and names D10 (#116). #116 enumerated §D's five metrics against the endpoint's fields and found the intersection **empty**. #129 closed three of the five: `/metrics` now serves `decisions`, `rounds_total`, `fast_path_decisions` and `proposer_activations` (raw counters — per-slot rounds and the fast-path hit rate are ratios a scraper computes), volatile per-process, counting only slots this replica finished its own attempt for. Recovery time and per-replica self-observed latency remain unserved and need a measurement point, not a counter | endpoint: tested. §D's metric list: **three of five implemented** (`smr/tests/observability_metrics.rs`, tested/power measured — 8 mutations, 8 killed; `status.rs`'s `metrics_endpoint_serves_the_consensus_counters` for the publish path). Remaining two: **not implemented** (enumerated, both lists closed) |
+| **D10** Observability | `net/tests/status.rs` covers the status/metrics endpoint and names D10 (#116). #116 enumerated §D's five metrics against the endpoint's fields and found the intersection **empty**; #129 served three (`decisions`, `rounds_total`, `fast_path_decisions`, `proposer_activations` — per-slot rounds and the fast-path hit rate are ratios a scraper computes), and #159 served the last two, each of which needed a measurement point and an interval *chosen*: `restarted`/`recovery_secs` (restart → this boot's catch-up finishing, first-write-wins) and `client_ops_completed`/`client_latency_micros_total`/`..._max` (client command decoded → `Outcome` dispatched). All are volatile and per-process; the two denominators count different populations and must not be divided into each other | endpoint: tested. §D's metric list: **five of five implemented** (`smr/tests/observability_metrics.rs`, tested/power measured — 8 mutations, 8 killed; `status.rs`'s `metrics_endpoint_serves_the_consensus_counters`, `..._self_observed_latency` and `a_real_process_restart_resets_the_counters_and_reports_a_recovery_time`, tested/power measured — 8 mutations, 7 killed, the eighth a measured zero with a structural reason, §6.20) |
 | **D11** Reconfiguration | Not implemented (Phase 8 stretch; a doc mention in `smr/src/lib.rs` only) | not implemented |
 
 ---
@@ -192,9 +192,11 @@ reminder.)
    listed only four, omitting the last) share **no** field with what
    `/metrics` actually serves. So "real coverage that is not mapped" was the
    wrong description of D10: the endpoint is well tested, and D10's metric
-   list is unimplemented. See the D10 row and §6.11. **Three of the five are
-   implemented as of #129** — see §6.19, which supersedes this item's
-   "unimplemented" for those three and leaves it standing for the other two.
+   list is unimplemented. See the D10 row and §6.11. **All five are
+   implemented as of #159** — three by #129 (§6.19) and the last two by
+   #159 (§6.20), which together supersede this item's "unimplemented"
+   entirely. What stands from it is the finding itself: the check nobody
+   had run is what found the gap.
 4. **Most core safety rests on model-checking plus tests of unmeasured power.**
    `grep -rn "Falsifier[,:]" crates/ --include=*.rs` finds 39 markers in 14
    files (23 in 9 before #112, then #114's re-runs, #113's two new ones, and
@@ -365,10 +367,14 @@ reminder.)
     genuinely well tested — this finding is about what it serves, not whether
     it works.
 
-    **Three of the five have since been served** (#129, §6.19). The two
-    "not tracked anywhere" entries of this item — recovery time, and a
-    node's self-observed latency — are the two that remain; the enumeration
-    above is otherwise superseded.
+    **All five have since been served** — three by #129 (§6.19), and this
+    item's two "not tracked anywhere" entries, recovery time and a node's
+    self-observed latency, by #159 (§6.20). The separation this item drew
+    is what predicted the shape of the work: the three that only needed
+    aggregating took one issue, and the two that needed a *measurement
+    point* needed an interval chosen before anything could be counted at
+    all. The enumeration above is superseded as a statement of what is
+    served; it is kept as the record of a distinction that held up.
 
 12. **A "no falsifier" finding was itself underpowered, and did not survive
     re-measurement** (#115). §6.8 recorded that the never-split assertion in
@@ -824,3 +830,75 @@ Two rules make that visible rather than silent:
     nowhere" stands for both. And the counters are *volatile*: they answer
     "what has this process done", not "what has this replica ever done",
     which is what makes a restart zero them by design rather than by bug.
+
+    *(All three of those gaps are addressed by #159; see §20. The
+    volatility is unchanged — it was a design choice, not a gap.)*
+
+20. **D10's last two metrics needed an interval chosen, not a counter
+    added — and the restart test that closed §19's coverage gap does not
+    test what the issue that asked for it assumed** (#159).
+
+    §19 left three things open. Two were unimplemented metrics; the third
+    was that `SmrCluster::metrics` and `SmrNode::metrics` were still
+    uncovered on a path that restarts. All three are closed, and the third
+    is closed differently from how #159 worded it.
+
+    **The intervals are the deliverable.** Neither remaining metric was a
+    counter away, and for each the candidate intervals #159 listed measure
+    different things:
+
+    - *Recovery time* (`restarted`, `recovery_secs`): from the driver's
+      restart branch — immediately before `on_restart`, which starts the
+      catch-up probe — to the first publish at which `is_catching_up()`
+      reads false. The other two candidates were rejected for stated
+      reasons: "frontier reaches the cluster's frontier" needs a
+      cluster-wide fact `StatusShared::is_ready`'s docs already say a
+      replica cannot honestly know, and "first client op served after the
+      restart" would report minutes for a millisecond rejoin on an idle
+      cluster. The number therefore inherits `is_ready`'s bound verbatim:
+      it is the boot-time rejoin finishing, **not** a claim of having
+      caught up with everything the cluster had decided.
+    - *Self-observed latency* (`client_ops_completed`,
+      `client_latency_micros_total`, `..._max`): from decoding a client's
+      command off this replica's socket to dispatching that operation's
+      `Outcome` — #159's second candidate. Its denominator is *client
+      operations this replica answered*, which is **not** `decisions`'
+      population (that one includes catch-up probes and excludes client
+      ops served elsewhere), so the two must not be divided into each
+      other. Both intervals are stated on the fields themselves rather
+      than in a commit message, because a latency whose interval is
+      unstated is the defect, not the absence of the number.
+
+    **Detection power, measured.** Eight mutations, each applied to a
+    clean tree, scored against `cargo test -p queso-net --lib --test
+    status --no-fail-fast`; control (unmutated) passes all 83. **7 of 8
+    killed.** Six are registered in `falsifiers/registry.toml` so
+    `replay.py` re-measures them; the full table is in
+    `crates/net/tests/status.rs`'s module docs rather than duplicated
+    here.
+
+    **The eighth is a measured zero, and it refutes the issue's own
+    assumption.** #159 asked for a real-process restart asserting "the
+    counters are back at zero while `next_slot` is preserved" — wording
+    that reads as testing `on_restart`'s counter reset. It does not, and
+    cannot: a real restart is a *new process*, whose `SmrNode` is built by
+    `from_durable` (`ReplicaState { durable, ..Default::default() }`), so
+    the counters start at zero whatever `on_restart` does. Deleting that
+    reset survives all 83 tests in this scope (measured, not argued), and
+    the in-process sim test remains its only killer. The reset is what
+    keeps the *sim* faithful to the real process, not the other way round.
+
+    **What the new test does establish**, measured: `decisions` silently
+    derived from the durable frontier — killed by no test in `queso-net`
+    before it, killed by it now. That is §19's surviving-mutant result
+    reaching the *published* path, which is the coverage §19 said was
+    missing. The reason it needs a restart is unchanged and enumerated:
+    `decisions` and `next_slot` advance in lockstep within one process
+    lifetime, because `finish_attempt` holds the crate's only
+    `applied_log.push`.
+
+    **Evidence class:** *tested, power measured* for the five served
+    metrics and both new measurement points; *measured zero* for the
+    `on_restart` reset on this scope, with a mechanism read from
+    `from_durable` rather than inferred from the zero. That D10's five are
+    the *right* five to expose is §D's question and is not claimed here.

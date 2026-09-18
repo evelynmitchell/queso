@@ -100,6 +100,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// budget.
 pub const MAX_STATUS_CONNECTIONS: usize = 128;
 
+/// [`StatusShared::recovery_micros`]'s "not measured" sentinel. `u64::MAX`
+/// microseconds is ~584,000 years, so no interval this process can actually
+/// observe collides with it; [`StatusShared::note_recovery`] saturates just
+/// below it rather than wrapping, so not even a pathological clock can make
+/// a measured recovery read as an absent one.
+const RECOVERY_UNSET: u64 = u64::MAX;
+
 /// The `Send + Sync` status snapshot [`crate::driver::run_node`] publishes
 /// once per event-loop iteration and every status HTTP handler reads from.
 /// Every field is a plain atomic: cheap to update on the driver's own
@@ -130,8 +137,6 @@ pub struct StatusShared {
     save_count: AtomicU64,
     /// See [`Self::is_ready`] for the precise, honest meaning.
     ready: AtomicBool,
-    /// Wall-clock instant this [`StatusShared`] was constructed (i.e. this
-    /// replica's driver loop starting up) -- fixed for the process's whole
     /// This replica's own D10 consensus counters, as most recently
     /// published by the driver -- see [`queso_smr::NodeMetrics`], which
     /// defines each one and why they are per-process. Held as four plain
@@ -146,6 +151,91 @@ pub struct StatusShared {
     rounds_total: AtomicU64,
     fast_path_decisions: AtomicU64,
     proposer_activations: AtomicU64,
+    /// Whether this process reloaded durable state at boot and therefore
+    /// ran `queso_smr::SmrNode::on_restart` (#159) -- i.e. whether
+    /// [`Self::recovery`] is a measurement this process can ever make.
+    ///
+    /// A cold boot (nothing on disk to reload) reports `false` for its
+    /// whole lifetime, and its recovery time is `null` because there was
+    /// nothing to recover -- not because a recovery is still running.
+    /// Without this flag those two states are the same `null`, and a
+    /// scraper would be left inferring the difference from `ready`, which
+    /// answers a different question (see [`Self::is_ready`]).
+    restarted: AtomicBool,
+    /// D10's **recovery time** (#159), in microseconds, or
+    /// [`RECOVERY_UNSET`] while unmeasured.
+    ///
+    /// **The interval, stated.** From the driver entering its restart
+    /// branch -- immediately before `queso_smr::SmrNode::on_restart`,
+    /// which is what starts the catch-up probe -- to the first publish at
+    /// which `queso_smr::SmrNode::is_catching_up()` reads `false`. That is
+    /// the first of the three candidate intervals #159 lists, and it is
+    /// picked because it is the only one this process can measure without
+    /// asking a question it has no way to ask: the second (this replica's
+    /// frontier reaching the *cluster's* frontier as of the restart) needs
+    /// a cluster-wide fact [`Self::is_ready`]'s docs already explain a
+    /// replica cannot honestly know, and the third (the first client
+    /// operation served after the restart) is dominated by how long a
+    /// client happens to wait before calling, so an idle cluster would
+    /// report a recovery time of minutes for a rejoin that took
+    /// milliseconds.
+    ///
+    /// **What it therefore claims, and what it does not.** It is this
+    /// boot's rejoin: how long this process took to finish the catch-up
+    /// its own restart started. It is *not* a claim that this replica had
+    /// caught up with everything the cluster had decided by the time it
+    /// stopped -- the bound [`Self::is_ready`] states applies here
+    /// verbatim, for the same reason, since this is measured off the same
+    /// signal.
+    ///
+    /// Later re-entries into catch-up are deliberately excluded (the
+    /// quiescence watchdog can re-issue it; see `queso_smr::replica`'s
+    /// docs): the write is first-wins, so this stays "this boot's rejoin"
+    /// rather than silently becoming "the most recent catch-up", which is
+    /// a different metric wearing the same name. Volatile and per-process,
+    /// exactly like the four counters above.
+    recovery_micros: AtomicU64,
+    /// D10's **per-replica self-observed latency** (#159), as the two
+    /// numbers a scraper needs in order to take a mean over a window of
+    /// its own choosing -- a count and summed microseconds -- plus this
+    /// process's high-water mark. Same reasoning as the counters above: an
+    /// average computed here could only ever be the lifetime one.
+    ///
+    /// **The interval, stated.** From this replica decoding a client's
+    /// command off its client socket (`crate::client::serve_one_client`,
+    /// which stamps it into `crate::driver::Event::ClientSubmit`) to the
+    /// driver dispatching that operation's `Outcome` back to the
+    /// connection task waiting to write it. It *includes* the time the
+    /// submission sat in the driver's inbox, the time the operation spent
+    /// queued behind this replica's one in-flight attempt, the consensus
+    /// round trips, and the write-before-reply fsync. It excludes exactly
+    /// the two socket edges either side: the frame read that precedes the
+    /// stamp, and the response write that follows the dispatch.
+    ///
+    /// That is #159's *second* candidate ("receive -> reply for client
+    /// requests it served"), not its first ("submit -> decide for slots
+    /// this replica drove"). The queueing the first would exclude is the
+    /// half worth seeing -- it is where a loaded node actually spends its
+    /// time, and a node's view of itself that hid it would be strictly
+    /// less useful than the bench client's view, which does not.
+    ///
+    /// **Do not divide this count by `decisions`.** They count different
+    /// populations: `client_ops_completed` counts client operations this
+    /// replica answered; `decisions` counts slots it finished an attempt
+    /// for, which includes catch-up probes no client asked for and
+    /// excludes client operations that reached the cluster through
+    /// another replica.
+    client_ops_completed: AtomicU64,
+    client_latency_micros_total: AtomicU64,
+    /// Lifetime high-water mark, not a windowed maximum: a scraper can
+    /// difference a monotone counter but cannot recover a windowed max
+    /// from one, so this is labelled a lifetime figure rather than left to
+    /// read as "recent". It is deliberately the cheap half of what a
+    /// histogram would give; `crate::metrics::Recorder`'s hdrhistogram is
+    /// the other half, from the client's side of the same operations.
+    client_latency_micros_max: AtomicU64,
+    /// Wall-clock instant this [`StatusShared`] was constructed (i.e. this
+    /// replica's driver loop starting up) -- fixed for the process's whole
     /// lifetime, used only to compute `/metrics`' `uptime_secs`.
     started_at: Instant,
     /// Phase 9.2 (issue #56): the Chain-of-Blocks checkpoint table `GET
@@ -185,6 +275,11 @@ impl StatusShared {
             rounds_total: AtomicU64::new(0),
             fast_path_decisions: AtomicU64::new(0),
             proposer_activations: AtomicU64::new(0),
+            restarted: AtomicBool::new(false),
+            recovery_micros: AtomicU64::new(RECOVERY_UNSET),
+            client_ops_completed: AtomicU64::new(0),
+            client_latency_micros_total: AtomicU64::new(0),
+            client_latency_micros_max: AtomicU64::new(0),
             ready: AtomicBool::new(false),
             started_at: Instant::now(),
             chain: checkpoint_every.map(ChainCheckpoints::new),
@@ -235,6 +330,59 @@ impl StatusShared {
             .store(metrics.proposer_activations, Ordering::Relaxed);
     }
 
+    /// Record that this process booted from reloaded durable state and is
+    /// therefore about to run a restart catch-up (#159). Called once, from
+    /// the driver's restart branch, before `on_restart` -- see
+    /// [`Self::recovery`] and the `restarted` field's docs for why "did
+    /// this process restart at all" is published separately from the
+    /// interval itself.
+    pub fn note_restart(&self) {
+        self.restarted.store(true, Ordering::Relaxed);
+    }
+
+    /// Record this boot's recovery interval unless one is already
+    /// recorded, returning whether this call was the one that recorded it.
+    ///
+    /// First-write-wins, not last: the driver re-checks the catch-up flag
+    /// on *every* publish, so a plain store would overwrite this on every
+    /// subsequent iteration, and a later watchdog-driven catch-up would
+    /// overwrite it again -- turning "this boot's rejoin" into "the most
+    /// recent catch-up" without the name changing. See
+    /// `recovery_micros`' docs for the interval this measures.
+    pub fn note_recovery(&self, elapsed: Duration) -> bool {
+        // Saturate one below the sentinel: an interval that somehow
+        // overflowed `u64` microseconds must still read as *measured*,
+        // however implausible its value, rather than as "never recovered".
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(RECOVERY_UNSET - 1);
+        self.recovery_micros
+            .compare_exchange(RECOVERY_UNSET, micros, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// This boot's measured recovery interval, or `None` when this process
+    /// has not measured one -- which covers both "never restarted" and
+    /// "restarted, still catching up". Those two are distinguished by
+    /// `restarted`, served alongside it on `/metrics`.
+    pub fn recovery(&self) -> Option<Duration> {
+        match self.recovery_micros.load(Ordering::Relaxed) {
+            RECOVERY_UNSET => None,
+            micros => Some(Duration::from_micros(micros)),
+        }
+    }
+
+    /// Record one client operation this replica served, over the interval
+    /// the `client_ops_completed` field's docs define (#159). Called from
+    /// the driver's own task, at the point each `Outcome` is dispatched to
+    /// the connection task waiting to write it.
+    pub fn note_client_op(&self, latency: Duration) {
+        let micros = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
+        self.client_ops_completed.fetch_add(1, Ordering::Relaxed);
+        self.client_latency_micros_total
+            .fetch_add(micros, Ordering::Relaxed);
+        self.client_latency_micros_max
+            .fetch_max(micros, Ordering::Relaxed);
+    }
+
     /// Whether `GET /ready` should currently answer `200` (`true`) or `503`
     /// (`false`).
     ///
@@ -282,13 +430,19 @@ impl StatusShared {
             rounds_total: self.rounds_total.load(Ordering::Relaxed),
             fast_path_decisions: self.fast_path_decisions.load(Ordering::Relaxed),
             proposer_activations: self.proposer_activations.load(Ordering::Relaxed),
+            restarted: self.restarted.load(Ordering::Relaxed),
+            recovery_secs: self.recovery().map(|d| d.as_secs_f64()),
+            client_ops_completed: self.client_ops_completed.load(Ordering::Relaxed),
+            client_latency_micros_total: self.client_latency_micros_total.load(Ordering::Relaxed),
+            client_latency_micros_max: self.client_latency_micros_max.load(Ordering::Relaxed),
             ready: self.is_ready(),
             uptime_secs: self.started_at.elapsed().as_secs_f64(),
         };
-        // `MetricsBody` is four integers, a bool, and a finite non-negative
-        // float -- there is no value this type can hold that
+        // `MetricsBody` is integers, bools, and two finite non-negative
+        // floats -- there is no value this type can hold that
         // `serde_json::to_string_pretty` rejects (the only failure mode is
-        // non-finite floats, and `Instant::elapsed` can't produce one).
+        // non-finite floats, and neither `Instant::elapsed` nor
+        // `Duration::as_secs_f64` over a measured interval can produce one).
         serde_json::to_string_pretty(&body)
             .expect("MetricsBody contains no non-finite floats to reject")
     }
@@ -311,6 +465,22 @@ struct MetricsBody {
     rounds_total: u64,
     fast_path_decisions: u64,
     proposer_activations: u64,
+    /// D10's remaining two (#159), which needed a measurement point rather
+    /// than a counter -- see [`StatusShared`]'s `recovery_micros` and
+    /// `client_ops_completed` field docs, which state the two intervals
+    /// precisely. `recovery_secs` is `null` whenever this process has not
+    /// measured one; `restarted` is what separates "never restarted" from
+    /// "restarted, still catching up".
+    restarted: bool,
+    recovery_secs: Option<f64>,
+    /// Count and summed microseconds, so a scraper can difference two
+    /// scrapes into a windowed mean; `client_latency_micros_max` is a
+    /// lifetime high-water mark. `client_ops_completed` is **not** a
+    /// subset of `decisions` and the two must not be divided into each
+    /// other -- see the field docs for the populations.
+    client_ops_completed: u64,
+    client_latency_micros_total: u64,
+    client_latency_micros_max: u64,
     ready: bool,
     uptime_secs: f64,
 }
@@ -683,6 +853,118 @@ mod tests {
         assert_eq!(parsed["save_count"], 1);
         assert_eq!(parsed["ready"], true);
         assert!(parsed["uptime_secs"].as_f64().unwrap() >= 0.0);
+    }
+
+    /// A process that never restarted must report `restarted: false` and a
+    /// `null` recovery time -- not `0`, which would read as "recovered
+    /// instantly" and put a fabricated data point into every scrape of
+    /// every cold-booted replica in the cluster (#159).
+    #[test]
+    fn a_process_that_never_restarted_reports_no_recovery_time() {
+        let status = StatusShared::new();
+        assert_eq!(status.recovery(), None);
+        let (_, _, body) = route("/metrics", &status);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(parsed["restarted"], false);
+        assert!(
+            parsed["recovery_secs"].is_null(),
+            "a cold boot has no recovery interval to report, got: {parsed}"
+        );
+    }
+
+    /// The two states that share a `null` recovery time are told apart by
+    /// `restarted`: this one has restarted and has *not* finished catching
+    /// up, which a scraper must be able to distinguish from a cold boot
+    /// without inferring it from `ready` (a different question -- see
+    /// [`StatusShared::is_ready`]).
+    #[test]
+    fn a_restart_still_catching_up_is_distinguishable_from_a_cold_boot() {
+        let status = StatusShared::new();
+        status.note_restart();
+        let (_, _, body) = route("/metrics", &status);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(parsed["restarted"], true);
+        assert!(parsed["recovery_secs"].is_null(), "{parsed}");
+    }
+
+    /// Recovery time is this boot's *first* catch-up, and the driver calls
+    /// the recorder on every publish (the catch-up signal is a level, not
+    /// an edge -- see `crate::driver::note_recovery_if_complete`). So the
+    /// first write must win and every later one must be a no-op, including
+    /// the ones a watchdog-driven catch-up would produce much later in the
+    /// process's life.
+    #[test]
+    fn recovery_time_records_the_first_measurement_and_ignores_later_ones() {
+        let status = StatusShared::new();
+        status.note_restart();
+        assert!(status.note_recovery(Duration::from_millis(40)));
+        assert!(!status.note_recovery(Duration::from_millis(900)));
+        assert!(!status.note_recovery(Duration::from_millis(1)));
+        assert_eq!(status.recovery(), Some(Duration::from_millis(40)));
+        let (_, _, body) = route("/metrics", &status);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert!(
+            (parsed["recovery_secs"].as_f64().unwrap() - 0.040).abs() < 1e-9,
+            "{parsed}"
+        );
+    }
+
+    /// A recovery of exactly zero must still read as *measured*. The
+    /// sentinel is `u64::MAX` rather than `0` precisely so that this case
+    /// -- a catch-up that completed within the measurement's resolution --
+    /// is not reported as "never recovered".
+    #[test]
+    fn a_zero_length_recovery_is_still_a_measurement() {
+        let status = StatusShared::new();
+        status.note_restart();
+        assert!(status.note_recovery(Duration::ZERO));
+        assert_eq!(status.recovery(), Some(Duration::ZERO));
+        let (_, _, body) = route("/metrics", &status);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(parsed["recovery_secs"].as_f64().unwrap(), 0.0);
+    }
+
+    /// The latency triple is a count, a sum, and a lifetime maximum -- the
+    /// three numbers a scraper needs to take a windowed mean and to see the
+    /// worst case. The sum must accumulate (so two scrapes difference into
+    /// a window) and the max must not decay when a faster operation
+    /// follows a slower one.
+    #[test]
+    fn client_latency_accumulates_and_keeps_a_high_water_mark() {
+        let status = StatusShared::new();
+        status.note_client_op(Duration::from_micros(300));
+        status.note_client_op(Duration::from_micros(1_700));
+        status.note_client_op(Duration::from_micros(500));
+        let (_, _, body) = route("/metrics", &status);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(parsed["client_ops_completed"], 3);
+        assert_eq!(parsed["client_latency_micros_total"], 2_500);
+        assert_eq!(
+            parsed["client_latency_micros_max"], 1_700,
+            "a faster operation after a slower one must not lower the high-water mark: {parsed}"
+        );
+    }
+
+    /// A replica that has served no client operation reports zeros, not
+    /// absent fields -- the same anti-vacuity point the #129 counters make:
+    /// `["client_ops_completed"] == 0` would also hold of a field serde
+    /// never serialized.
+    #[test]
+    fn a_replica_that_served_nothing_reports_zeroed_latency_fields() {
+        let status = StatusShared::new();
+        let (_, _, body) = route("/metrics", &status);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        for field in [
+            "client_ops_completed",
+            "client_latency_micros_total",
+            "client_latency_micros_max",
+        ] {
+            assert!(
+                parsed[field].is_u64(),
+                "/metrics must serve `{field}`, got: {parsed}"
+            );
+            assert_eq!(parsed[field], 0, "{parsed}");
+        }
     }
 
     #[test]

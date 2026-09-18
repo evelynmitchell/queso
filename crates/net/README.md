@@ -216,11 +216,32 @@ Three endpoints, `GET` only:
   `docs/deploy-flyio.md`), not a linearizability guarantee. See
   `src/status.rs`'s module docs for the full reasoning.
 - **`GET /metrics`** -- a small pretty-printed JSON document of counters
-  this replica actually tracks: `events_processed` (total dispatched
-  events since boot), `next_slot` (current log frontier), `save_count` (the
-  real, always-on fsync count from `queso_net::persist::Store::save_count`
-  -- not the test-only `NodeConfig::save_counter`), `ready` (same bool
-  `/ready` reports), and `uptime_secs`.
+  this replica actually tracks. The driver-level ones: `events_processed`
+  (total dispatched events since boot), `next_slot` (current log frontier),
+  `save_count` (the real, always-on fsync count from
+  `queso_net::persist::Store::save_count` -- not the test-only
+  `NodeConfig::save_counter`), `ready` (same bool `/ready` reports), and
+  `uptime_secs`. Then `docs/02-properties.md`'s D10 metrics, all of them
+  **volatile and per-process** -- this boot, not this replica's history:
+  - `decisions`, `rounds_total`, `fast_path_decisions`,
+    `proposer_activations` (#129), as raw counters rather than pre-divided
+    rates, so a scraper keeps the denominator: per-slot rounds is
+    `rounds_total / decisions`, the fast-path hit rate is
+    `fast_path_decisions / decisions`.
+  - `restarted` and `recovery_secs` (#159) -- whether this process booted
+    from reloaded durable state, and how long its restart catch-up took.
+    `null` when there is no measurement, which `restarted` separates from
+    "still catching up".
+  - `client_ops_completed`, `client_latency_micros_total`,
+    `client_latency_micros_max` (#159) -- this node's view of its *own*
+    latency serving clients (the bench client's view lives in
+    `queso_net::metrics`). Count and sum, so a scraper differences two
+    scrapes into a windowed mean; the max is a lifetime high-water mark.
+
+  Each D10 field's exact interval and population is stated on the
+  corresponding `StatusShared` field in `src/status.rs`. In particular
+  `client_ops_completed` and `decisions` count different populations and
+  must not be divided into each other.
 
 Anything else (wrong method, unknown path) is a `404`/`405`; a malformed or
 slow-loris-style request gets a bounded-size, bounded-time read and a `400`
@@ -458,7 +479,11 @@ status/metrics HTTP server: against a real 3-node cluster with
 answers `200` before any operation is submitted, `/ready` answers `200`
 once an operation has been driven through, `/metrics`' JSON counters
 (`save_count`, `next_slot`, `events_processed`) actually move after a
-decided `Put`, and `/unknown` is a `404`. A second test reuses the ordinary
+decided `Put`, and `/unknown` is a `404`. It is also the D10 evidence: three
+further tests cover the consensus counters (#129), the self-observed latency
+triple, and -- against a real `queso-node` process that is `SIGKILL`ed and
+rebooted -- the recovery-time pair and the per-process reset of everything
+else (#159). A second test reuses the ordinary
 (status-disabled) `spawn_cluster` every other test in this file uses and
 drives a full `Put`/`Get` round trip, proving the feature costs nothing
 observable when `status_listen_addr` is left `None`.
