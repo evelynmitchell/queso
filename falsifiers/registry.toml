@@ -177,3 +177,75 @@ replace = "        // MUTANT: self.decisions.store(metrics.decisions, Ordering::
 scope = ["-p", "queso-net", "--test", "status"]
 expect_fail = ["metrics_endpoint_serves_the_consensus_counters"]
 expect_pass = ["status_endpoints_report_health_ready_and_metrics", "status_server_survives_malformed_requests", "status_disabled_by_default_still_serves_put_and_get"]
+
+[[mutation]]
+id = "d10-recovery-never-recorded"
+property = "D10"
+issue = 159
+note = "The driver never closes the recovery interval, so `/metrics` reports `restarted: true` with a `null` recovery time forever -- a rejoin that looks permanently in progress. Only the real-process restart test can see this: nothing in-process restarts a node the way a scrape of a rebooted one does."
+file = "crates/net/src/driver.rs"
+find = "    if node.is_catching_up() {\n        return;\n    }"
+replace = "    if true {\n        return;\n    }"
+scope = ["-p", "queso-net", "--test", "status"]
+expect_fail = ["a_real_process_restart_resets_the_counters_and_reports_a_recovery_time"]
+expect_pass = ["metrics_endpoint_serves_the_consensus_counters", "metrics_endpoint_serves_the_self_observed_latency", "status_endpoints_report_health_ready_and_metrics"]
+
+[[mutation]]
+id = "d10-recovery-last-write-wins"
+property = "D10"
+issue = 159
+note = "Recovery time recorded on every publish instead of once. The value still looks plausible at any single scrape -- it simply means 'time since this boot' rather than 'this boot's rejoin', which is the redefinition-without-renaming failure mode CLAUDE.md exists to catch. Caught only by the two assertions that scrape twice."
+file = "crates/net/src/status.rs"
+find = "        self.recovery_micros\n            .compare_exchange(RECOVERY_UNSET, micros, Ordering::Relaxed, Ordering::Relaxed)\n            .is_ok()"
+replace = "        self.recovery_micros.store(micros, Ordering::Relaxed);\n        true"
+scope = ["-p", "queso-net", "--lib", "--test", "status"]
+expect_fail = ["a_real_process_restart_resets_the_counters_and_reports_a_recovery_time", "status::tests::recovery_time_records_the_first_measurement_and_ignores_later_ones"]
+expect_pass = ["status::tests::a_process_that_never_restarted_reports_no_recovery_time", "metrics_endpoint_serves_the_consensus_counters"]
+
+[[mutation]]
+id = "d10-recovery-for-a-cold-boot"
+property = "D10"
+issue = 159
+note = "Every boot measures a recovery, so a replica that never restarted reports one too. This is the mutation the never-restarted-peer control exists for: without it, a `recovery_secs` that was simply always set satisfies every other assertion in the restart test."
+file = "crates/net/src/driver.rs"
+find = "    let restart_began_at = is_restart.then(Instant::now);"
+replace = "    let restart_began_at = Some(Instant::now());"
+scope = ["-p", "queso-net", "--test", "status"]
+expect_fail = ["a_real_process_restart_resets_the_counters_and_reports_a_recovery_time"]
+expect_pass = ["metrics_endpoint_serves_the_consensus_counters", "metrics_endpoint_serves_the_self_observed_latency"]
+
+[[mutation]]
+id = "d10-latency-never-recorded"
+property = "D10"
+issue = 159
+note = "The self-observed latency triple is never fed, so a node reports zero latency over any number of operations it actually served. Killed from two directions -- the latency test's count, and the restart test's pre-crash reading -- which is why both name it."
+file = "crates/net/src/driver.rs"
+find = "                        shared.note_client_op(received_at.elapsed());"
+replace = "                        let _ = received_at;"
+scope = ["-p", "queso-net", "--test", "status"]
+expect_fail = ["metrics_endpoint_serves_the_self_observed_latency", "a_real_process_restart_resets_the_counters_and_reports_a_recovery_time"]
+expect_pass = ["metrics_endpoint_serves_the_consensus_counters", "status_endpoints_report_health_ready_and_metrics"]
+
+[[mutation]]
+id = "d10-decisions-from-frontier-published"
+property = "D10"
+issue = 159
+note = "The same mutation as `d10-decisions-from-frontier`, replayed against the *published* path rather than the sim accessor. That is the whole point of #159's third item: before the real-process restart test existed, this mutant survived every test in `queso-net` -- `decisions` and `next_slot` advance in lockstep within one process lifetime, so only a restart separates them, and this crate had no restarting scrape. The controls are the non-restarting status tests, which still pass: it is a precise instrument, not a broad break."
+file = "crates/smr/src/replica.rs"
+find = "    pub(crate) fn observability(&self) -> NodeMetrics {\n        self.metrics\n    }"
+replace = "    pub(crate) fn observability(&self) -> NodeMetrics {\n        NodeMetrics { decisions: self.durable.next_slot, ..self.metrics }\n    }"
+scope = ["-p", "queso-net", "--test", "status"]
+expect_fail = ["a_real_process_restart_resets_the_counters_and_reports_a_recovery_time"]
+expect_pass = ["metrics_endpoint_serves_the_consensus_counters", "metrics_endpoint_serves_the_self_observed_latency"]
+
+[[mutation]]
+id = "d10-no-restart-reset-published"
+property = "D10"
+issue = 159
+note = "A recorded **zero**, and the reason is structural rather than a gap to close: `on_restart` failing to clear the counters is invisible to a real-process restart, because a real restart is a new process whose `SmrNode` is built by `from_durable` -- `ReplicaState { durable, ..Default::default() }`, so `NodeMetrics` starts at zero whatever `on_restart` does. Measured: the mutant passed all 83 tests in this scope. The killer is the in-process sim test instead (`d10-no-restart-reset`, `-p queso-smr`), and this entry exists so nobody reads the real-process restart test as covering it."
+file = "crates/smr/src/replica.rs"
+find = "        st.metrics = NodeMetrics::default();"
+replace = "        // MUTANT: st.metrics = NodeMetrics::default();"
+scope = ["-p", "queso-net", "--test", "status"]
+expect_fail = []
+expect_pass = ["a_real_process_restart_resets_the_counters_and_reports_a_recovery_time", "metrics_endpoint_serves_the_consensus_counters"]

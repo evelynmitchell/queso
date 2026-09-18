@@ -148,6 +148,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use queso_consensus::rpc::ConcreteMsg;
@@ -184,6 +185,13 @@ pub enum Event {
     ClientSubmit {
         command: Command,
         resp: oneshot::Sender<Outcome>,
+        /// When this replica finished decoding the command off its client
+        /// socket -- the start of D10's self-observed latency interval
+        /// (#159), stamped by `crate::client::serve_one_client` rather
+        /// than here so that the time this event spends waiting in the
+        /// inbox is inside the interval, not outside it. See
+        /// `crate::status::StatusShared`'s `client_ops_completed` docs.
+        received_at: Instant,
     },
 }
 
@@ -197,6 +205,43 @@ pub enum Event {
 /// magnitude more than the cost of applying a few dozen more in-memory
 /// events) without letting one batch's worst-case latency run away.
 const GROUP_COMMIT_BATCH_LIMIT: usize = 64;
+
+/// Close D10's recovery interval (#159) if this boot had one and its
+/// restart catch-up has now finished.
+///
+/// `restart_began_at` is `None` for a cold boot, which has nothing to
+/// recover and must keep reporting `null` rather than `0` -- "this process
+/// never restarted" and "this process recovered instantly" are different
+/// claims, and `/metrics`' `restarted` flag is what tells them apart.
+///
+/// Called after *every* publish, not just the one that happens to complete
+/// catch-up, because nothing hands the driver an edge-triggered "catch-up
+/// finished" signal: `queso_smr::SmrNode::is_catching_up` is a level. The
+/// resulting repeated calls are made harmless by
+/// `crate::status::StatusShared::note_recovery` being first-write-wins,
+/// which is also what keeps a later watchdog-driven catch-up (see
+/// `queso_smr::replica`'s docs) from overwriting this boot's number.
+fn note_recovery_if_complete(
+    shared: &StatusShared,
+    restart_began_at: Option<Instant>,
+    node: &SmrNode,
+    id: NodeId,
+) {
+    let Some(began) = restart_began_at else {
+        return;
+    };
+    if node.is_catching_up() {
+        return;
+    }
+    let elapsed = began.elapsed();
+    if shared.note_recovery(elapsed) {
+        info!(
+            id = ?id,
+            recovery_secs = elapsed.as_secs_f64(),
+            "restart catch-up complete"
+        );
+    }
+}
 
 /// Boot one replica: dial every peer, accept inbound peer and client
 /// connections, then drive [`queso_smr::SmrNode`] forever from a single
@@ -419,8 +464,19 @@ async fn run_node_inner(
         inbox_tx.clone(),
     );
 
+    // D10 recovery time (#159): `Some` exactly when this boot has a
+    // recovery to measure, and stamped immediately before `on_restart`
+    // below, which is the call that starts the catch-up probe this
+    // interval is about. A cold boot leaves it `None` and never reports a
+    // recovery time at all -- see `crate::status::StatusShared`'s
+    // `recovery_micros` docs for the interval and the two candidates it
+    // was chosen over.
+    let restart_began_at = is_restart.then(Instant::now);
     if is_restart {
         info!(id = ?config.id, max_tick = baseline.0, "recovered durable state, rejoining as a learner");
+        if let Some(shared) = &status {
+            shared.note_restart();
+        }
         ctx.tick_now();
         // No fsync needed before this flush: `on_restart` only clears
         // volatile state and starts a catch-up `Proposer` (see
@@ -449,6 +505,13 @@ async fn run_node_inner(
         // all-zero rather than an absent field.
         shared.publish_consensus(node.metrics());
 
+        // D10 (#159): a restart whose catch-up probe somehow needed no
+        // round trip at all would finish before this loop ever runs, so
+        // the recovery check belongs here as well as in the loop below --
+        // otherwise that boot would report `restarted` forever with a
+        // `null` recovery time, which reads as "still catching up".
+        note_recovery_if_complete(shared, restart_began_at, &node, config.id);
+
         // Phase 9.2 (issue #56): fold the chain over whatever this boot
         // reloaded from disk, for the same reason the publish above exists
         // -- so `GET /chain` is truthful from the moment the node is up,
@@ -462,7 +525,10 @@ async fn run_node_inner(
         }
     }
 
-    let mut pending: BTreeMap<OpId, oneshot::Sender<Outcome>> = BTreeMap::new();
+    // The `Instant` beside each responder is the client's arrival stamp
+    // (see `Event::ClientSubmit::received_at`), so the reply site below can
+    // close D10's self-observed latency interval without a second map.
+    let mut pending: BTreeMap<OpId, (oneshot::Sender<Outcome>, Instant)> = BTreeMap::new();
     let mut next_op_id: u64 = 0;
 
     while let Some(first_event) = inbox_rx.recv().await {
@@ -496,10 +562,14 @@ async fn run_node_inner(
             match event {
                 Event::Message { from, payload } => node.on_message(from, payload, &mut ctx),
                 Event::Timer(timer_id) => node.on_timer(timer_id, &mut ctx),
-                Event::ClientSubmit { command, resp } => {
+                Event::ClientSubmit {
+                    command,
+                    resp,
+                    received_at,
+                } => {
                     let op_id = OpId(next_op_id);
                     next_op_id += 1;
-                    pending.insert(op_id, resp);
+                    pending.insert(op_id, (resp, received_at));
                     node.submit(op_id, config.id, command, &mut ctx);
                 }
             }
@@ -582,7 +652,7 @@ async fn run_node_inner(
             })
             .collect();
         for op_id in completed {
-            if let Some(resp) = pending.remove(&op_id) {
+            if let Some((resp, received_at)) = pending.remove(&op_id) {
                 if let Some(OpRecord {
                     outcome: Some(outcome),
                     ..
@@ -598,6 +668,16 @@ async fn run_node_inner(
                         released_ok,
                         "write-before-reply violated: a client Outcome was about to be sent before this batch's durable state was persisted"
                     );
+                    // D10 self-observed latency (#159), closed here rather
+                    // than after the `send`: this is the moment this
+                    // replica is done with the operation, and what the
+                    // connection task does with the `Outcome` afterwards
+                    // (serialize it, write it to a socket a client may be
+                    // slow to read) is not this node's own latency. The
+                    // stamp's other end is in `crate::client`.
+                    if let Some(shared) = &status {
+                        shared.note_client_op(received_at.elapsed());
+                    }
                     let _ = resp.send(outcome);
                 }
             }
@@ -621,6 +701,13 @@ async fn run_node_inner(
             // decision counted for a slot this batch has not yet made
             // durable.
             shared.publish_consensus(node.metrics());
+
+            // D10 (#159): the batch that completes this boot's restart
+            // catch-up is the one that closes the recovery interval. Every
+            // later batch calls this too and it is a no-op -- the record
+            // is first-write-wins, deliberately, so this stays "this
+            // boot's rejoin" rather than tracking the most recent one.
+            note_recovery_if_complete(shared, restart_began_at, &node, config.id);
 
             // Phase 9.2 (issue #56): fold whatever this batch applied into
             // the Chain-of-Blocks hash and publish any checkpoint it

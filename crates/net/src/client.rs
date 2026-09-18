@@ -31,7 +31,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bytes::BytesMut;
@@ -104,10 +104,18 @@ async fn serve_one_client(
     let command: Command = bincode::deserialize(&bytes)?;
 
     let (resp_tx, resp_rx) = oneshot::channel();
+    // D10 self-observed latency (#159): stamped here, with a decoded
+    // command in hand and before the submission enters the driver's inbox,
+    // so the interval the node reports about itself includes its own
+    // queueing rather than starting when the event loop gets round to the
+    // event. See `crate::status::StatusShared`'s `client_ops_completed`
+    // docs for the exact interval and what it deliberately excludes.
+    let received_at = Instant::now();
     inbox
         .send(Event::ClientSubmit {
             command,
             resp: resp_tx,
+            received_at,
         })
         .map_err(|_| anyhow::anyhow!("replica's driver loop has shut down"))?;
     let outcome = resp_rx.await?;

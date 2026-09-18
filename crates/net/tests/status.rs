@@ -29,19 +29,83 @@
 //! end-to-end evidence, and `crates/smr/tests/observability_metrics.rs` for
 //! the evidence that the counters count the right population.
 //!
-//! The remaining two are **still not served**, and are not a counter away:
+//! #159 then served the remaining two, which were not a counter away --
+//! each needed a measurement point, and each needed its interval *chosen*
+//! before it could be implemented, because the candidates named in that
+//! issue do not measure the same thing:
 //!
-//! - **recovery time** -- nothing tracks it anywhere (`grep` finds no
-//!   counter). It needs a measurement point (restart -> caught up), not an
-//!   increment.
-//! - **per-replica latency** -- `queso_net::metrics` does record latency,
-//!   but it is the *bench client's* `Recorder` (used by `queso-bench`,
-//!   `bench.rs` and `nemesis.rs`), i.e. a client-side view of the cluster,
-//!   not a per-replica metric a node publishes about itself.
+//! - **recovery time** -- `restarted` and `recovery_secs`, measured in
+//!   `queso_net::driver` from the restart branch (immediately before
+//!   `on_restart`, which starts the catch-up probe) to the first publish at
+//!   which `SmrNode::is_catching_up()` reads false. See
+//!   [`a_real_process_restart_resets_the_counters_and_reports_a_recovery_time`].
+//! - **per-replica self-observed latency** --
+//!   `client_ops_completed`/`client_latency_micros_total`/`..._max`,
+//!   measured from decoding a client's command off this replica's socket to
+//!   dispatching that operation's `Outcome`. See
+//!   [`metrics_endpoint_serves_the_self_observed_latency`]. This is a
+//!   node's view of itself; `queso_net::metrics::Recorder`'s histograms
+//!   remain the bench *client's* view of the cluster, and the two answer
+//!   different questions about the same operations.
 //!
-//! So D10 is **three of five served**, not done: the matrix row says so,
-//! and the two that remain are tracked in #159 rather than folded into
-//! this file's claim.
+//! Both intervals are stated in full on `queso_net::status::StatusShared`'s
+//! `recovery_micros` and `client_ops_completed` fields, including what each
+//! excludes and which candidate interval was rejected and why. A latency
+//! number whose interval is unstated is the kind of sentence `CLAUDE.md`
+//! exists to prevent, so the interval lives next to the counter rather than
+//! in a commit message.
+//!
+//! # Detection power of the #159 tests (measured)
+//!
+//! Falsifier, run: eight mutations, each applied to a clean tree and scored
+//! against `cargo test -p queso-net --lib --test status --no-fail-fast`
+//! (83 tests green on the unmutated control). Six are registered in
+//! `falsifiers/registry.toml` (`d10-recovery-never-recorded`,
+//! `d10-recovery-last-write-wins`, `d10-recovery-for-a-cold-boot`,
+//! `d10-latency-never-recorded`, `d10-decisions-from-frontier-published`,
+//! `d10-no-restart-reset-published`) so `falsifiers/replay.py` re-measures
+//! them rather than leaving this table to rot.
+//!
+//! | mutation | caught by |
+//! |---|---|
+//! | driver never closes the recovery interval | the restart test |
+//! | recovery recorded on every publish, not once | the restart test, plus `recovery_time_records_the_first_measurement_and_ignores_later_ones` |
+//! | `restarted` never set | the restart test, plus `a_restart_still_catching_up_is_distinguishable_from_a_cold_boot` |
+//! | every boot measures a recovery, cold boots included | the restart test (its never-restarted-peer control) |
+//! | `note_client_op` never called | the latency test *and* the restart test |
+//! | latency max stores instead of `fetch_max` | the latency test, plus `client_latency_accumulates_and_keeps_a_high_water_mark` |
+//! | `observability()` derives `decisions` from the frontier | the restart test **only** |
+//! | `on_restart` does not reset the counters | **nothing here** -- see below |
+//!
+//! 7 of 8 killed, and the eighth is the row worth reading.
+//!
+//! **The measured zero.** Removing `on_restart`'s counter reset survives
+//! all 83 tests in this scope, and that is structural rather than a gap to
+//! close: a real restart is a *new process*, whose `SmrNode` is built by
+//! `SmrNode::from_durable` -- `ReplicaState { durable, ..Default::default() }`
+//! -- so its `NodeMetrics` starts at zero whatever `on_restart` does. The
+//! reset is what keeps the *in-process* model faithful to that, so the sim
+//! test (`crates/smr/tests/observability_metrics.rs`'s
+//! `a_restart_clears_the_counters`) is its only killer, and stays so. #159's
+//! wording -- assert "the counters are back at zero" across a real restart
+//! -- is satisfied here, but it does not test the reset, and reading it that
+//! way would be exactly the inherited-premise error `CLAUDE.md` §3 warns
+//! about.
+//!
+//! **What this file's restart test does add**, measured rather than argued:
+//! `d10-decisions-from-frontier-published` -- `decisions` silently derived
+//! from the durable frontier -- was killed by no test in `queso-net` before
+//! it, and is killed by it now. That mutant is invisible to any
+//! non-restarting test because `decisions` and `next_slot` advance in
+//! lockstep within one process lifetime (enumerated in #129: the crate has
+//! exactly one `applied_log.push`), and this crate previously had no
+//! restarting scrape of the published path.
+//!
+//! So D10 is **five of five served**. That is a claim about the metrics
+//! being served and counting what they are named after -- not a claim that
+//! they are the right five to have chosen, which is §D's question, nor that
+//! `recovery_secs` means "caught up with the cluster", which it explicitly
+//! does not (see `StatusShared::is_ready`'s bound, which it inherits).
 
 use std::time::Duration;
 
@@ -52,7 +116,76 @@ use queso_smr::{ClientId, Command, Outcome};
 mod support;
 use support::{
     http_get, raw_status_request, spawn_cluster, spawn_cluster_with_status, submit_with_retry,
+    ProcCluster,
 };
+
+/// `GET /metrics` at `addr`, parsed. Panics on anything but a `200` with a
+/// JSON body -- a status endpoint that answered something else is a test
+/// failure, not a condition to poll through.
+async fn metrics(addr: std::net::SocketAddr) -> serde_json::Value {
+    let (code, body) = http_get(addr, "/metrics").await;
+    assert_eq!(code, 200, "GET /metrics at {addr} answered {code}: {body}");
+    serde_json::from_str(&body).expect("metrics body is valid JSON")
+}
+
+/// [`metrics`], but `None` if the connection could not be established at
+/// all -- the one failure a reboot legitimately produces. Anything a
+/// listener actually answered is still asserted on.
+async fn try_metrics(addr: std::net::SocketAddr) -> Option<serde_json::Value> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
+    let request = "GET /metrics HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
+    stream.write_all(request.as_bytes()).await.ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.ok()?;
+    let response = String::from_utf8(response).expect("status server response is valid UTF-8");
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("status server response has no header/body split: {response:?}"));
+    assert!(
+        head.starts_with("HTTP/1.1 200 OK"),
+        "GET /metrics at {addr} answered: {head:?}"
+    );
+    Some(serde_json::from_str(body).expect("metrics body is valid JSON"))
+}
+
+/// Poll `GET /metrics` at `addr` until `done` accepts the body, or the
+/// deadline passes.
+///
+/// Needed only after a real process restart: the status listener is up
+/// before the driver has published anything about this boot (see
+/// `queso_net::status::StatusShared::new`'s docs), so a scrape taken
+/// immediately after `spawn` can legitimately describe a process that has
+/// not reached its restart branch yet. Waiting that window out is not the
+/// same as retrying a failed assertion -- the predicate is a statement
+/// about *which boot* answered, not about the values under test.
+async fn metrics_until(
+    addr: std::net::SocketAddr,
+    timeout: Duration,
+    what: &str,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last = serde_json::Value::Null;
+    loop {
+        // A rebooting process's listener can refuse a connection outright
+        // for a moment while it rebinds the port, so this poll tolerates a
+        // failed *connection* -- the harness racing the reboot -- while
+        // still treating a non-200 or unparseable answer from a listener
+        // that did accept as the failure it is (see `try_metrics`).
+        if let Some(body) = try_metrics(addr).await {
+            if done(&body) {
+                return body;
+            }
+            last = body;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("replica at {addr} never {what}; last /metrics body: {last}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 /// `GET /health` must answer `200` right away (process-up liveness, see
 /// `queso_net::status`'s module docs) -- before this replica has served a
@@ -240,6 +373,240 @@ async fn metrics_endpoint_serves_the_consensus_counters() {
         bystander["decisions"].as_u64().unwrap() < decisions,
         "replica 1 never received a client op, so it cannot have driven as many \
          slots to a decision as the leader: leader={after} replica1={bystander}"
+    );
+}
+
+/// D10's **per-replica self-observed latency** (#159): `/metrics` serves
+/// the count/sum/max triple for the client operations *this* replica
+/// served, over the interval `queso_net::status::StatusShared`'s
+/// `client_ops_completed` docs define (decode off the client socket ->
+/// `Outcome` dispatched back to the connection task).
+///
+/// What could be wrong, and what this therefore asserts: that the triple is
+/// fed at all (count moves), that it is fed something real rather than zero
+/// (sum moves), that the maximum is a maximum (`max <= total`, and `max >=
+/// the mean`), and that it is *this replica's own* view -- the bystander
+/// control, which is the assertion that fails if the field were a cluster
+/// aggregate or a constant.
+///
+/// Deliberately *not* asserted: any absolute latency. What a localhost
+/// round trip plus an fsync costs is a property of the machine the test
+/// runs on, and pinning it would make this a change-detector for CI
+/// hardware. The bounds asserted hold for any timing.
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_endpoint_serves_the_self_observed_latency() {
+    let (client_addrs, status_addrs) = spawn_cluster_with_status(3, Some(NodeId(0)));
+    let timeout = Duration::from_secs(10);
+
+    // Present-and-zero before any client operation, `is_u64` for the same
+    // reason the #129 counters check it: `== 0` would also hold of a field
+    // that was never serialized at all.
+    let baseline = metrics(status_addrs[0]).await;
+    for field in [
+        "client_ops_completed",
+        "client_latency_micros_total",
+        "client_latency_micros_max",
+    ] {
+        assert!(
+            baseline[field].is_u64(),
+            "/metrics must serve `{field}`, got: {baseline}"
+        );
+        assert_eq!(baseline[field], 0, "{baseline}");
+    }
+
+    const OPS: u64 = 4;
+    for seq in 0..OPS {
+        let put = Command::Put {
+            client: ClientId(11),
+            seq,
+            key: 300 + seq as u32,
+            value: seq as i64,
+        };
+        assert_eq!(
+            submit_with_retry(client_addrs[0], &put, timeout).await,
+            Outcome::Put
+        );
+    }
+
+    let after = metrics(status_addrs[0]).await;
+    let completed = after["client_ops_completed"].as_u64().unwrap();
+    let total = after["client_latency_micros_total"].as_u64().unwrap();
+    let max = after["client_latency_micros_max"].as_u64().unwrap();
+    assert!(
+        completed >= OPS,
+        "replica 0 answered {OPS} client operations, so it must report at least \
+         that many: {after}"
+    );
+    assert!(
+        total > 0,
+        "an operation that crossed a real cluster and an fsync cannot have taken \
+         zero microseconds: {after}"
+    );
+    assert!(
+        max > 0 && max <= total,
+        "the high-water mark must be one of the summed samples: {after}"
+    );
+    assert!(
+        max >= total / completed,
+        "a maximum below the mean is not a maximum: {after}"
+    );
+
+    // Control: replica 1 was never asked to serve a client operation, so a
+    // per-replica metric must report nothing for it. This is what fails if
+    // the field were a cluster-wide aggregate, a constant, or the bench
+    // client's view rather than the node's own.
+    let bystander = metrics(status_addrs[1]).await;
+    assert_eq!(
+        bystander["client_ops_completed"], 0,
+        "replica 1 served no client operation: {bystander}"
+    );
+    assert_eq!(bystander["client_latency_micros_total"], 0, "{bystander}");
+    assert_eq!(bystander["client_latency_micros_max"], 0, "{bystander}");
+}
+
+/// The published counters across a **real process restart** (#159's third
+/// item), and D10's **recovery time** with it.
+///
+/// # Why this needs real processes, when `queso-smr` already has a restart
+///
+/// `queso_smr::NodeMetrics` is read through two one-line accessors:
+/// `SmrCluster::metrics` (what the simulator's tests read) and
+/// `SmrNode::metrics` (what this crate's driver publishes). Before this
+/// test, the restart evidence and the published-path evidence were in
+/// different files: `crates/smr/tests/observability_metrics.rs` restarts
+/// but reads the sim accessor, and
+/// [`metrics_endpoint_serves_the_consensus_counters`] above reads the
+/// published one but never restarts.
+///
+/// That gap is not cosmetic, and #129 measured why: `decisions` and
+/// `next_slot` advance in lockstep within one process lifetime -- every
+/// applied slot is applied inside `finish_attempt`, the crate's only
+/// `applied_log.push` -- so a `decisions` silently derived from the durable
+/// frontier is *invisible* to any test that does not restart. Only a
+/// restart separates them, and only this file exercises the path a real
+/// deployment scrapes.
+///
+/// # What is asserted, and what is deliberately loose
+///
+/// - The frontier **survives**: `next_slot` after the reboot is at least
+///   what it was before. (Not equality: the restarted replica's own
+///   catch-up probe is a real attempt at the next slot, so an idle cluster
+///   legitimately advances by a slot or two while rejoining.)
+/// - The counters **do not**: `decisions` after the reboot is strictly
+///   below the pre-crash frontier, and the client-latency triple is back at
+///   zero -- this process has served nobody. A `decisions` that came from
+///   the frontier would report the pre-crash figure here.
+/// - Recovery time is measured, is reported only by the process that
+///   actually restarted, and is **stable**: re-scraping later returns the
+///   identical value. That last one is what fails if the interval were
+///   recorded on every publish rather than first-write-wins, which would
+///   silently redefine it as "time since this boot".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_process_restart_resets_the_counters_and_reports_a_recovery_time() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let mut cluster = ProcCluster::start_with_status(3, 0, data_dir.path(), None);
+    let timeout = Duration::from_secs(20);
+
+    const WRITES: u64 = 8;
+    for seq in 0..WRITES {
+        let put = Command::Put {
+            client: ClientId(23),
+            seq,
+            key: 400 + seq as u32,
+            value: seq as i64,
+        };
+        assert_eq!(
+            submit_with_retry(cluster.client_addr(0), &put, timeout).await,
+            Outcome::Put,
+            "write {seq} should be applied"
+        );
+    }
+
+    let before = metrics(cluster.status_addr(0)).await;
+    let frontier_before = before["next_slot"].as_u64().unwrap();
+    assert!(
+        frontier_before >= WRITES,
+        "the leader applied {WRITES} writes: {before}"
+    );
+    assert!(
+        before["decisions"].as_u64().unwrap() >= WRITES,
+        "the leader drove {WRITES} writes to a decision: {before}"
+    );
+    assert!(
+        before["client_ops_completed"].as_u64().unwrap() >= WRITES,
+        "the leader answered {WRITES} clients: {before}"
+    );
+    assert_eq!(
+        before["restarted"], false,
+        "this process booted cold: {before}"
+    );
+    assert!(
+        before["recovery_secs"].is_null(),
+        "a process that never restarted has no recovery interval to report: {before}"
+    );
+
+    // SIGKILL and reboot against the same data directory: a new process, a
+    // blank heap, and a durable snapshot to reload -- the real path, which
+    // an in-process "drop and rebuild the node" cannot exercise.
+    cluster.kill(0);
+    cluster.spawn(0);
+
+    // `restarted` flipping to `true` is what identifies the new boot:
+    // the process that answered before the kill reports `false` for its
+    // whole life, so this cannot be satisfied by a stale answer.
+    let after = metrics_until(
+        cluster.status_addr(0),
+        timeout,
+        "reported a completed restart recovery",
+        |body| body["restarted"] == true && !body["recovery_secs"].is_null(),
+    )
+    .await;
+
+    assert!(
+        after["next_slot"].as_u64().unwrap() >= frontier_before,
+        "the durable frontier must survive the crash: before={before} after={after}"
+    );
+    assert!(
+        after["decisions"].as_u64().unwrap() < frontier_before,
+        "the D10 counters are per-process: a rebooted replica that has driven only its \
+         own catch-up cannot report the pre-crash count. A `decisions` derived from the \
+         durable frontier reports {frontier_before} here. before={before} after={after}"
+    );
+    assert_eq!(
+        after["client_ops_completed"], 0,
+        "the rebooted process has answered no client: {after}"
+    );
+    assert_eq!(after["client_latency_micros_total"], 0, "{after}");
+    assert_eq!(after["client_latency_micros_max"], 0, "{after}");
+
+    let recovery = after["recovery_secs"].as_f64().unwrap();
+    assert!(
+        recovery.is_finite() && recovery >= 0.0,
+        "recovery time must be a real interval: {after}"
+    );
+
+    // Stability: the driver re-checks the catch-up level on every publish,
+    // so a last-write-wins record would keep growing. Wait long enough for
+    // several publishes (the node ticks every 5ms) and re-scrape.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let later = metrics(cluster.status_addr(0)).await;
+    assert_eq!(
+        later["recovery_secs"], after["recovery_secs"],
+        "recovery time is this boot's rejoin, not time since boot -- it must not move \
+         after it is first recorded: first={after} later={later}"
+    );
+
+    // Control: a replica that never restarted must not report a recovery
+    // time at all. Without this, a `restarted`/`recovery_secs` pair that was
+    // simply always set would satisfy everything above.
+    let peer = metrics(cluster.status_addr(1)).await;
+    assert_eq!(
+        peer["restarted"], false,
+        "replica 1 was never killed: {peer}"
+    );
+    assert!(
+        peer["recovery_secs"].is_null(),
+        "replica 1 never restarted, so it has no recovery interval: {peer}"
     );
 }
 
